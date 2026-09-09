@@ -38,20 +38,34 @@ The server writes its token and cached tool lists to `%USERPROFILE%\.vmcp\`.
 
 ## Building the plugin
 
-The plugin lives in `src/plugin/` and builds from its own Rojo project, separate from the place:
+`src/plugin/` holds the panel UI and nothing else — no toolbar, no dock widget, no socket. Add
+your own entry `Script` beside `Panel/`, then build from the plugin's own Rojo project:
 
 ```bash
 rojo build plugin.project.json -o "$LOCALAPPDATA/Roblox/Plugins/VMCP.rbxm"
 ```
 
-Restart Studio and the **VMCP** button appears on the Plugins tab. It opens a dock widget with
-the bridge port, Connect/Disconnect, and a collapsed auth-token field that opens itself when the
-socket closes with `1008`.
+The panel is a plain module. Mount it into any `PluginGui`, `ScreenGui` or `Frame`, wire the
+three callbacks, and report back with `SetState`:
 
-The panel is UI only right now. `src/plugin/init.server.luau` drives it through a stub that walks
-the connection states on a timer; the real socket replaces the bodies of `Panel.OnConnect` and
-`Panel.OnDisconnect` and nothing else. `Panel.SetState(kind, detail)` is how the transport
-reports back — `"idle"`, `"connecting"`, `"connected"`, `"fault"`.
+```lua
+local Panel = require(script.Panel)
+
+Panel.Mount(widget, savedPort, hasToken)
+
+Panel.OnConnect = function(port) end     -- Connect clicked, or Enter in the port field
+Panel.OnDisconnect = function() end      -- Disconnect clicked
+Panel.OnToken = function(token) end      -- token pasted; persist it yourself
+
+Panel.SetState("connecting", { phase = "handshake" })
+Panel.SetState("connected", { tools = 6, revision = 3 })
+Panel.SetState("fault", { code = 1008 })  -- also opens the token field
+```
+
+The full list of states and the close codes it has copy for is in the header comment of
+[`src/plugin/Panel/init.luau`](src/plugin/Panel/init.luau). It carries its own styling, so it
+looks right wherever you put it. For Studio's light/dark theme, call
+`require(script.Panel.Style).SetTheme(isDark)` off `settings():GetService("Studio").ThemeChanged`.
 
 [`docs/protocol.md`](docs/protocol.md) is the full contract — handshake, message shapes,
 error codes, Luau JSON gotchas. It's the only file you need.

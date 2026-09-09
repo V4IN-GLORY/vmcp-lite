@@ -2,7 +2,25 @@
 --!optimize 2
 
 -- The connect panel: its instance tree, and the mapping from connection state to what you see.
--- It knows nothing about WebSockets -- that lives in Transport.luau.
+-- It knows nothing about sockets, plugins or settings -- drive it entirely through the API below.
+--
+--   Panel.Mount(parent, savedPort?, hasToken?) -> Frame
+--   Panel.Destroy()
+--
+-- Out (assign these; all optional):
+--   Panel.OnConnect(port)     Connect clicked, or Enter pressed in the port field
+--   Panel.OnDisconnect()      Disconnect clicked
+--   Panel.OnToken(token)      a token was pasted and committed -- persist it yourself
+--
+-- In (call this to change what is displayed):
+--   Panel.SetState("idle")
+--   Panel.SetState("connecting", { phase = "socket" })      or phase = "handshake"
+--   Panel.SetState("connected", { tools = 6, revision = 3 })
+--   Panel.SetState("fault", { code = 1008 })                also opens the token field
+--   Panel.SetState("fault", { code = 1009 | 4000 })
+--   Panel.SetState("fault", { retryIn = 4 })                anything else: unreachable
+--
+-- Close codes come from docs/protocol.md. The panel only displays them; it never retries.
 
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
