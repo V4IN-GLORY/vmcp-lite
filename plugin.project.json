@@ -1,0 +1,6 @@
+{
+  "name": "VMCP",
+  "tree": {
+    "$path": "src/plugin"
+  }
+}

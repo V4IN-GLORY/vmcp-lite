@@ -1,0 +1,12 @@
+# Project place file
+/VMCP.rbxlx
+
+# Roblox Studio lock files
+/*.rbxlx.lock
+/*.rbxl.lock
+
+sourcemap.json
+
+# TypeScript MCP server
+server/node_modules/
+server/dist/
