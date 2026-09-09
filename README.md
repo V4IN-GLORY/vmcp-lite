@@ -38,12 +38,19 @@ The server writes its token and cached tool lists to `%USERPROFILE%\.vmcp\`.
 
 ## Building the plugin
 
-`src/plugin/` holds the panel UI and nothing else — no toolbar, no dock widget, no socket. Add
-your own entry `Script` beside `Panel/`, then build from the plugin's own Rojo project:
+`src/plugin/` holds the panel UI and nothing else — no toolbar, no dock widget, no socket.
+`init.server.luau` is the entry point and is deliberately empty; fill it in, then build from the
+plugin's own Rojo project:
 
 ```bash
 rojo build plugin.project.json -o "$LOCALAPPDATA/Roblox/Plugins/VMCP.rbxm"
 ```
+
+Restart Studio afterwards — it only picks up newly installed plugins on load.
+
+Or work from the place instead: `rojo serve`, then right-click **ServerStorage → VMCP** and pick
+*Save as Local Plugin*. That menu item only appears on a `Script`, which is why `src/plugin` has
+an `init.server.luau` at its root rather than being a bare folder.
 
 The panel is a plain module that builds and styles the widgets. It holds no protocol, no state
 machine and no validation — you mount it, then drive it:
