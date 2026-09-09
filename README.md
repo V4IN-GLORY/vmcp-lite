@@ -45,26 +45,26 @@ your own entry `Script` beside `Panel/`, then build from the plugin's own Rojo p
 rojo build plugin.project.json -o "$LOCALAPPDATA/Roblox/Plugins/VMCP.rbxm"
 ```
 
-The panel is a plain module. Mount it into any `PluginGui`, `ScreenGui` or `Frame`, wire the
-three callbacks, and report back with `SetState`:
+The panel is a plain module that builds and styles the widgets. It holds no protocol, no state
+machine and no validation — you mount it, then drive it:
 
 ```lua
 local Panel = require(script.Panel)
+Panel.Mount(widget)
 
-Panel.Mount(widget, savedPort, hasToken)
+Panel.ConnectButton.Activated:Connect(function() ... end)
+Panel.DisconnectButton.Activated:Connect(function() ... end)
+Panel.PortInput.FocusLost:Connect(function(enterPressed) ... end)
+Panel.TokenInput.FocusLost:Connect(function() ... end)
 
-Panel.OnConnect = function(port) end     -- Connect clicked, or Enter in the port field
-Panel.OnDisconnect = function() end      -- Disconnect clicked
-Panel.OnToken = function(token) end      -- token pasted; persist it yourself
-
-Panel.SetState("connecting", { phase = "handshake" })
-Panel.SetState("connected", { tools = 6, revision = 3 })
-Panel.SetState("fault", { code = 1008 })  -- also opens the token field
+Panel.StatusLine.Text = "Connected · 6 tools · rev 3"
+Panel.StatusWord.Text = "connected"
+Panel.SetSignal("Live")        -- Idle | Work | Live | Fault; Work animates the hairline
+Panel.SetTokenOpen(true)       -- the auth-token drawer
 ```
 
-The full list of states and the close codes it has copy for is in the header comment of
-[`src/plugin/Panel/init.luau`](src/plugin/Panel/init.luau). It carries its own styling, so it
-looks right wherever you put it. For Studio's light/dark theme, call
+It carries its own styling, so it looks right wherever you mount it — `PluginGui`, `ScreenGui`
+or a plain `Frame`. For Studio's light/dark theme call
 `require(script.Panel.Style).SetTheme(isDark)` off `settings():GetService("Studio").ThemeChanged`.
 
 [`docs/protocol.md`](docs/protocol.md) is the full contract — handshake, message shapes,
