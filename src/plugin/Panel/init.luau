@@ -17,6 +17,11 @@
 --   Panel.SetTokenOpen(open)                              the auth-token drawer
 --   Panel.Destroy()
 --
+--   Panel.ConnectRequested      ()             Connect button clicked
+--   Panel.DisconnectRequested   ()             Disconnect button clicked
+--   Panel.PortChanged           (text: string) PortInput text edited
+--   Panel.TokenChanged          (text: string) TokenInput text edited
+--
 -- Clicking the disclosure row toggles the drawer on its own. Everything else is yours.
 
 local RunService = game:GetService("RunService")
@@ -40,7 +45,20 @@ local Panel = {
 	TokenInput = nil :: any,
 	StatusLine = nil :: any,
 	StatusWord = nil :: any,
+	ConnectRequested = nil :: any,
+	DisconnectRequested = nil :: any,
+	PortChanged = nil :: any,
+	TokenChanged = nil :: any,
 }
+
+local connectRequested = Instance.new("BindableEvent")
+local disconnectRequested = Instance.new("BindableEvent")
+local portChanged = Instance.new("BindableEvent")
+local tokenChanged = Instance.new("BindableEvent")
+Panel.ConnectRequested = connectRequested.Event
+Panel.DisconnectRequested = disconnectRequested.Event
+Panel.PortChanged = portChanged.Event
+Panel.TokenChanged = tokenChanged.Event
 
 local gradient: UIGradient
 local tokenGroup: Frame
@@ -291,6 +309,19 @@ function Panel.Mount(parent: Instance): Frame
 		Panel.SetTokenOpen(not tokenOpen)
 	end)
 
+	Panel.ConnectButton.Activated:Connect(function()
+		connectRequested:Fire()
+	end)
+	Panel.DisconnectButton.Activated:Connect(function()
+		disconnectRequested:Fire()
+	end)
+	Panel.PortInput:GetPropertyChangedSignal("Text"):Connect(function()
+		portChanged:Fire(Panel.PortInput.Text)
+	end)
+	Panel.TokenInput:GetPropertyChangedSignal("Text"):Connect(function()
+		tokenChanged:Fire(Panel.TokenInput.Text)
+	end)
+
 	table.clear(orders)
 	Panel.SetSignal("Idle")
 	Panel.Root = root
@@ -303,6 +334,10 @@ function Panel.Destroy()
 	if Panel.Root then
 		Panel.Root:Destroy()
 	end
+	connectRequested:Destroy()
+	disconnectRequested:Destroy()
+	portChanged:Destroy()
+	tokenChanged:Destroy()
 end
 
 return Panel
