@@ -11,9 +11,19 @@
 --
 -- Panel/init.luau documents the rest of its surface.
 
-
+local Panel = require(script.Panel)
 
 local port = plugin:GetSetting("port") or nil
+local token = plugin:GetSetting("token") or nil
 
+Panel.PortChanged:Connect(function(new)
+    port = new
+    plugin:SetSetting("port", new)
+    print("changed port")
+end)
 
-
+Panel.TokenChanged:Connect(function(new)
+    token = new
+    plugin:SetSetting("token", new)
+    print("changed token")
+end)
