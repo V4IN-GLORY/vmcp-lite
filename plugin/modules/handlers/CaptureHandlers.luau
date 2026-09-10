@@ -49,56 +49,20 @@ local function readPixelsTiled(img, w, h)
 	local BYTES_PER_PIXEL = 4
 	local fullBuf = buffer.create(w * h * BYTES_PER_PIXEL)
 	local fullRowBytes = w * BYTES_PER_PIXEL
-	do
-		local ty = 0
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				ty += MAX_TILE_SIZE
-			else
-				shouldIncrement = true
-			end
-			if not (ty < h) then
-				break
-			end
-			local tileH = math.min(MAX_TILE_SIZE, h - ty)
-			do
-				local tx = 0
-				local shouldIncrement_1 = false
-				while true do
-					if shouldIncrement_1 then
-						tx += MAX_TILE_SIZE
-					else
-						shouldIncrement_1 = true
-					end
-					if not (tx < w) then
-						break
-					end
-					local tileW = math.min(MAX_TILE_SIZE, w - tx)
-					local tileBuf = img:ReadPixelsBuffer(Vector2.new(tx, ty), Vector2.new(tileW, tileH))
-					local tileRowBytes = tileW * BYTES_PER_PIXEL
-					do
-						local row = 0
-						local shouldIncrement_2 = false
-						while true do
-							if shouldIncrement_2 then
-								row += 1
-							else
-								shouldIncrement_2 = true
-							end
-							if not (row < tileH) then
-								break
-							end
-							buffer.copy(
-								fullBuf,
-								(ty + row) * fullRowBytes + tx * BYTES_PER_PIXEL,
-								tileBuf,
-								row * tileRowBytes,
-								tileRowBytes
-							)
-						end
-					end
-				end
+	for ty = 0, h - 1, MAX_TILE_SIZE do
+		local tileH = math.min(MAX_TILE_SIZE, h - ty)
+		for tx = 0, w - 1, MAX_TILE_SIZE do
+			local tileW = math.min(MAX_TILE_SIZE, w - tx)
+			local tileBuf = img:ReadPixelsBuffer(Vector2.new(tx, ty), Vector2.new(tileW, tileH))
+			local tileRowBytes = tileW * BYTES_PER_PIXEL
+			for row = 0, tileH - 1 do
+				buffer.copy(
+					fullBuf,
+					(ty + row) * fullRowBytes + tx * BYTES_PER_PIXEL,
+					tileBuf,
+					row * tileRowBytes,
+					tileRowBytes
+				)
 			end
 		end
 	end
@@ -230,7 +194,6 @@ local function captureRead(requestData)
 	return readContentToBase64(contentId)
 end
 return {
-	captureScreenshotData = captureScreenshotData,
 	captureScreenshot = captureScreenshot,
 	captureBegin = captureBegin,
 	captureRead = captureRead,

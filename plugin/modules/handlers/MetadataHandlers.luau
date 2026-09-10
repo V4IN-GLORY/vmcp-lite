@@ -71,7 +71,7 @@ local function getAttributes(requestData)
 		local attributes = instance:GetAttributes()
 		local serializedAttributes = {}
 		local count = 0
-		for name, value in pairs(attributes) do
+		for name, value in attributes do
 			serializedAttributes[name] = {
 				value = serializeValue(value),
 				type = typeof(value),
@@ -104,21 +104,15 @@ local function getSelection(_requestData)
 			message = "No objects selected",
 		}
 	end
-	-- ▼ ReadonlyArray.map ▼
-	local newValue = table.create(#selection)
-	local callback = function(instance)
-		return {
+	local selectedObjects = table.create(#selection)
+	for i, instance in selection do
+		selectedObjects[i] = {
 			name = instance.Name,
 			className = instance.ClassName,
 			path = getInstancePath(instance),
 			parent = if instance.Parent then getInstancePath(instance.Parent) else nil,
 		}
 	end
-	for _k, _v in selection do
-		newValue[_k] = callback(_v, _k - 1, selection)
-	end
-	-- ▲ ReadonlyArray.map ▲
-	local selectedObjects = newValue
 	return {
 		success = true,
 		selection = selectedObjects,

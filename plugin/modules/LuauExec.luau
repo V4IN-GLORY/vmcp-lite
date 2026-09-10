@@ -39,22 +39,10 @@ local WRAPPER_LINE_OFFSET = 84
 local function countLines(s)
 	local n = 1
 	local size = #s
-	do
-		local i = 1
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				i += 1
-			else
-				shouldIncrement = true
-			end
-			if not (i <= size) then
-				break
-			end
-			if string.sub(s, i, i) == "\n" then
-				n += 1
-			end
-		end
+	for i = 1, size do
+	if string.sub(s, i, i) == "\n" then
+		n += 1
+	end
 	end
 	return n
 end
@@ -87,14 +75,14 @@ local function buildWrapper(code, payloadInstanceName)
 \t\t__mcp_real_print(...)\
 \t\tlocal args = \{...\}\
 \t\tlocal parts = table.create(#args)\
-\t\tfor i, a in ipairs(args) do parts[i] = tostring(a) end\
+\t\tfor i, a in args do parts[i] = tostring(a) end\
 \t\ttable.insert(__mcp_output, table.concat(parts, "\\t"))\
 \tend\
 \tlocal warn = function(...)\
 \t\t__mcp_real_warn(...)\
 \t\tlocal args = \{...\}\
 \t\tlocal parts = table.create(#args)\
-\t\tfor i, a in ipairs(args) do parts[i] = tostring(a) end\
+\t\tfor i, a in args do parts[i] = tostring(a) end\
 \t\ttable.insert(__mcp_output, "[warn] " .. table.concat(parts, "\\t"))\
 \tend\
 \tlocal function __mcp_is_stack_noise(msg)\
@@ -342,24 +330,12 @@ function recoverPayloadRequireError(err, userLines, payloadInstanceName, history
 		local payloadPathPrefix = `Workspace.{payloadInstanceName}:`
 		local hist = LogService:GetLogHistory()
 		local start = math.max(0, historyStart)
-		do
-			local i = #hist - 1
-			local shouldIncrement = false
-			while true do
-				if shouldIncrement then
-					i -= 1
-				else
-					shouldIncrement = true
-				end
-				if not (i >= start) then
-					break
-				end
-				local e = hist[i + 1]
-				if e.messageType == Enum.MessageType.MessageError and string.sub(e.message, 1, #payloadPathPrefix) == payloadPathPrefix then
-					errMsg = e.message
-					break
-				end
-			end
+		for i = #hist - 1, start, -1 do
+		local e = hist[i + 1]
+		if e.messageType == Enum.MessageType.MessageError and string.sub(e.message, 1, #payloadPathPrefix) == payloadPathPrefix then
+			errMsg = e.message
+			break
+		end
 		end
 	end
 	return remapPayloadLines(errMsg, userLines, payloadInstanceName)
@@ -422,5 +398,4 @@ return {
 	execute = execute,
 	formatReturnValue = formatReturnValue,
 	recoverPayloadRequireError = recoverPayloadRequireError,
-	remapPayloadLines = remapPayloadLines,
 }

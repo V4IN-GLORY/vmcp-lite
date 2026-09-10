@@ -27,7 +27,7 @@ local function setProperties(requestData)
 	local results = {}
 	local successCount = 0
 	local failureCount = 0
-	for propName, propValue in pairs(properties) do
+	for propName, propValue in properties do
 		local success, err = pcall(function()
 			if propName == "Parent" or propName == "PrimaryPart" then
 				if type(propValue) == "string" then

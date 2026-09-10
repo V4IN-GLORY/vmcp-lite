@@ -568,20 +568,12 @@ local function getProjectStructure(requestData)
 		end
 		local children = instance:GetChildren()
 		if showScriptsOnly then
-			-- ▼ ReadonlyArray.filter ▼
-			local newValue = {}
-			local callback = function(child)
-				return child:IsA("BaseScript") or child:IsA("Folder") or child:IsA("ModuleScript")
-			end
-			local length = 0
-			for _k, _v in children do
-				if callback(_v, _k - 1, children) == true then
-					length += 1
-					newValue[length] = _v
+			children = {}
+			for _, child in children do
+				if child:IsA("BaseScript") or child:IsA("Folder") or child:IsA("ModuleScript") then
+					table.insert(children, child)
 				end
 			end
-			-- ▲ ReadonlyArray.filter ▲
-			children = newValue
 		end
 		local nodeChildren = {}
 		local childCount = #children
@@ -595,61 +587,28 @@ local function getProjectStructure(requestData)
 				table.insert(classGroups[cn], child)
 			end
 			local childSummary = {}
-			-- ▼ ReadonlyMap.forEach ▼
-			local callback = function(classChildren, cn)
-				local object = {
+			for cn, classChildren in classGroups do
+				local first, second = classChildren[1], classChildren[2]
+				table.insert(childSummary, {
 					className = cn,
 					count = #classChildren,
-				}
-				local result = classChildren[1]
-				if result ~= nil then
-					result = result.Name
-				end
-				local result_1 = classChildren[2]
-				if result_1 ~= nil then
-					result_1 = result_1.Name
-				end
-				object.examples = { result, result_1 }
-				table.insert(childSummary, object)
+					examples = { if first then first.Name else nil, if second then second.Name else nil },
+				})
 			end
-			for _k, _v in classGroups do
-				callback(_v, _k, classGroups)
-			end
-			-- ▲ ReadonlyMap.forEach ▲
 			node.childSummary = childSummary
-			-- ▼ ReadonlyMap.forEach ▼
-			local callback_1 = function(classChildren, cn)
-				local limit = math.min(3, #classChildren)
-				do
-					local i = 0
-					local shouldIncrement = false
-					while true do
-						if shouldIncrement then
-							i += 1
-						else
-							shouldIncrement = true
-						end
-						if not (i < limit) then
-							break
-						end
-						local arg0 = getStructure(classChildren[i + 1], depth + 1)
-						table.insert(nodeChildren, arg0)
-					end
+			for cn, classChildren in classGroups do
+				for i = 1, math.min(3, #classChildren) do
+					table.insert(nodeChildren, getStructure(classChildren[i], depth + 1))
 				end
 				if #classChildren > 3 then
-					local arg0 = {
+					table.insert(nodeChildren, {
 						name = `... {#classChildren - 3} more {cn} objects`,
 						className = "MoreIndicator",
 						path = `{getInstancePath(instance)} [{cn} children]`,
 						note = "Use specific path to explore these objects",
-					}
-					table.insert(nodeChildren, arg0)
+					})
 				end
 			end
-			for _k, _v in classGroups do
-				callback_1(_v, _k, classGroups)
-			end
-			-- ▲ ReadonlyMap.forEach ▲
 		else
 			for _, child in children do
 				local arg0 = getStructure(child, depth + 1)

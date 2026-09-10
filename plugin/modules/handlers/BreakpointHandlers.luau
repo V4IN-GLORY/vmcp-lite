@@ -409,12 +409,7 @@ local function clearAllBreakpoints(requestData)
 		return serviceOrError
 	end
 	local service = serviceOrError
-	-- ▼ ReadonlyMap.size ▼
-	local _size = 0
-	for _ in breakpoints do
-		_size += 1
-	end
-	-- ▲ ReadonlyMap.size ▲
+	local _size = Utils.countKeys(breakpoints)
 	local managedCount = _size
 	local ok, err = pcall(function()
 		return service:ClearBreakpoints()

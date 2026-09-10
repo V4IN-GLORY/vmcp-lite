@@ -87,19 +87,6 @@ local function processRequest(request, context)
 		}
 	end
 end
-local function getConnectionStatus()
-	local conn = State.getActiveConnection()
-	if not conn.isActive then
-		return "disconnected"
-	end
-	if conn.consecutiveFailures >= conn.maxFailuresBeforeError then
-		return "error"
-	end
-	if conn.lastHttpOk then
-		return "connected"
-	end
-	return "connecting"
-end
 local function dispatchSocketRequest(request, context)
 	if request.peerId ~= PluginSession.peerId then
 		return ClientBroker.dispatchClientRequest(request.peerId, request.target, request.endpoint, request.data)
@@ -334,7 +321,6 @@ local function checkForUpdates()
 	end)
 end
 return {
-	getConnectionStatus = getConnectionStatus,
 	activatePlugin = activatePlugin,
 	deactivatePlugin = deactivatePlugin,
 	deactivateAll = deactivateAll,

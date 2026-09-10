@@ -169,21 +169,9 @@ local function summarizeMode(mode, config, service, topN, raw)
 		return metric(a, config.sortByTriangles == true) > metric(b, config.sortByTriangles == true)
 	end)
 	local top = {}
-	do
-		local i = 0
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				i += 1
-			else
-				shouldIncrement = true
-			end
-			if not (i < math.min(topN, #leaves)) then
-				break
-			end
-			local arg0 = compactEntry(leaves[i + 1])
-			table.insert(top, arg0)
-		end
+	for i = 0, math.min(topN, #leaves) - 1 do
+		local arg0 = compactEntry(leaves[i + 1])
+		table.insert(top, arg0)
 	end
 	local body = {
 		mode = mode,

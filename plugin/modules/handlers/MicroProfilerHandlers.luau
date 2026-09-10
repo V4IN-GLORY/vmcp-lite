@@ -1,4 +1,5 @@
 local RunService = game:GetService("RunService")
+local Utils = require(script.Parent.Parent.Utils)
 local DEFAULT_DURATION_MS = 1000
 local MIN_DURATION_MS = 100
 local MAX_DURATION_MS = 5000
@@ -71,40 +72,16 @@ local function cooperativeSort(values, comesBefore, checkpoint)
 			root = candidate
 		end
 	end
-	do
-		local start = math.floor((count - 2) / 2)
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				start -= 1
-			else
-				shouldIncrement = true
-			end
-			if not (start >= 0) then
-				break
-			end
-			siftDown(start, count - 1)
-			checkpoint()
-		end
+	for start = math.floor((count - 2) / 2), 0, -1 do
+		siftDown(start, count - 1)
+		checkpoint()
 	end
-	do
-		local lastIndex = count - 1
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				lastIndex -= 1
-			else
-				shouldIncrement = true
-			end
-			if not (lastIndex > 0) then
-				break
-			end
-			local value = values[1]
-			values[1] = values[lastIndex + 1]
-			values[lastIndex + 1] = value
-			checkpoint()
-			siftDown(0, lastIndex - 1)
-		end
+	for lastIndex = count - 1, 0 + 1, -1 do
+		local value = values[1]
+		values[1] = values[lastIndex + 1]
+		values[lastIndex + 1] = value
+		checkpoint()
+		siftDown(0, lastIndex - 1)
 	end
 end
 local function normalizeDurationMs(value)
@@ -191,7 +168,7 @@ local function percentile(sortedValues, fraction)
 end
 local function copyRecord(row)
 	local out = {}
-	for key, value in pairs(row) do
+	for key, value in row do
 		out[key] = value
 	end
 	return out
@@ -221,12 +198,7 @@ end
 local function summarizeFrameImpact(frameRawById, analyzedFrames, checkpoint)
 	local condition = frameRawById == nil
 	if not condition then
-		-- ▼ ReadonlyMap.size ▼
-		local _size = 0
-		for _ in frameRawById do
-			_size += 1
-		end
-		-- ▲ ReadonlyMap.size ▲
+		local _size = Utils.countKeys(frameRawById)
 		condition = _size == 0
 	end
 	if condition then
@@ -398,58 +370,42 @@ local function collectFrameSummary(session, startFrame, frameMax, checkpoint)
 	local durations = {}
 	local incompleteFrames = 0
 	local pausedFrames = 0
-	do
-		local _frameId = startFrame
-		local shouldIncrement = false
-		while true do
-			local frameId = _frameId
-			if shouldIncrement then
-				frameId += 1
-			else
-				shouldIncrement = true
-			end
-			if not (frameId <= frameMax) then
-				break
-			end
-			checkpoint()
-			local ok, descOrErr = safeCall(function()
-				return session:GetFrameDesc(frameId)
-			end)
-			if not ok or not (descOrErr ~= "" and descOrErr) then
-				_frameId = frameId
-				continue
-			end
-			local desc = descOrErr
-			local tickStart = desc:TickStartCpu()
-			local tickEnd = desc:TickEndCpu()
-			local durationRaw = tickEnd - tickStart
-			local isIncomplete = desc:IsIncomplete()
-			local isPaused = desc:IsPaused()
-			if isIncomplete then
-				incompleteFrames += 1
-			end
-			if isPaused then
-				pausedFrames += 1
-			end
-			if durationRaw <= 0 or durationRaw > 1000000000000 then
-				_frameId = frameId
-				continue
-			end
-			local durationUs = rawToUs(durationRaw)
-			table.insert(durations, durationUs)
-			local row = {
-				frame_id = frameId,
-				duration_us = durationUs,
-			}
-			if isIncomplete then
-				row.incomplete = true
-			end
-			if isPaused then
-				row.paused = true
-			end
-			table.insert(frameRows, row)
-			_frameId = frameId
+	for frameId = startFrame, frameMax do
+		checkpoint()
+		local ok, descOrErr = safeCall(function()
+			return session:GetFrameDesc(frameId)
+		end)
+		if not ok or not (descOrErr ~= "" and descOrErr) then
+			continue
 		end
+		local desc = descOrErr
+		local tickStart = desc:TickStartCpu()
+		local tickEnd = desc:TickEndCpu()
+		local durationRaw = tickEnd - tickStart
+		local isIncomplete = desc:IsIncomplete()
+		local isPaused = desc:IsPaused()
+		if isIncomplete then
+			incompleteFrames += 1
+		end
+		if isPaused then
+			pausedFrames += 1
+		end
+		if durationRaw <= 0 or durationRaw > 1000000000000 then
+			continue
+		end
+		local durationUs = rawToUs(durationRaw)
+		table.insert(durations, durationUs)
+		local row = {
+			frame_id = frameId,
+			duration_us = durationUs,
+		}
+		if isIncomplete then
+			row.incomplete = true
+		end
+		if isPaused then
+			row.paused = true
+		end
+		table.insert(frameRows, row)
 	end
 	cooperativeSort(durations, function(a, b)
 		return a < b
@@ -463,20 +419,8 @@ local function collectFrameSummary(session, startFrame, frameMax, checkpoint)
 		checkpoint()
 	end
 	local topFrames = {}
-	do
-		local i = 0
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				i += 1
-			else
-				shouldIncrement = true
-			end
-			if not (i < math.min(10, #frameRows)) then
-				break
-			end
-			table.insert(topFrames, frameRows[i + 1])
-		end
+	for i = 0, math.min(10, #frameRows) - 1 do
+		table.insert(topFrames, frameRows[i + 1])
 	end
 	local count = #durations
 	return {
@@ -806,11 +750,7 @@ local function captureMicroProfiler(requestData)
 			local entry
 			while #stack > 0 do
 				checkpoint()
-				-- ▼ Array.pop ▼
-				local length = #stack
-				local result = stack[length]
-				stack[length] = nil
-				-- ▲ Array.pop ▲
+				local result = table.remove(stack)
 				local candidate = result
 				if candidate and candidate.timerId == timerId then
 					entry = candidate
@@ -863,12 +803,7 @@ local function captureMicroProfiler(requestData)
 			addTimerAggregate(threadMap, threadId, inclusiveRaw, exclusiveRaw)
 		end
 	end
-	-- ▼ ReadonlySet.size ▼
-	local _size = 0
-	for _ in sampledFrames do
-		_size += 1
-	end
-	-- ▲ ReadonlySet.size ▲
+	local _size = Utils.countKeys(sampledFrames)
 	local sampledFrameCoveragePct = percent(_size, framesConsidered)
 	local analysisFrameMin = if sampledFrameMin ~= nil then sampledFrameMin else startFrame
 	local analysisFrameMax = if sampledFrameMax ~= nil then sampledFrameMax else frameMax
@@ -878,20 +813,10 @@ local function captureMicroProfiler(requestData)
 	if condition_3 then
 		_result = frameSummary.frames
 	else
-		-- ▼ ReadonlySet.size ▼
-		local size_1 = 0
-		for _ in sampledFrames do
-			size_1 += 1
-		end
-		-- ▲ ReadonlySet.size ▲
+		local size_1 = Utils.countKeys(sampledFrames)
 		local _result_1
 		if size_1 > 0 then
-			-- ▼ ReadonlySet.size ▼
-			local size_2 = 0
-			for _ in sampledFrames do
-				size_2 += 1
-			end
-			-- ▲ ReadonlySet.size ▲
+			local size_2 = Utils.countKeys(sampledFrames)
 			_result_1 = size_2
 		else
 			_result_1 = framesConsidered
@@ -971,7 +896,7 @@ local function captureMicroProfiler(requestData)
 			row.max_to_avg = maxToAvg
 		end
 		local timerFrameImpact = summarizeFrameImpact(timerFrameAggregates[timerId], analysisFrameCount, checkpoint)
-		for key, value in pairs(timerFrameImpact) do
+		for key, value in timerFrameImpact do
 			row[key] = value
 		end
 		if info.is_user_timer == true then
@@ -1065,20 +990,8 @@ local function captureMicroProfiler(requestData)
 			end, checkpoint)
 			if maxRelatedTimers > 0 and #timerThreadSummaryRows > 0 then
 				local topTimerThreads = {}
-				do
-					local i = 0
-					local shouldIncrement = false
-					while true do
-						if shouldIncrement then
-							i += 1
-						else
-							shouldIncrement = true
-						end
-						if not (i < math.min(maxRelatedTimers, #timerThreadSummaryRows)) then
-							break
-						end
-						table.insert(topTimerThreads, timerThreadSummaryRows[i + 1])
-					end
+				for i = 0, math.min(maxRelatedTimers, #timerThreadSummaryRows) - 1 do
+					table.insert(topTimerThreads, timerThreadSummaryRows[i + 1])
 				end
 				row.top_threads = topTimerThreads
 			end
@@ -1177,61 +1090,25 @@ local function captureMicroProfiler(requestData)
 			local children = childRelationsByParent[timerId]
 			if parents ~= nil and #parents > 0 then
 				local topParents = {}
-				do
-					local i = 0
-					local shouldIncrement = false
-					while true do
-						if shouldIncrement then
-							i += 1
-						else
-							shouldIncrement = true
-						end
-						if not (i < math.min(maxRelatedTimers, #parents)) then
-							break
-						end
-						table.insert(topParents, parents[i + 1])
-					end
+				for i = 0, math.min(maxRelatedTimers, #parents) - 1 do
+					table.insert(topParents, parents[i + 1])
 				end
 				row.top_parents = topParents
 			end
 			if children ~= nil and #children > 0 then
 				local topChildren = {}
-				do
-					local i = 0
-					local shouldIncrement = false
-					while true do
-						if shouldIncrement then
-							i += 1
-						else
-							shouldIncrement = true
-						end
-						if not (i < math.min(maxRelatedTimers, #children)) then
-							break
-						end
-						table.insert(topChildren, children[i + 1])
-					end
+				for i = 0, math.min(maxRelatedTimers, #children) - 1 do
+					table.insert(topChildren, children[i + 1])
 				end
 				row.top_children = topChildren
 			end
 		end
 	end
 	local topTimers = {}
-	do
-		local i = 0
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				i += 1
-			else
-				shouldIncrement = true
-			end
-			if not (i < math.min(maxTimers, #rows)) then
-				break
-			end
-			local row = copyRecord(rows[i + 1])
-			row.rank = i + 1
-			table.insert(topTimers, row)
-		end
+	for i = 0, math.min(maxTimers, #rows) - 1 do
+		local row = copyRecord(rows[i + 1])
+		row.rank = i + 1
+		table.insert(topTimers, row)
 	end
 	local rowsByExclusive = {}
 	for _, row in rows do
@@ -1242,40 +1119,16 @@ local function captureMicroProfiler(requestData)
 		return a.exclusive_us > b.exclusive_us
 	end, checkpoint)
 	local topTimersByExclusive = {}
-	do
-		local i = 0
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				i += 1
-			else
-				shouldIncrement = true
-			end
-			if not (i < math.min(maxTimers, #rowsByExclusive)) then
-				break
-			end
-			local row = copyRecord(rowsByExclusive[i + 1])
-			row.rank = i + 1
-			table.insert(topTimersByExclusive, row)
-		end
+	for i = 0, math.min(maxTimers, #rowsByExclusive) - 1 do
+		local row = copyRecord(rowsByExclusive[i + 1])
+		row.rank = i + 1
+		table.insert(topTimersByExclusive, row)
 	end
 	local topEdges = {}
-	do
-		local i = 0
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				i += 1
-			else
-				shouldIncrement = true
-			end
-			if not (i < math.min(maxTimers, #edgeRows)) then
-				break
-			end
-			local row = copyRecord(edgeRows[i + 1])
-			row.rank = i + 1
-			table.insert(topEdges, row)
-		end
+	for i = 0, math.min(maxTimers, #edgeRows) - 1 do
+		local row = copyRecord(edgeRows[i + 1])
+		row.rank = i + 1
+		table.insert(topEdges, row)
 	end
 	local threadRows = {}
 	for threadId, aggregate in threadAggregates do
@@ -1301,21 +1154,9 @@ local function captureMicroProfiler(requestData)
 			return a.inclusive_us > b.inclusive_us
 		end, checkpoint)
 		local topThreadTimers = {}
-		do
-			local i = 0
-			local shouldIncrement = false
-			while true do
-				if shouldIncrement then
-					i += 1
-				else
-					shouldIncrement = true
-				end
-				if not (i < math.min(maxTimersPerGroup, #timerRows)) then
-					break
-				end
-				local timerRow = copyRecord(timerRows[i + 1])
-				table.insert(topThreadTimers, timerRow)
-			end
+		for i = 0, math.min(maxTimersPerGroup, #timerRows) - 1 do
+			local timerRow = copyRecord(timerRows[i + 1])
+			table.insert(topThreadTimers, timerRow)
 		end
 		if #topThreadTimers > 0 then
 			row.top_timers = topThreadTimers
@@ -1326,22 +1167,10 @@ local function captureMicroProfiler(requestData)
 		return a.inclusive_us > b.inclusive_us
 	end, checkpoint)
 	local topThreads = {}
-	do
-		local i = 0
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				i += 1
-			else
-				shouldIncrement = true
-			end
-			if not (i < math.min(maxGroups, #threadRows)) then
-				break
-			end
-			local row = threadRows[i + 1]
-			row.rank = i + 1
-			table.insert(topThreads, row)
-		end
+	for i = 0, math.min(maxGroups, #threadRows) - 1 do
+		local row = threadRows[i + 1]
+		row.rank = i + 1
+		table.insert(topThreads, row)
 	end
 	local groupRows = {}
 	for _, aggregate in groupAggregates do
@@ -1355,31 +1184,19 @@ local function captureMicroProfiler(requestData)
 			return a.inclusive_us > b.inclusive_us
 		end, checkpoint)
 		local topGroupTimers = {}
-		do
-			local i = 0
-			local shouldIncrement = false
-			while true do
-				if shouldIncrement then
-					i += 1
-				else
-					shouldIncrement = true
-				end
-				if not (i < math.min(maxTimersPerGroup, #timerRows)) then
-					break
-				end
-				local timerRow = timerRows[i + 1]
-				local arg0 = {
-					timer_id = timerRow.timer_id,
-					name = timerRow.name,
-					inclusive_us = timerRow.inclusive_us,
-					inclusive_us_per_s = timerRow.inclusive_us_per_s,
-					exclusive_us = timerRow.exclusive_us,
-					count = timerRow.count,
-					max_invocation_us = timerRow.max_invocation_us,
-					max_frame_inclusive_us = timerRow.max_frame_inclusive_us,
-				}
-				table.insert(topGroupTimers, arg0)
-			end
+		for i = 0, math.min(maxTimersPerGroup, #timerRows) - 1 do
+			local timerRow = timerRows[i + 1]
+			local arg0 = {
+				timer_id = timerRow.timer_id,
+				name = timerRow.name,
+				inclusive_us = timerRow.inclusive_us,
+				inclusive_us_per_s = timerRow.inclusive_us_per_s,
+				exclusive_us = timerRow.exclusive_us,
+				count = timerRow.count,
+				max_invocation_us = timerRow.max_invocation_us,
+				max_frame_inclusive_us = timerRow.max_frame_inclusive_us,
+			}
+			table.insert(topGroupTimers, arg0)
 		end
 		local inclusiveUs = rawToUs(aggregate.inclusive_raw)
 		local exclusiveUs = rawToUs(aggregate.exclusive_raw)
@@ -1399,7 +1216,7 @@ local function captureMicroProfiler(requestData)
 		}
 		local groupFrameImpact =
 			summarizeFrameImpact(groupFrameAggregates[aggregate.group], analysisFrameCount, checkpoint)
-		for key, value in pairs(groupFrameImpact) do
+		for key, value in groupFrameImpact do
 			groupRow[key] = value
 		end
 		if #topGroupTimers > 0 then
@@ -1411,22 +1228,10 @@ local function captureMicroProfiler(requestData)
 		return a.inclusive_us > b.inclusive_us
 	end, checkpoint)
 	local topGroups = {}
-	do
-		local i = 0
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				i += 1
-			else
-				shouldIncrement = true
-			end
-			if not (i < math.min(maxGroups, #groupRows)) then
-				break
-			end
-			local row = copyRecord(groupRows[i + 1])
-			row.rank = i + 1
-			table.insert(topGroups, row)
-		end
+	for i = 0, math.min(maxGroups, #groupRows) - 1 do
+		local row = copyRecord(groupRows[i + 1])
+		row.rank = i + 1
+		table.insert(topGroups, row)
 	end
 	local groupRowsByExclusive = {}
 	for _, row in groupRows do
@@ -1437,22 +1242,10 @@ local function captureMicroProfiler(requestData)
 		return a.exclusive_us > b.exclusive_us
 	end, checkpoint)
 	local topGroupsByExclusive = {}
-	do
-		local i = 0
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				i += 1
-			else
-				shouldIncrement = true
-			end
-			if not (i < math.min(maxGroups, #groupRowsByExclusive)) then
-				break
-			end
-			local row = copyRecord(groupRowsByExclusive[i + 1])
-			row.rank = i + 1
-			table.insert(topGroupsByExclusive, row)
-		end
+	for i = 0, math.min(maxGroups, #groupRowsByExclusive) - 1 do
+		local row = copyRecord(groupRowsByExclusive[i + 1])
+		row.rank = i + 1
+		table.insert(topGroupsByExclusive, row)
 	end
 	local omitted = {}
 	if omittedIdle > 0 then
@@ -1565,12 +1358,7 @@ local function captureMicroProfiler(requestData)
 		processed_frame_min = sampledFrameMin,
 		processed_frame_max = sampledFrameMax,
 	}
-	-- ▼ ReadonlySet.size ▼
-	local size_1 = 0
-	for _ in sampledFrames do
-		size_1 += 1
-	end
-	-- ▲ ReadonlySet.size ▲
+	local size_1 = Utils.countKeys(sampledFrames)
 	object_1.processed_frame_count = size_1
 	object_1.selected_frame_event_coverage_pct = sampledFrameCoveragePct
 	object_1.frame_window = frameWindow
@@ -1600,12 +1388,7 @@ local function captureMicroProfiler(requestData)
 		sampled_frame_min = sampledFrameMin,
 		sampled_frame_max = sampledFrameMax,
 	}
-	-- ▼ ReadonlySet.size ▼
-	local size_2 = 0
-	for _ in sampledFrames do
-		size_2 += 1
-	end
-	-- ▲ ReadonlySet.size ▲
+	local size_2 = Utils.countKeys(sampledFrames)
 	object_3.sampled_frames = size_2
 	object_3.events_sampled = eventsSampled
 	object_3.enter_events = enterEvents

@@ -199,38 +199,14 @@ local function summarizeProfile(rawJson, profile, requestData, durationMs, frequ
 		return a.total_us > b.total_us
 	end)
 	local topFunctions = {}
-	do
-		local i = 0
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				i += 1
-			else
-				shouldIncrement = true
-			end
-			if not (i < math.min(maxFunctions, #rows)) then
-				break
-			end
-			local arg0 = compactFunction(rows[i + 1], i + 1, durationMs)
-			table.insert(topFunctions, arg0)
-		end
+	for i = 0, math.min(maxFunctions, #rows) - 1 do
+		local arg0 = compactFunction(rows[i + 1], i + 1, durationMs)
+		table.insert(topFunctions, arg0)
 	end
 	local debugLabels = {}
-	do
-		local i = 0
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				i += 1
-			else
-				shouldIncrement = true
-			end
-			if not (i < math.min(maxFunctions, #debugRows)) then
-				break
-			end
-			local arg0 = compactFunction(debugRows[i + 1], i + 1, durationMs)
-			table.insert(debugLabels, arg0)
-		end
+	for i = 0, math.min(maxFunctions, #debugRows) - 1 do
+		local arg0 = compactFunction(debugRows[i + 1], i + 1, durationMs)
+		table.insert(debugLabels, arg0)
 	end
 	local categoryNames = {}
 	for i = 0, #categories - 1 do

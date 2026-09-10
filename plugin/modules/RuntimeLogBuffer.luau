@@ -134,20 +134,12 @@ end
 local function query(opts)
 	local _result
 	if opts.since ~= nil then
-		-- ▼ ReadonlyArray.filter ▼
-		local newValue = {}
-		local callback = function(e)
-			return e.seq > opts.since
-		end
-		local length = 0
-		for _k, _v in entries do
-			if callback(_v, _k - 1, entries) == true then
-				length += 1
-				newValue[length] = _v
+		_result = {}
+		for _, e in entries do
+			if e.seq > opts.since then
+				table.insert(_result, e)
 			end
 		end
-		-- ▲ ReadonlyArray.filter ▲
-		_result = newValue
 	else
 		local array = {}
 		table.move(entries, 1, #entries, #array + 1, array)
@@ -161,40 +153,20 @@ local function query(opts)
 		-- because '-' means "0+" in Lua patterns). Substring search matches
 		-- most users' mental model of "filter messages containing this text".
 		local needle = opts.filter
-		-- ▼ ReadonlyArray.filter ▼
-		local newValue = {}
-		local callback = function(e)
+		result = {}
+		for _, e in result do
 			local start = string.find(e.message, needle, 1, true)
-			return start ~= nil
-		end
-		local length = 0
-		for _k, _v in result do
-			if callback(_v, _k - 1, result) == true then
-				length += 1
-				newValue[length] = _v
+			if start ~= nil then
+				table.insert(result, e)
 			end
 		end
-		-- ▲ ReadonlyArray.filter ▲
-		result = newValue
 	end
 	if opts.tail ~= nil and #result > opts.tail then
 		-- roblox-ts arrays don't expose .slice; manual tail copy.
 		local tailed = {}
 		local start = #result - opts.tail
-		do
-			local i = start
-			local shouldIncrement = false
-			while true do
-				if shouldIncrement then
-					i += 1
-				else
-					shouldIncrement = true
-				end
-				if not (i < #result) then
-					break
-				end
-				table.insert(tailed, result[i + 1])
-			end
+		for i = start, #result - 1 do
+			table.insert(tailed, result[i + 1])
 		end
 		result = tailed
 	end

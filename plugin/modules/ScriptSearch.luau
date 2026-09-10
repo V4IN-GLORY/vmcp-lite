@@ -202,11 +202,7 @@ local function createScriptSearch(corpus)
 		local hitLimit = false
 		while #stack > 0 and not hitLimit do
 			control:checkpoint()
-			-- ▼ Array.pop ▼
-			local length = #stack
-			local result_1 = stack[length]
-			stack[length] = nil
-			-- ▲ Array.pop ▲
+			local result_1 = table.remove(stack)
 			local instance = result_1
 			local snapshot = corpus:readScript(instance, classFilter)
 			if snapshot ~= nil and (classFilter == nil or snapshot.className == classFilter) then

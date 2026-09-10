@@ -60,6 +60,5 @@ local function notRenderingReason()
 end
 return {
 	start = start,
-	secondsSinceFrame = secondsSinceFrame,
 	notRenderingReason = notRenderingReason,
 }

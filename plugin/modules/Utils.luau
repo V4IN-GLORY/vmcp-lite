@@ -525,7 +525,9 @@ local function convertPropertyValue(instance, propertyName, propertyValue)
 			end
 		end
 		if propertyName == "BrickColor" then
-			return BrickColor.new(propertyValue)
+			-- Cast: propertyValue is a JSON-decoded name, not one of the literal
+			-- BrickColor names the overload expects.
+			return BrickColor.new(propertyValue :: any)
 		end
 		if propertyValue == "true" then
 			return true
@@ -535,180 +537,6 @@ local function convertPropertyValue(instance, propertyName, propertyValue)
 		end
 	end
 	return propertyValue
-end
-local function evaluateFormula(formula, variables, instance, index)
-	local value = formula
-	local arg1 = tostring(index)
-	value = (string.gsub(value, "index", arg1))
-	if instance and instance:IsA("BasePart") then
-		local pos = instance.Position
-		local sz = instance.Size
-		local arg1_1 = tostring(pos.X)
-		value = (string.gsub(value, "Position%.X", arg1_1))
-		local arg1_2 = tostring(pos.Y)
-		value = (string.gsub(value, "Position%.Y", arg1_2))
-		local arg1_3 = tostring(pos.Z)
-		value = (string.gsub(value, "Position%.Z", arg1_3))
-		local arg1_4 = tostring(sz.X)
-		value = (string.gsub(value, "Size%.X", arg1_4))
-		local arg1_5 = tostring(sz.Y)
-		value = (string.gsub(value, "Size%.Y", arg1_5))
-		local arg1_6 = tostring(sz.Z)
-		value = (string.gsub(value, "Size%.Z", arg1_6))
-		local arg1_7 = tostring(pos.Magnitude)
-		value = (string.gsub(value, "magnitude", arg1_7))
-	end
-	if variables then
-		for k, v in pairs(variables) do
-			local arg1_1 = tostring(v)
-			value = (string.gsub(value, k, arg1_1))
-		end
-	end
-	value = (
-		string.gsub(value, "sin%(([%d%.%-]+)%)", function(x)
-			local condition = tonumber(x)
-			if condition == nil then
-				condition = 0
-			end
-			return tostring(math.sin(condition))
-		end)
-	)
-	value = (
-		string.gsub(value, "cos%(([%d%.%-]+)%)", function(x)
-			local condition = tonumber(x)
-			if condition == nil then
-				condition = 0
-			end
-			return tostring(math.cos(condition))
-		end)
-	)
-	value = (
-		string.gsub(value, "sqrt%(([%d%.%-]+)%)", function(x)
-			local condition = tonumber(x)
-			if condition == nil then
-				condition = 0
-			end
-			return tostring(math.sqrt(condition))
-		end)
-	)
-	value = (
-		string.gsub(value, "abs%(([%d%.%-]+)%)", function(x)
-			local condition = tonumber(x)
-			if condition == nil then
-				condition = 0
-			end
-			return tostring(math.abs(condition))
-		end)
-	)
-	value = (
-		string.gsub(value, "floor%(([%d%.%-]+)%)", function(x)
-			local condition = tonumber(x)
-			if condition == nil then
-				condition = 0
-			end
-			return tostring(math.floor(condition))
-		end)
-	)
-	value = (
-		string.gsub(value, "ceil%(([%d%.%-]+)%)", function(x)
-			local condition = tonumber(x)
-			if condition == nil then
-				condition = 0
-			end
-			return tostring(math.ceil(condition))
-		end)
-	)
-	local directResult = tonumber(value)
-	if directResult ~= nil then
-		return directResult, nil
-	end
-	local success, evalResult = pcall(function()
-		local num = tonumber(value)
-		if num ~= nil then
-			return num
-		end
-		do
-			local a, b = string.match(value, "^([%d%.%-]+)%s*%*%s*([%d%.%-]+)$")
-			local condition = a
-			if condition ~= "" and condition then
-				condition = b
-			end
-			if condition ~= "" and condition then
-				local condition_1 = tonumber(a)
-				if condition_1 == nil then
-					condition_1 = 0
-				end
-				local condition_2 = tonumber(b)
-				if condition_2 == nil then
-					condition_2 = 0
-				end
-				return condition_1 * condition_2
-			end
-		end
-		do
-			local a, b = string.match(value, "^([%d%.%-]+)%s*%+%s*([%d%.%-]+)$")
-			local condition = a
-			if condition ~= "" and condition then
-				condition = b
-			end
-			if condition ~= "" and condition then
-				local condition_1 = tonumber(a)
-				if condition_1 == nil then
-					condition_1 = 0
-				end
-				local condition_2 = tonumber(b)
-				if condition_2 == nil then
-					condition_2 = 0
-				end
-				return condition_1 + condition_2
-			end
-		end
-		do
-			local a, b = string.match(value, "^([%d%.%-]+)%s*%-%s*([%d%.%-]+)$")
-			local condition = a
-			if condition ~= "" and condition then
-				condition = b
-			end
-			if condition ~= "" and condition then
-				local condition_1 = tonumber(a)
-				if condition_1 == nil then
-					condition_1 = 0
-				end
-				local condition_2 = tonumber(b)
-				if condition_2 == nil then
-					condition_2 = 0
-				end
-				return condition_1 - condition_2
-			end
-		end
-		do
-			local a, b = string.match(value, "^([%d%.%-]+)%s*/%s*([%d%.%-]+)$")
-			local condition = a
-			if condition ~= "" and condition then
-				condition = b
-			end
-			if condition ~= "" and condition then
-				local condition_1 = tonumber(b)
-				if condition_1 == nil then
-					condition_1 = 1
-				end
-				local divisor = condition_1
-				if divisor ~= 0 then
-					local condition_2 = tonumber(a)
-					if condition_2 == nil then
-						condition_2 = 0
-					end
-					return condition_2 / divisor
-				end
-			end
-		end
-		error(`Unsupported formula pattern: {value}`)
-	end)
-	if success and type(evalResult) == "number" then
-		return evalResult, nil
-	else
-		return index, "Complex formulas not supported - using index value"
-	end
 end
 local function compareVersions(v1, v2)
 	local function parseVersion(v)
@@ -725,39 +553,36 @@ local function compareVersions(v1, v2)
 	local p1 = parseVersion(v1)
 	local p2 = parseVersion(v2)
 	local maxLen = math.max(#p1, #p2)
-	do
-		local i = 0
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				i += 1
-			else
-				shouldIncrement = true
-			end
-			if not (i < maxLen) then
-				break
-			end
-			local condition = p1[i + 1]
-			if condition == nil then
-				condition = 0
-			end
-			local n1 = condition
-			local condition_1 = p2[i + 1]
-			if condition_1 == nil then
-				condition_1 = 0
-			end
-			local n2 = condition_1
-			if n1 < n2 then
-				return -1
-			end
-			if n1 > n2 then
-				return 1
-			end
+	for i = 0, maxLen - 1 do
+		local condition = p1[i + 1]
+		if condition == nil then
+			condition = 0
+		end
+		local n1 = condition
+		local condition_1 = p2[i + 1]
+		if condition_1 == nil then
+			condition_1 = 0
+		end
+		local n2 = condition_1
+		if n1 < n2 then
+			return -1
+		end
+		if n1 > n2 then
+			return 1
 		end
 	end
 	return 0
 end
+local function countKeys(t): number
+	local n = 0
+	for _ in t do
+		n += 1
+	end
+	return n
+end
+
 return {
+	countKeys = countKeys,
 	safeCall = safeCall,
 	getInstancePath = getInstancePath,
 	getInstanceByPath = getInstanceByPath,
@@ -766,6 +591,5 @@ return {
 	readScriptSource = readScriptSource,
 	applyScriptSource = applyScriptSource,
 	convertPropertyValue = convertPropertyValue,
-	evaluateFormula = evaluateFormula,
 	compareVersions = compareVersions,
 }

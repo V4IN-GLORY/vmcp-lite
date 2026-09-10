@@ -102,20 +102,14 @@ local function handleMultiplayerTestState()
 		return StudioTestService:CanLeaveTest()
 	end)
 	local exp = Players:GetPlayers()
-	-- ▼ ReadonlyArray.map ▼
-	local newValue = table.create(#exp)
-	local callback = function(player)
-		return {
+	local players = table.create(#exp)
+	for i, player in exp do
+		players[i] = {
 			name = player.Name,
 			userId = player.UserId,
 			displayName = player.DisplayName,
 		}
 	end
-	for _k, _v in exp do
-		newValue[_k] = callback(_v, _k - 1, exp)
-	end
-	-- ▲ ReadonlyArray.map ▲
-	local players = newValue
 	table.sort(players, function(a, b)
 		return a.name < b.name
 	end)

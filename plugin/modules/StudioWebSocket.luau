@@ -1,6 +1,7 @@
 local HttpService = game:GetService("HttpService")
 local HttpDiagnostics = require(script.Parent.HttpDiagnostics)
 local PluginSession = require(script.Parent.PluginSession)
+local Utils = require(script.Parent.Utils)
 local PROTOCOL_VERSION = 1
 local INITIAL_RETRY_DELAY_SECONDS = 0.5
 local MAX_RETRY_DELAY_SECONDS = 5
@@ -399,18 +400,8 @@ local function retainResponse(requestId, body, serverUrl, progress, admissionRej
 	end
 	-- Admission errors have their own bounded 128 x 4KiB reserve so a full-size
 	-- result never consumes the capacity required to retain a rejection.
-	-- ▼ ReadonlyMap.size ▼
-	local _size = 0
-	for _ in inFlightRequests do
-		_size += 1
-	end
-	-- ▲ ReadonlyMap.size ▲
-	-- ▼ ReadonlyMap.size ▼
-	local size_1 = 0
-	for _ in pendingResponses do
-		size_1 += 1
-	end
-	-- ▲ ReadonlyMap.size ▲
+	local _size = Utils.countKeys(inFlightRequests)
+	local size_1 = Utils.countKeys(pendingResponses)
 	local reservedBytes = (_size + size_1 - pendingRejectionCount) * RESERVED_ERROR_BYTES
 	if not admissionRejection and pendingResponseBytes + #body + reservedBytes > MAX_PENDING_RESPONSE_BYTES then
 		body = encodeError(
@@ -449,19 +440,9 @@ local function rejectAdmission(requestId, detail)
 	local condition = pendingRejectionCount >= MAX_ADMISSION_REJECTIONS
 	if not condition then
 		local exp = terminalCount
-		-- ▼ ReadonlyMap.size ▼
-		local _size = 0
-		for _ in inFlightRequests do
-			_size += 1
-		end
-		-- ▲ ReadonlyMap.size ▲
+		local _size = Utils.countKeys(inFlightRequests)
 		local exp_1 = exp + _size
-		-- ▼ ReadonlyMap.size ▼
-		local size_1 = 0
-		for _ in pendingResponses do
-			size_1 += 1
-		end
-		-- ▲ ReadonlyMap.size ▲
+		local size_1 = Utils.countKeys(pendingResponses)
 		condition = exp_1 + size_1 >= MAX_TERMINAL_RESPONSES
 	end
 	if condition then
@@ -500,18 +481,8 @@ local function dispatchRequest(request, requestBytes)
 	if not active or dispatchOptions == nil then
 		return nil
 	end
-	-- ▼ ReadonlyMap.size ▼
-	local _size = 0
-	for _ in inFlightRequests do
-		_size += 1
-	end
-	-- ▲ ReadonlyMap.size ▲
-	-- ▼ ReadonlyMap.size ▼
-	local size_1 = 0
-	for _ in pendingResponses do
-		size_1 += 1
-	end
-	-- ▲ ReadonlyMap.size ▲
+	local _size = Utils.countKeys(inFlightRequests)
+	local size_1 = Utils.countKeys(pendingResponses)
 	local activeCount = _size + size_1 - pendingRejectionCount
 	if
 		activeCount >= MAX_ACTIVE_RESPONSES

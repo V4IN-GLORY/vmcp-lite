@@ -1,0 +1,6 @@
+# Toolchain for building the MCP Studio plugin. Run `rokit install` once.
+
+[tools]
+rojo = "rojo-rbx/rojo@7.7.0"
+stylua = "JohnnyMorganz/StyLua@0.20.0"
+luau-lsp = "JohnnyMorganz/luau-lsp@1.69.0"

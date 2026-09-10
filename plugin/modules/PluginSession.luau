@@ -179,7 +179,6 @@ return {
 	getMultiplayerGroupId = getMultiplayerGroupId,
 	getPlaceKey = getPlaceKey,
 	getRole = getRole,
-	getPlaceName = getPlaceName,
 	invalidatePlaceName = invalidatePlaceName,
 	prepareSharedTopology = prepareSharedTopology,
 	prepareMultiplayerTopology = prepareMultiplayerTopology,

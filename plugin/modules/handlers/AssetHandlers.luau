@@ -109,20 +109,14 @@ local function insertAsset(requestData)
 		pcall(function()
 			Selection:Set(insertedInstances)
 		end)
-		-- ▼ ReadonlyArray.map ▼
-		local newValue = table.create(#insertedInstances)
-		local callback = function(inst)
-			return {
+		local resultInstances = table.create(#insertedInstances)
+		for i, inst in insertedInstances do
+			resultInstances[i] = {
 				name = inst.Name,
 				className = inst.ClassName,
 				path = getInstancePath(inst),
 			}
 		end
-		for _k, _v in insertedInstances do
-			newValue[_k] = callback(_v, _k - 1, insertedInstances)
-		end
-		-- ▲ ReadonlyArray.map ▲
-		local resultInstances = newValue
 		return {
 			success = true,
 			assetId = assetId,
@@ -340,7 +334,7 @@ local function previewAsset(requestData)
 			end
 			-- Only include props if there are any
 			local hasProps = false
-			for _element, _element_1 in pairs(props) do
+			for _element, _element_1 in props do
 				local _ = { _element, _element_1 }
 				hasProps = true
 				break
@@ -390,12 +384,7 @@ local function previewAsset(requestData)
 			hasSounds = hasSounds,
 			soundCount = #soundReferences,
 		}
-		-- ▼ ReadonlySet.size ▼
-		local _size = 0
-		for _ in uniqueSoundContentIds do
-			_size += 1
-		end
-		-- ▲ ReadonlySet.size ▲
+		local _size = Utils.countKeys(uniqueSoundContentIds)
 		object_1.uniqueSoundContentIdCount = _size
 		object_1.hasParticles = hasParticles
 		object_1.hasVfx = hasVfx

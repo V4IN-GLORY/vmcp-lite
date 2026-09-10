@@ -10,3 +10,6 @@ sourcemap.json
 # TypeScript MCP server
 server/node_modules/
 server/dist/
+
+build/
+.tooling/

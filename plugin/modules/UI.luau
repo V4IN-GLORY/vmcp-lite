@@ -2,7 +2,6 @@ local TweenService = game:GetService("TweenService")
 local State = require(script.Parent.State)
 local ServerUrlSettings = require(script.Parent.ServerUrlSettings)
 local elements = nil
-local pulseAnimation
 local buttonHover = false
 local toolbarButton
 local toolbarIcons
@@ -44,16 +43,6 @@ local function showBanner(kind, text)
 	elements.contentFrame.Position = UDim2.new(0, 8, 0, 70)
 	elements.contentFrame.Size = UDim2.new(1, -16, 1, -78)
 end
-local function hideBanner(kind)
-	if kind ~= nil and activeBannerKind ~= kind then
-		return nil
-	end
-	activeBannerKind = nil
-	elements.updateBanner.Visible = false
-	elements.updateBannerText.Text = ""
-	elements.contentFrame.Position = UDim2.new(0, 8, 0, 44)
-	elements.contentFrame.Size = UDim2.new(1, -16, 1, -52)
-end
 local C = {
 	bg = Color3.fromRGB(14, 14, 14),
 	card = Color3.fromRGB(22, 22, 22),
@@ -82,12 +71,8 @@ local function setButtonDisconnect(btn, stroke)
 	btn.BackgroundColor3 = C.bg
 	stroke.Color = Color3.fromRGB(80, 30, 30)
 end
-local function stopPulseAnimation()
-	elements.statusPulse.Size = UDim2.new(0, 10, 0, 10)
-	elements.statusPulse.Position = UDim2.new(0, 0, 0, 0)
-	elements.statusPulse.BackgroundTransparency = 0.7
-end
-local function startPulseAnimation()
+-- The pulse tween was removed upstream; both call sites just reset the dot.
+local function resetStatusPulse()
 	elements.statusPulse.Size = UDim2.new(0, 10, 0, 10)
 	elements.statusPulse.Position = UDim2.new(0, 0, 0, 0)
 	elements.statusPulse.BackgroundTransparency = 0.7
@@ -427,7 +412,7 @@ local function updateUIState()
 		el.statusText.Text = "OFFLINE"
 		el.detailStatusLabel.Text = ""
 		el.detailStatusLabel.TextColor3 = C.muted
-		stopPulseAnimation()
+		resetStatusPulse()
 		el.step1Dot.BackgroundColor3 = C.gray
 		el.step1Label.Text = "HTTP server"
 		el.step2Dot.BackgroundColor3 = C.gray
@@ -462,7 +447,7 @@ local function updateUIState()
 		el.step3Dot.BackgroundColor3 = Color3.fromRGB(34, 197, 94)
 		el.step3Label.Text = "Commands (OK)"
 		el.troubleshootLabel.Visible = false
-		stopPulseAnimation()
+		resetStatusPulse()
 	elseif conn.lastHttpOk and not conn.lastMcpOk then
 		el.statusLabel.Text = "Waiting for MCP server"
 		el.statusLabel.TextColor3 = Color3.fromRGB(245, 158, 11)
@@ -479,7 +464,7 @@ local function updateUIState()
 		el.step3Label.Text = "Commands (waiting...)"
 		local elapsed = if conn.mcpWaitStartTime ~= nil then tick() - conn.mcpWaitStartTime else 0
 		el.troubleshootLabel.Visible = elapsed > 8
-		startPulseAnimation()
+		resetStatusPulse()
 	elseif conn.consecutiveFailures >= conn.maxFailuresBeforeError then
 		el.statusLabel.Text = "Server unavailable"
 		el.statusLabel.TextColor3 = Color3.fromRGB(239, 68, 68)
@@ -495,7 +480,7 @@ local function updateUIState()
 		el.step3Dot.BackgroundColor3 = Color3.fromRGB(239, 68, 68)
 		el.step3Label.Text = "Commands (error)"
 		el.troubleshootLabel.Visible = false
-		stopPulseAnimation()
+		resetStatusPulse()
 	elseif conn.consecutiveFailures > 5 then
 		local waitTime = math.ceil(conn.currentRetryDelay)
 		el.statusLabel.Text = `Retrying ({waitTime}s)`
@@ -512,7 +497,7 @@ local function updateUIState()
 		el.step3Dot.BackgroundColor3 = Color3.fromRGB(245, 158, 11)
 		el.step3Label.Text = "Commands (retrying...)"
 		el.troubleshootLabel.Visible = false
-		startPulseAnimation()
+		resetStatusPulse()
 	else
 		el.statusLabel.Text = if conn.consecutiveFailures > 1
 			then `Connecting (attempt {conn.consecutiveFailures})`
@@ -530,19 +515,16 @@ local function updateUIState()
 		el.step3Dot.BackgroundColor3 = C.yellow
 		el.step3Label.Text = "Commands (connecting...)"
 		el.troubleshootLabel.Visible = false
-		startPulseAnimation()
+		resetStatusPulse()
 	end
 end
 return {
 	elements = nil,
 	init = init,
 	updateUIState = updateUIState,
-	stopPulseAnimation = stopPulseAnimation,
-	startPulseAnimation = startPulseAnimation,
 	setToolbarButton = setToolbarButton,
 	updateToolbarIcon = updateToolbarIcon,
 	showBanner = showBanner,
-	hideBanner = hideBanner,
 	getElements = function()
 		return elements
 	end,

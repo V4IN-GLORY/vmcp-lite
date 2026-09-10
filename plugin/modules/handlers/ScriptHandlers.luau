@@ -22,24 +22,12 @@ local function getTopServiceName(instance)
 end
 local function sliceLines(lines, startLine, endLine)
 	local selectedLines = {}
-	do
-		local i = startLine
-		local shouldIncrement = false
-		while true do
-			if shouldIncrement then
-				i += 1
-			else
-				shouldIncrement = true
-			end
-			if not (i <= endLine) then
-				break
-			end
-			local condition = lines[i]
-			if condition == nil then
-				condition = ""
-			end
-			table.insert(selectedLines, condition)
+	for i = startLine, endLine do
+		local condition = lines[i]
+		if condition == nil then
+			condition = ""
 		end
+		table.insert(selectedLines, condition)
 	end
 	return selectedLines
 end
@@ -321,38 +309,14 @@ local function insertScriptLines(requestData)
 		end
 		local newLines = splitLines(newContent)
 		local resultLines = {}
-		do
-			local i = 0
-			local shouldIncrement = false
-			while true do
-				if shouldIncrement then
-					i += 1
-				else
-					shouldIncrement = true
-				end
-				if not (i < afterLine) then
-					break
-				end
-				table.insert(resultLines, lines[i + 1])
-			end
+		for i = 0, afterLine - 1 do
+			table.insert(resultLines, lines[i + 1])
 		end
 		for _, line in newLines do
 			table.insert(resultLines, line)
 		end
-		do
-			local i = afterLine
-			local shouldIncrement = false
-			while true do
-				if shouldIncrement then
-					i += 1
-				else
-					shouldIncrement = true
-				end
-				if not (i < totalLines) then
-					break
-				end
-				table.insert(resultLines, lines[i + 1])
-			end
+		for i = afterLine, totalLines - 1 do
+			table.insert(resultLines, lines[i + 1])
 		end
 		local newSource = joinLines(resultLines, hadTrailingNewline)
 		local applyResult = applyScriptSource(instance, newSource, source)
@@ -414,35 +378,11 @@ local function deleteScriptLines(requestData)
 			error(`endLine out of range ({startLine}-{totalLines})`)
 		end
 		local resultLines = {}
-		do
-			local i = 0
-			local shouldIncrement = false
-			while true do
-				if shouldIncrement then
-					i += 1
-				else
-					shouldIncrement = true
-				end
-				if not (i < startLine - 1) then
-					break
-				end
-				table.insert(resultLines, lines[i + 1])
-			end
+		for i = 0, startLine - 1 - 1 do
+			table.insert(resultLines, lines[i + 1])
 		end
-		do
-			local i = endLine
-			local shouldIncrement = false
-			while true do
-				if shouldIncrement then
-					i += 1
-				else
-					shouldIncrement = true
-				end
-				if not (i < totalLines) then
-					break
-				end
-				table.insert(resultLines, lines[i + 1])
-			end
+		for i = endLine, totalLines - 1 do
+			table.insert(resultLines, lines[i + 1])
 		end
 		local newSource = joinLines(resultLines, hadTrailingNewline)
 		local applyResult = applyScriptSource(instance, newSource, source)
@@ -626,19 +566,12 @@ local function findAndReplaceInScripts(requestData)
 	local traversalSuccess, traversalResult = pcall(function()
 		return processInstance(startInstance)
 	end)
-	-- ▼ ReadonlyArray.filter ▼
 	local newValue = {}
-	local callback = function(change)
-		return change.error ~= nil
-	end
-	local length = 0
-	for _k, _v in changes do
-		if callback(_v, _k - 1, changes) == true then
-			length += 1
-			newValue[length] = _v
+	for _, change in changes do
+		if change.error ~= nil then
+			table.insert(newValue, change)
 		end
 	end
-	-- ▲ ReadonlyArray.filter ▲
 	local failedScripts = #newValue
 	local scriptsModified = #changes - failedScripts
 	if recordingId ~= nil then
