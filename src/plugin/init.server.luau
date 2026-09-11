@@ -34,7 +34,8 @@ Panel.TokenChanged:Connect(function(new)
 end)
 
 Panel.ConnectRequested:Connect(function()
-    
+    Panel.SetSignal("Work")
+    Panel.StatusWord.Text = "Connecting"
 end)
 
 
@@ -52,5 +53,5 @@ if token then
 end
 
 if port and token then -- implement auto connect logic on plugin load
-    P
+    Panel._connectRequestedBindable:Fire()
 end

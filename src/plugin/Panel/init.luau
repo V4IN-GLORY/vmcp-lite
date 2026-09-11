@@ -15,6 +15,10 @@
 --
 --   Panel.SetSignal("Idle" | "Work" | "Live" | "Fault")   lamp + hairline colour; Work animates
 --   Panel.SetTokenOpen(open)                              the auth-token drawer
+--   Panel.SetStatusWord(text)                              the word beside the lamp
+--   Panel.SetStatusLine(text)                              the sentence under the buttons
+--   Panel.SetConnectEnabled(enabled)                       ConnectButton.Interactable
+--   Panel.SetDisconnectEnabled(enabled)                    DisconnectButton.Interactable
 --   Panel.Destroy()
 --
 --   Panel.ConnectRequested      ()             Connect button clicked
@@ -174,6 +178,22 @@ function Panel.SetTokenOpen(open: boolean)
 	if not open and Panel.TokenInput:IsFocused() then
 		Panel.TokenInput:ReleaseFocus()
 	end
+end
+
+function Panel.SetStatusWord(text: string)
+	Panel.StatusWord.Text = text
+end
+
+function Panel.SetStatusLine(text: string)
+	Panel.StatusLine.Text = text
+end
+
+function Panel.SetConnectEnabled(enabled: boolean)
+	Panel.ConnectButton.Interactable = enabled
+end
+
+function Panel.SetDisconnectEnabled(enabled: boolean)
+	Panel.DisconnectButton.Interactable = enabled
 end
 
 ---------------------------------------------------------------------- tree
