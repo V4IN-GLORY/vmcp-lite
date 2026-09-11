@@ -13,6 +13,18 @@
 
 local Panel = require(script.Panel)
 
+local widgetinfo = DockWidgetPluginGuiInfo.new(
+    Enum.InitialDockState.Float,
+    true,
+    false,
+    400,
+    400,
+    200,
+    200
+)
+
+local widget = plugin:CreateDockWidgetPluginGuiAsync("MCP_Panel", widgetinfo)
+
 local port = plugin:GetSetting("port") or nil
 local token = plugin:GetSetting("token") or nil
 
@@ -27,3 +39,5 @@ Panel.TokenChanged:Connect(function(new)
     plugin:SetSetting("token", new)
     print("changed token")
 end)
+
+
