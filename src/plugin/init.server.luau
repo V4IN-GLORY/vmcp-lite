@@ -1,21 +1,14 @@
 --!strict
 
--- Plugin entry point. Being a Script rather than a Folder is what makes the built model
--- installable -- both "Save as Local Plugin" and the Plugins folder need a Script at the root.
---
--- Empty on purpose: the toolbar, the dock widget, the settings and the socket are yours.
--- When you have somewhere to put it, the panel goes in with:
---
---   local Panel = require(script.Panel)
---   Panel.Mount(widget)
---
--- Panel/init.luau documents the rest of its surface.
-
 local Panel = require(script.Panel)
+local toolbar = plugin:CreateToolbar("VMCP")
+local button = toolbar:CreateButton("Panel", "", "rbxassetid://5325741572", "nil")
+
+local HttpService = game:GetService("HttpService")
 
 local widgetinfo = DockWidgetPluginGuiInfo.new(
     Enum.InitialDockState.Float,
-    true,
+    false,
     false,
     400,
     400,
@@ -40,4 +33,19 @@ Panel.TokenChanged:Connect(function(new)
     print("changed token")
 end)
 
+button.Click:Connect(function()
+    widget.Enabled = not widget.Enabled
+    Panel.Mount(widget)
+end)
 
+if port then -- implement auto connect logic here
+    Panel.PortInput.Text = port
+end
+
+if token then
+    Panel.TokenInput.Text = token
+end
+
+if port and token then -- implement auto connect logic on plugin load
+
+end

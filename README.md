@@ -7,31 +7,9 @@ Two halves:
 - `server/` — the TypeScript MCP server. Talks MCP to Claude on one side, WebSocket to
   Studio on the other. Has no tools of its own and never needs editing to add one.
 - `src/` — the Rojo place. The Studio plugin that registers tools lives on this side.
-- `plugin/` — the reference MCP plugin, decompiled from its shipped `.rbxmx` into
-  plain Luau. Builds standalone; see below.
 
 The plugin sends its tool list — names, descriptions, JSON schemas — when it connects, and
 those become the tools Claude sees. Adding a tool means writing Luau, not TypeScript.
-
-## Building the plugin
-
-`plugin/` is the reference MCP Studio plugin as readable Luau (it was originally shipped
-as roblox-ts compiler output). It builds on its own, independently of the `src/` place:
-
-```powershell
-rokit install            # once - gets rojo, stylua, luau-lsp
-.\build.ps1              # -> build/MCPPlugin.rbxmx
-.\build.ps1 -Install     # also copies into %LOCALAPPDATA%\Roblox\Plugins
-.\build.ps1 -Check       # analyze + format check first
-.\build.ps1 -Format      # reformat sources in place
-```
-
-`plugin/include/LibMP.luau` is a 4.9 MB vendored MicroProfiler library, loaded by name at
-runtime. It is not part of the readable source and is skipped by the checks.
-
-`-Check` gates on syntax errors only. The type diagnostics it counts are inference noise
-inherited from the compiled original, which carried no annotations; the set is unchanged
-from what the shipped `.rbxmx` produced.
 
 ## Running it
 

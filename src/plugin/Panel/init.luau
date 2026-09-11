@@ -315,10 +315,10 @@ function Panel.Mount(parent: Instance): Frame
 	Panel.DisconnectButton.Activated:Connect(function()
 		disconnectRequested:Fire()
 	end)
-	Panel.PortInput:GetPropertyChangedSignal("Text"):Connect(function()
+	Panel.PortInput.FocusLost:Connect(function()
 		portChanged:Fire(Panel.PortInput.Text)
 	end)
-	Panel.TokenInput:GetPropertyChangedSignal("Text"):Connect(function()
+	Panel.TokenInput.FocusLost:Connect(function()
 		tokenChanged:Fire(Panel.TokenInput.Text)
 	end)
 

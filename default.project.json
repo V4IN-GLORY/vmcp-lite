@@ -18,9 +18,6 @@
     "ServerStorage": {
       "VMCP": {
         "$path": "src/plugin"
-      },
-      "MCPPlugin": {
-        "$path": "plugin"
       }
     },
 
