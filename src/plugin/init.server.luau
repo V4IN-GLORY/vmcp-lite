@@ -33,6 +33,11 @@ Panel.TokenChanged:Connect(function(new)
     print("changed token")
 end)
 
+Panel.ConnectRequested:Connect(function()
+    
+end)
+
+
 button.Click:Connect(function()
     widget.Enabled = not widget.Enabled
     Panel.Mount(widget)
@@ -47,5 +52,5 @@ if token then
 end
 
 if port and token then -- implement auto connect logic on plugin load
-
+    P
 end

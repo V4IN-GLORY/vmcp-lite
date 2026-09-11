@@ -51,14 +51,14 @@ local Panel = {
 	TokenChanged = nil :: any,
 }
 
-local connectRequested = Instance.new("BindableEvent")
-local disconnectRequested = Instance.new("BindableEvent")
-local portChanged = Instance.new("BindableEvent")
-local tokenChanged = Instance.new("BindableEvent")
-Panel.ConnectRequested = connectRequested.Event
-Panel.DisconnectRequested = disconnectRequested.Event
-Panel.PortChanged = portChanged.Event
-Panel.TokenChanged = tokenChanged.Event
+Panel._connectRequestedBindable = Instance.new("BindableEvent")
+Panel._disconnectRequestedBindable = Instance.new("BindableEvent")
+Panel._portChangedBindable = Instance.new("BindableEvent")
+Panel._tokenChangedBindable = Instance.new("BindableEvent")
+Panel.ConnectRequested = Panel._connectRequestedBindable.Event
+Panel.DisconnectRequested = Panel._disconnectRequestedBindable.Event
+Panel.PortChanged = Panel._portChangedBindable.Event
+Panel.TokenChanged = Panel._tokenChangedBindable.Event
 
 local gradient: UIGradient
 local tokenGroup: Frame
@@ -310,16 +310,16 @@ function Panel.Mount(parent: Instance): Frame
 	end)
 
 	Panel.ConnectButton.Activated:Connect(function()
-		connectRequested:Fire()
+		Panel._connectRequestedBindable:Fire()
 	end)
 	Panel.DisconnectButton.Activated:Connect(function()
-		disconnectRequested:Fire()
+		Panel._disconnectRequestedBindable:Fire()
 	end)
 	Panel.PortInput.FocusLost:Connect(function()
-		portChanged:Fire(Panel.PortInput.Text)
+		Panel._portChangedBindable:Fire(Panel.PortInput.Text)
 	end)
 	Panel.TokenInput.FocusLost:Connect(function()
-		tokenChanged:Fire(Panel.TokenInput.Text)
+		Panel._tokenChangedBindable:Fire(Panel.TokenInput.Text)
 	end)
 
 	table.clear(orders)
@@ -334,10 +334,10 @@ function Panel.Destroy()
 	if Panel.Root then
 		Panel.Root:Destroy()
 	end
-	connectRequested:Destroy()
-	disconnectRequested:Destroy()
-	portChanged:Destroy()
-	tokenChanged:Destroy()
+	Panel._connectRequestedBindable:Destroy()
+	Panel._disconnectRequestedBindable:Destroy()
+	Panel._portChangedBindable:Destroy()
+	Panel._tokenChangedBindable:Destroy()
 end
 
 return Panel
