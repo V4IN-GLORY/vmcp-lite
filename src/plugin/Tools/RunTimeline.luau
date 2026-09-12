@@ -25,7 +25,8 @@ Tool.Definition = {
 		.. 'anywhere else, or ctx:Await("thing", 2) to wait for it rather than hope. Every event '
 		.. "also gets vmcp: vmcp.Tool calls any other VMCP tool in any context, vmcp.Game.Require "
 		.. "reads a live module's real state, vmcp.Remotes watches remote traffic, vmcp.Exploit "
-		.. "spams and fuzzes remotes, vmcp.Bench times a function under load. Client events also "
+		.. "replays the game's own remote traffic with its arguments broken, vmcp.Bench times a "
+		.. "function under load. Client events also "
 		.. "get input, for real keys and clicks. Starts its own playtest if one isn't already open.",
 	inputSchema = {
 		type = "object",

@@ -64,25 +64,88 @@ see what the server pushes out.
 ## Simulating an exploiter
 
 A remote handler is only as safe as its worst caller, and the worst caller doesn't use your UI.
-These run from a **client** event, through the real network path:
+These run from a **client** event, through the real network path.
+
+### Tailored to the game — do this one first
+
+Blind junk stops at the first argument the handler checks. What actually finds bugs is the game's
+own traffic, replayed and broken one argument at a time. Two events and a `ctx` hop:
+
+```lua
+-- server, at 0: watch, and let the game play normally for a few seconds
+vmcp.Remotes.WatchAll(game.ReplicatedStorage.Remotes)
+```
+
+```lua
+-- server, later: hand the captured shapes over
+ctx.shapes = vmcp.Remotes.Shapes()
+```
+
+```lua
+-- client, last: replay every remote with its real arguments, then break them
+ctx.attack = vmcp.Exploit.FromTraffic(ctx:Await("shapes", 10))
+```
+
+`Remotes.Shapes()` gives one entry per remote seen — class, call count, a one-word signature per
+argument position, and a real sample set of arguments that survives the trip through `ctx`. An
+Instance argument crosses as its path and is resolved again on the client, so "the sword you were
+holding" is still that sword.
+
+`FromTraffic` then runs `Exploit.Tailor` on each: **one argument changed per variant**, chosen for
+the type that argument really is.
+
+| real argument | what gets sent instead |
+|---|---|
+| number | negative, `math.huge`, `nan`, past `2^53`, the same number as a string |
+| string | empty, 10k chars, a number, the same name with `_NOPE` on it |
+| Instance | **another player's character or player**, a random part, its path as a string |
+| table | empty, a number, a 10k-entry table |
+| Vector3 | a million studs away, `nan` components |
+| any | nil, plus "no arguments at all" and "one extra argument" |
+
+The Instance row is the one that finds real bugs — it's the missing ownership check. The pool is
+built from the live place: the other players, their characters, and things in Workspace and
+ReplicatedStorage.
+
+One change at a time is deliberate. Two wrong arguments tell you which check fired, not which one
+is missing.
+
+### Reading the result
+
+A **RemoteFunction** answers you directly — a thrown error is the handler rejecting it, a returned
+value is what it was willing to hand over. That's in the report.
+
+A **RemoteEvent** gives the caller nothing back, so "sent" is all this side can say. What it did
+shows up in the server's logs and state — so pair it with a server event afterwards that reads the
+thing that shouldn't have changed:
+
+```lua
+-- server, after the attack
+ctx.cashAfter = game.Players:GetPlayers()[1].leaderstats.Cash.Value
+```
+
+```json
+"assertion": "return ctx.cashAfter == ctx.cashBefore"
+```
+
+### The blind versions
+
+Still there for when there's no traffic to learn from, or when the question is rate limiting:
 
 ```lua
 -- the same arguments, far too often: finds missing rate limiting
 local report = vmcp.Exploit.Spam(remote, { "Fireball" }, { times = 500, perFrame = 20 })
 ctx.spam = vmcp.Exploit.Summarise(report)
 
--- junk arguments every call: finds missing validation
+-- junk arguments every call, no knowledge of the shape
 local report = vmcp.Exploit.Fuzz(remote, 3, { times = 200 })
 
--- a sweep before you know which one is weak
+-- one junk call at every remote under a folder, to see what falls over
 ctx.sweep = vmcp.Exploit.FuzzAll(game.ReplicatedStorage.Remotes)
 ```
 
-The junk pool is the set that actually finds things: nil, wrong types, `0/0`, `math.huge`, `2^53`,
-empty and enormous strings, tables where a number was expected, an Instance.
-
-Pair it with `vmcp.Remotes` on the server side and errors the handler throws show up in the
-timeline's notes.
+`Exploit.Tailor(remote, args)` is the direct form if you already know the arguments and don't need
+to capture them — hand it a real call and it does the same breaking.
 
 ## Timing a function under load
 

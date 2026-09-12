@@ -1,0 +1,5541 @@
+<roblox version="4">
+  <Item class="Script" referent="0">
+    <Properties>
+      <string name="Name">VMCP</string>
+      <token name="RunContext">0</token>
+      <string name="Source"><![CDATA[--!strict
+
+-- This runs in every DataModel Studio has open. The edit one gets the panel and the toolbar; a
+-- playtest's server and clients get the same tools with no UI at all, because the plugin is
+-- loaded into those too and that is what makes a live context reachable.
+
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+
+local Bridge = require(script.Bridge)
+local LogBuffer = require(script.Log.Buffer)
+
+local DEFAULT_PORT = "8791"
+
+-- Started before anything else can log: get_logs is only useful if it was already recording when
+-- the interesting error happened.
+LogBuffer.Start()
+
+-- An unsaved place reports PlaceId 0, which the server refuses. This GUID stands in for it and is
+-- stored per-machine so the place keeps its identity across sessions.
+local function getPlaceGuid(): string
+	local guid = plugin:GetSetting("placeGuid")
+	if not guid then
+		guid = HttpService:GenerateGUID(false)
+		plugin:SetSetting("placeGuid", guid)
+	end
+	return guid
+end
+
+Bridge.Init(script.Tools, { GetPlaceGuid = getPlaceGuid })
+
+if not RunService:IsEdit() then
+	-- A playtest DataModel. It needs the edit session's id to attach to, which the edit session
+	-- writes to plugin settings as it connects -- nothing inside a running DataModel can work out
+	-- which Studio window spawned it.
+	local linkId = plugin:GetSetting("linkId")
+	local token = plugin:GetSetting("token")
+	if linkId and token and token ~= "" then
+		Bridge.Connect(plugin:GetSetting("port") or DEFAULT_PORT, token, {
+			role = if RunService:IsServer() then "server" else "client",
+			linkId = linkId,
+			-- Play Solo is one DataModel wearing both hats, so it answers as client 1 as well.
+			alsoClient = RunService:IsServer() and RunService:IsClient(),
+		})
+	end
+	return
+end
+
+local Panel = require(script.Panel)
+
+local toolbar = plugin:CreateToolbar("VMCP")
+local button = toolbar:CreateButton("Panel", "Open the VMCP bridge panel", "rbxassetid://5325741572")
+
+local widget = plugin:CreateDockWidgetPluginGuiAsync(
+	"MCP_Panel",
+	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 400, 400, 200, 200)
+)
+widget.Title = "VMCP"
+
+local port = plugin:GetSetting("port") or DEFAULT_PORT
+local token = plugin:GetSetting("token")
+
+-- Mounted once, up front. The panel's setters all reach into widgets Mount creates, so touching
+-- any of them beforehand is a nil index -- and remounting per click would stack whole trees.
+Panel.Mount(widget)
+Panel.PortInput.Text = port
+Panel.TokenInput.Text = token or ""
+
+Bridge.OnStatus(function(signal: string, word: string, line: string)
+	Panel.SetSignal(signal)
+	Panel.SetStatusWord(word)
+	Panel.SetStatusLine(line)
+
+	local live = signal == "Live" or signal == "Work"
+	Panel.SetConnectEnabled(not live)
+	Panel.SetDisconnectEnabled(live)
+end)
+
+local function connect()
+	if not token or token == "" then
+		Panel.SetSignal("Fault")
+		Panel.SetStatusWord("no token")
+		Panel.SetStatusLine("Paste the auth token from `npm run token` first.")
+		Panel.SetTokenOpen(true)
+		return
+	end
+	-- Left where a playtest DataModel can find it. Two Studio windows share plugin settings, so
+	-- the last one to connect owns the playtests; one test per Studio instance anyway.
+	plugin:SetSetting("linkId", Bridge.Connection().sessionId)
+	Bridge.Connect(port, token)
+end
+
+Panel.PortChanged:Connect(function(new: string)
+	port = if new ~= "" then new else DEFAULT_PORT
+	plugin:SetSetting("port", port)
+end)
+
+Panel.TokenChanged:Connect(function(new: string)
+	token = new
+	plugin:SetSetting("token", new)
+end)
+
+Panel.ConnectRequested:Connect(connect)
+Panel.DisconnectRequested:Connect(Bridge.Disconnect)
+
+button.Click:Connect(function()
+	widget.Enabled = not widget.Enabled
+end)
+
+plugin.Unloading:Connect(Bridge.Disconnect)
+
+if token and token ~= "" then
+	connect()
+end
+]]></string>
+    </Properties>
+    <Item class="ModuleScript" referent="1">
+      <Properties>
+        <string name="Name">Bridge</string>
+        <string name="Source"><![CDATA[--!strict
+--!optimize 2
+
+-- The socket. Opens one WebStreamClient, handshakes, keeps it alive, and hands tool/call
+-- messages to Dispatch.
+--
+-- Bridge.Init(toolFolder, settings)   settings: { GetPlaceGuid: () -> string }
+-- Bridge.Connect(port, token, as)     as: { role, linkId, alsoClient } -- the edit session omits it
+-- Bridge.Disconnect()                 deliberate; stops retrying
+-- Bridge.OnStatus(fn)                 fn(signal, word, line) -- drives the Panel
+-- Bridge.Invoke(name, arguments)      call another tool, in any context, through the server
+-- Bridge.Ctx*                         the timeline's shared context, which the server holds
+--
+-- One Studio window runs several of these. The plugin loads into the edit DataModel and, while a
+-- playtest is on, into the test server and every test client as well -- same code, different role
+-- in the handshake. That is how a call for a live context reaches a real running game.
+--
+-- The reconnect rule is not the one in docs/protocol.md. That table says to skip retrying on
+-- close codes 1008 and 4000, but WebStreamClient's Closed event carries no arguments at all, so
+-- the plugin never sees a code. What it can see is whether the handshake ever succeeded: 1008
+-- (bad token, bad version, non-JSON) always closes before the hello reply, so a close that
+-- happened after the socket opened but before the reply is a configuration problem and retrying
+-- it forever is pointless noise. A close with no Opened behind it is just a server that isn't
+-- listening yet, which is exactly what a restart looks like, so that one keeps retrying.
+
+local HttpService = game:GetService("HttpService")
+
+local Dispatch = require(script.Dispatch)
+local Registry = require(script.Registry)
+
+local PROTOCOL_VERSION = 3
+local BACKOFF_START = 1
+local BACKOFF_MAX = 30
+-- A supersede (close 4000) also lands after a good handshake, so two Studio windows sharing a
+-- sessionId would retry each other forever. Dropping out after a few near-instant closes ends
+-- that without needing the close code we can't read.
+local FLAP_WINDOW = 10
+local FLAP_LIMIT = 4
+
+local Bridge = {}
+
+local state = {
+	socket = nil :: any,
+	sessionId = HttpService:GenerateGUID(false),
+	port = nil :: string?,
+	token = nil :: string?,
+	-- The reconnect decision hangs off this pair: opened means the socket reached the server at
+	-- all, handshakeOk means the server accepted the session.
+	opened = false,
+	handshakeOk = false,
+	helloId = 0,
+	nextId = 1,
+	wantConnected = false,
+	backoff = BACKOFF_START,
+	connectedAt = 0,
+	flaps = 0,
+	role = "plugin",
+	linkId = nil :: string?,
+	alsoClient = false,
+	-- Assigned by the server: 0 for a test server, 1+ for each test client.
+	peerIndex = nil :: number?,
+	toolFolder = nil :: Instance?,
+	getPlaceGuid = nil :: (() -> string)?,
+	onStatus = nil :: ((signal: string, word: string, line: string) -> ())?,
+}
+
+-- Replies we're still waiting on, keyed by the id we sent. Only Bridge.Request puts anything in
+-- here; tool/call goes the other direction.
+local pending: { [number]: (ok: boolean, payload: any) -> () } = {}
+
+local function report(signal: string, word: string, line: string)
+	if state.onStatus then
+		state.onStatus(signal, word, line)
+	end
+end
+
+-- Encoding is the only way this fails, and a silent failure means Claude waits out the whole
+-- timeout for a reply that never comes, so the reason goes back to the caller.
+local function send(message: { [string]: any }): (boolean, string?)
+	local socket = state.socket
+	if not socket then
+		return false, "socket is closed"
+	end
+
+	local ok, encoded = pcall(HttpService.JSONEncode, HttpService, message)
+	if not ok then
+		return false, tostring(encoded)
+	end
+
+	socket:Send(encoded)
+	return true, nil
+end
+
+-- An unsaved place has a PlaceId of 0, which the server refuses, so those fall back to a GUID
+-- stored in plugin settings -- stable across sessions the way a real PlaceId would be.
+local function placeIdentity(): (string, string)
+	local id = game.PlaceId
+	if id ~= 0 then
+		return tostring(id), if game.Name ~= "" then game.Name else "Unsaved Place"
+	end
+	local getGuid = state.getPlaceGuid
+	return (if getGuid then getGuid() else "0"), "Unsaved Place"
+end
+
+local function closeSocket()
+	local socket = state.socket
+	if not socket then
+		return
+	end
+	state.socket = nil
+	-- Six live stream clients per session, so the old one goes before a new one opens.
+	pcall(function()
+		socket:Close()
+	end)
+end
+
+local scheduleRetry: () -> ()
+
+local function openSocket()
+	closeSocket()
+	state.opened = false
+	state.handshakeOk = false
+
+	local port = state.port
+	local token = state.token
+	if not port or not token then
+		report("Fault", "no token", "Set a port and paste the auth token first.")
+		return
+	end
+
+	report("Work", "connecting", `Connecting to ws://127.0.0.1:{port}`)
+
+	-- No Origin header: the server refuses any connection carrying one, because a webpage can
+	-- reach localhost and a plugin never sends it.
+	local ok, socket = pcall(function()
+		return HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, {
+			Url = `ws://127.0.0.1:{port}`,
+		})
+	end)
+	if not ok then
+		report("Fault", "failed", `Could not open a socket: {socket}`)
+		return
+	end
+
+	state.socket = socket
+	state.connectedAt = os.clock()
+
+	-- Every handler below ignores a socket that is no longer the current one. Replacing a socket
+	-- fires Closed on the old one, and without this that stale event would schedule a retry
+	-- alongside the connection that just replaced it.
+	socket.Opened:Connect(function()
+		if socket ~= state.socket then
+			return
+		end
+		state.opened = true
+
+		local folder = state.toolFolder
+		if not folder then
+			report("Fault", "not set up", "Bridge.Init was never called with a tool folder.")
+			return
+		end
+		Registry.Collect(folder)
+		local placeId, placeName = placeIdentity()
+
+		state.helloId = state.nextId
+		state.nextId += 1
+		send({
+			jsonrpc = "2.0",
+			id = state.helloId,
+			method = "session/hello",
+			params = {
+				token = token,
+				protocolVersion = PROTOCOL_VERSION,
+				sessionId = state.sessionId,
+				placeId = placeId,
+				placeName = placeName,
+				tools = Registry.definitions,
+				role = state.role,
+				linkId = state.linkId,
+				alsoClient = state.alsoClient,
+			},
+		})
+	end)
+
+	socket.MessageReceived:Connect(function(raw: string)
+		if socket ~= state.socket then
+			return
+		end
+
+		local decoded, message = pcall(HttpService.JSONDecode, HttpService, raw)
+		if not decoded then
+			warn(`[VMCP] server sent something that wasn't JSON: {message}`)
+			return
+		end
+
+		local waiter = if message.method == nil then pending[message.id] else nil
+		if waiter then
+			if message.error then
+				waiter(false, message.error.message)
+			else
+				waiter(true, message.result)
+			end
+			return
+		end
+
+		if message.id == state.helloId and not state.handshakeOk then
+			if message.error then
+				-- Wrong token or wrong protocol version. Retrying can't fix either.
+				report("Fault", "refused", message.error.message)
+				state.wantConnected = false
+				closeSocket()
+				return
+			end
+			state.handshakeOk = true
+			state.backoff = BACKOFF_START
+			state.flaps = 0
+			state.peerIndex = if message.result then message.result.peerIndex else nil
+			local count = #Registry.definitions
+			report("Live", "connected", `{count} tool{if count == 1 then "" else "s"} registered.`)
+			return
+		end
+
+		Dispatch.Handle(send, message)
+	end)
+
+	socket.Error:Connect(function(status: number, reason: string)
+		if socket ~= state.socket then
+			return
+		end
+		warn(`[VMCP] socket error {status}: {reason}`)
+	end)
+
+	socket.Closed:Connect(function()
+		-- No close code here -- see the note at the top of the file.
+		if socket ~= state.socket then
+			return
+		end
+
+		local wasOpen, wasLive = state.opened, state.handshakeOk
+		state.socket = nil
+		for _, waiting in pending do
+			waiting(false, "the connection to the VMCP server dropped")
+		end
+		state.opened = false
+		state.handshakeOk = false
+
+		if not state.wantConnected then
+			report("Idle", "not connected", "Disconnected.")
+			return
+		end
+		-- Never opened: nothing was listening. Common and temporary -- Node restarts constantly
+		-- during development -- so back off and keep trying.
+		if not wasOpen then
+			scheduleRetry()
+			return
+		end
+		if not wasLive then
+			report("Fault", "refused", "Server closed before the handshake. Check the port and token.")
+			state.wantConnected = false
+			return
+		end
+
+		if os.clock() - state.connectedAt < FLAP_WINDOW then
+			state.flaps += 1
+		else
+			state.flaps = 0
+		end
+		if state.flaps >= FLAP_LIMIT then
+			report("Fault", "superseded", "Kept getting dropped -- another Studio window may hold this session.")
+			state.wantConnected = false
+			return
+		end
+
+		scheduleRetry()
+	end)
+end
+
+function scheduleRetry()
+	local delay = state.backoff
+	state.backoff = math.min(delay * 2, BACKOFF_MAX)
+	report("Work", "reconnecting", `Lost the server. Retrying in {delay}s.`)
+
+	task.delay(delay, function()
+		if state.wantConnected and not state.socket then
+			openSocket()
+		end
+	end)
+end
+
+-- Asks the server a question and waits for the answer. The server can reach the filesystem and
+-- the plugin can't, which is the only reason this direction exists.
+--
+-- Yields, so it can only be called from a tool's own thread -- Dispatch spawns one per call, so
+-- blocking here holds up that call and nothing else on the socket.
+function Bridge.Request(method: string, params: { [string]: any }, timeout: number?): (boolean, any)
+	if not state.handshakeOk then
+		return false, "not connected to the VMCP server"
+	end
+
+	local id = state.nextId
+	state.nextId += 1
+	local thread = coroutine.running()
+
+	pending[id] = function(ok: boolean, payload: any)
+		pending[id] = nil
+		task.spawn(thread, ok, payload)
+	end
+
+	local sent, failure = send({ jsonrpc = "2.0", id = id, method = method, params = params })
+	if not sent then
+		pending[id] = nil
+		return false, failure :: any
+	end
+
+	task.delay(timeout or 15, function()
+		local waiting = pending[id]
+		if waiting then
+			waiting(false, `the server didn't answer {method} in time`)
+		end
+	end)
+
+	return coroutine.yield()
+end
+
+function Bridge.Init(toolFolder: Instance, settings: { GetPlaceGuid: () -> string })
+	state.toolFolder = toolFolder
+	state.getPlaceGuid = settings.GetPlaceGuid
+end
+
+function Bridge.OnStatus(fn: (signal: string, word: string, line: string) -> ())
+	state.onStatus = fn
+end
+
+-- `as` is how a playtest DataModel says which one it is. The edit session leaves it out.
+function Bridge.Connect(port: string, token: string, as: { role: string, linkId: string, alsoClient: boolean? }?)
+	state.port = port
+	state.token = token
+	if as then
+		state.role = as.role
+		state.linkId = as.linkId
+		state.alsoClient = as.alsoClient == true
+	end
+	state.wantConnected = true
+	state.backoff = BACKOFF_START
+	state.flaps = 0
+	openSocket()
+end
+
+function Bridge.Disconnect()
+	state.wantConnected = false
+	closeSocket()
+	report("Idle", "not connected", "Disconnected.")
+end
+
+function Bridge.Connection(): { port: string?, token: string?, sessionId: string, role: string, peerIndex: number? }
+	return {
+		port = state.port,
+		token = state.token,
+		sessionId = state.sessionId,
+		role = state.role,
+		peerIndex = state.peerIndex,
+	}
+end
+
+-- Calls another tool, in whatever context `arguments.context` names, through the server. This is
+-- what lets a timeline event in a test client ask the edit session for a tree dump, or push work
+-- onto the server and read the answer in the same snippet.
+function Bridge.Invoke(name: string, arguments: { [string]: any }?, timeout: number?): (boolean, any)
+	local ok, payload = Bridge.Request("tool/invoke", {
+		name = name,
+		arguments = arguments or {},
+		depth = Dispatch.CurrentDepth(),
+	}, timeout)
+	if not ok then
+		return false, payload
+	end
+	return true, payload.result
+end
+
+-- The timeline's shared context. It lives on the server because the edit DataModel, the test
+-- server and each test client are separate processes -- this socket is the only thing they share.
+function Bridge.CtxSet(key: string, value: any, from: string): boolean
+	-- No timestamp: every write blocks until the server has it, so arrival order is write order
+	-- and the server is the only clock all three DataModels agree on.
+	return (Bridge.Request("ctx/set", { key = key, value = value, from = from }, 5))
+end
+
+function Bridge.CtxGet(key: string): any
+	local ok, payload = Bridge.Request("ctx/get", { key = key }, 5)
+	return if ok then payload.value else nil
+end
+
+function Bridge.CtxNote(text: string): boolean
+	return (Bridge.Request("ctx/note", { text = text }, 5))
+end
+
+function Bridge.CtxClear(): boolean
+	return (Bridge.Request("ctx/clear", {}, 5))
+end
+
+function Bridge.CtxSnapshot(): any
+	local ok, payload = Bridge.Request("ctx/snapshot", {}, 10)
+	return if ok then payload else nil
+end
+
+function Bridge.IsConnected(): boolean
+	return state.handshakeOk
+end
+
+return Bridge
+]]></string>
+      </Properties>
+      <Item class="ModuleScript" referent="2">
+        <Properties>
+          <string name="Name">Dispatch</string>
+          <string name="Source"><![CDATA[--!strict
+--!optimize 2
+
+-- Routes one decoded message from the server. Everything here is guarded: an error thrown out
+-- of the socket's MessageReceived callback kills the callback, not the socket, and the server
+-- then sits waiting until the call times out. A crash has to become an isError reply instead.
+
+local Registry = require(script.Parent.Registry)
+
+local Dispatch = {}
+
+-- Returns false plus the reason when the message could not be encoded, which is the only way
+-- sending fails and would otherwise be silent.
+type Send = (message: { [string]: any }) -> (boolean, string?)
+
+local function textResult(text: string, isError: boolean?): { [string]: any }
+	local result: { [string]: any } = { content = { { type = "text", text = text } } }
+	if isError then
+		result.isError = true
+	end
+	return result
+end
+
+-- How deep the tool on this thread already is. A tool calling another tool passes the count on so
+-- the server can tell a chain from a loop. Weak keys so a finished call isn't held alive.
+local depthByThread: { [thread]: number } = setmetatable({}, { __mode = "k" }) :: any
+
+function Dispatch.CurrentDepth(): number
+	return depthByThread[coroutine.running()] or 0
+end
+
+local function runTool(send: Send, id: any, name: string, arguments: any)
+	depthByThread[coroutine.running()] = if type(arguments) == "table" and type(arguments.__depth) == "number"
+		then arguments.__depth
+		else 0
+
+	local tool = Registry.byName[name]
+	if not tool then
+		send({ jsonrpc = "2.0", id = id, result = textResult(`no tool named "{name}"`, true) })
+		return
+	end
+
+	local ok, returned = pcall(tool.Run, arguments or {})
+	if not ok then
+		send({ jsonrpc = "2.0", id = id, result = textResult(`{name} errored: {returned}`, true) })
+		return
+	end
+
+	-- A non-table result rides the server's documented shorthand; a table goes through untouched
+	-- and the server coerces it. Encoding can still fail -- a tool returning an Instance, say --
+	-- and Claude would otherwise just see the call time out.
+	local result = if type(returned) == "table" then returned else textResult(tostring(returned or "done"))
+	local encoded, failure = send({ jsonrpc = "2.0", id = id, result = result })
+	if not encoded then
+		send({ jsonrpc = "2.0", id = id, result = textResult(`{name} returned something unencodable: {failure}`, true) })
+	end
+end
+
+function Dispatch.Handle(send: Send, message: { [string]: any })
+	if message.method == "tool/call" then
+		local params = message.params or {}
+		-- Spawned: a yielding tool would otherwise block every later message on this socket.
+		task.spawn(runTool, send, message.id, params.name, params.arguments)
+		return
+	end
+
+	if message.error then
+		warn(`[VMCP] server refused request {message.id}: {message.error.message}`)
+	end
+end
+
+return Dispatch
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="3">
+        <Properties>
+          <string name="Name">Registry</string>
+          <string name="Source"><![CDATA[--!strict
+--!optimize 2
+
+-- Collects the tool modules and turns them into the `tools` array for session/hello.
+--
+-- The server validates definitions too, but it rejects the *whole* list when one entry is
+-- malformed, and its error arrives as a closed socket. Checking here instead means a bad tool
+-- names itself in the Output window and the other tools still register.
+
+export type Definition = {
+	name: string,
+	description: string,
+	inputSchema: { [string]: any },
+	outputSchema: { [string]: any }?,
+	tags: { [string]: any }?,
+	timeoutMs: number?,
+}
+
+export type Tool = {
+	Definition: Definition,
+	Run: (arguments: any) -> any,
+}
+
+local Registry = {
+	definitions = {} :: { Definition },
+	byName = {} :: { [string]: Tool },
+}
+
+-- Mirrors the server's NAME_PATTERN; anything else is refused at registration.
+local function validate(definition: any): string?
+	if type(definition) ~= "table" then
+		return "Definition must be a table"
+	end
+	local name = definition.name
+	if type(name) ~= "string" or #name > 64 or not string.match(name, "^[%w_%-]+$") then
+		return "name must be 1-64 chars of letters, digits, underscore or hyphen"
+	end
+	if type(definition.description) ~= "string" or definition.description == "" then
+		return "description must be a non-empty string"
+	end
+
+	local input = definition.inputSchema
+	if type(input) ~= "table" then
+		return "inputSchema must be a table"
+	end
+	-- An empty table encodes as [] and the server turns that back into { type = "object" }.
+	if next(input) ~= nil and input.type ~= "object" then
+		return `inputSchema needs type = "object" at its root (MCP requires it)`
+	end
+	if definition.timeoutMs ~= nil and (type(definition.timeoutMs) ~= "number" or definition.timeoutMs <= 0) then
+		return "timeoutMs must be a positive number"
+	end
+	return nil
+end
+
+-- Requires every ModuleScript in `folder` and keeps the ones that look like tools.
+function Registry.Collect(folder: Instance)
+	table.clear(Registry.definitions)
+	table.clear(Registry.byName)
+
+	for _, child in folder:GetChildren() do
+		if not child:IsA("ModuleScript") then
+			continue
+		end
+
+		local ok, tool = pcall(require, child)
+		if not ok then
+			warn(`[VMCP] tool "{child.Name}" failed to load: {tool}`)
+			continue
+		end
+		if type(tool) ~= "table" or type(tool.Run) ~= "function" then
+			warn(`[VMCP] tool "{child.Name}" has no Run function`)
+			continue
+		end
+
+		local problem = validate(tool.Definition)
+		if problem then
+			warn(`[VMCP] tool "{child.Name}" rejected: {problem}`)
+			continue
+		end
+
+		local name = tool.Definition.name
+		if Registry.byName[name] then
+			warn(`[VMCP] duplicate tool name "{name}" in "{child.Name}"`)
+			continue
+		end
+
+		Registry.byName[name] = tool
+		table.insert(Registry.definitions, tool.Definition)
+	end
+end
+
+return Registry
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="ModuleScript" referent="4">
+      <Properties>
+        <string name="Name">Env</string>
+        <string name="Source"><![CDATA[--!strict
+
+-- What a snippet sees as `vmcp`. Built once and handed to every snippet and every timeline event,
+-- so they all have the same vocabulary whichever DataModel they happen to be running in.
+
+local Bridge = require(script.Parent.Bridge)
+
+local Env = {
+	Anim = require(script.Parent.Lib.Anim),
+	Bench = require(script.Parent.Lib.Bench),
+	Build = require(script.Parent.Lib.Build),
+	Canvas = require(script.Parent.Lib.Canvas),
+	Exploit = require(script.Parent.Lib.Exploit),
+	Remotes = require(script.Parent.Lib.Remotes),
+	Rig = require(script.Parent.Lib.Rig),
+	Style = require(script.Parent.Lib.Style),
+	Serialize = require(script.Parent.Exec.Serialize),
+	-- Eval and Require, against the running game's own script VM rather than the plugin's.
+	Game = require(script.Parent.Exec.GameVm),
+}
+
+-- Calls another VMCP tool and gives back its text. `arguments.context` picks the DataModel, so a
+-- client event can ask the server a question, or ask the edit session for a tree dump, without
+-- the payload having to be split into three separate calls first.
+--
+-- Returns ok plus the text; a tool that reported an error comes back as false with its own words.
+function Env.Tool(name: string, arguments: { [string]: any }?): (boolean, string)
+	local reached, result = Bridge.Invoke(name, arguments, 120)
+	if not reached then
+		return false, tostring(result)
+	end
+
+	local parts = {}
+	for _, item in result.content or {} do
+		if type(item.text) == "string" then
+			table.insert(parts, item.text)
+		end
+	end
+	return result.isError ~= true, table.concat(parts, "\n")
+end
+
+return Env
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="Folder" referent="5">
+      <Properties>
+        <string name="Name">Exec</string>
+      </Properties>
+      <Item class="ModuleScript" referent="6">
+        <Properties>
+          <string name="Name">GameVm</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Runs code inside the running game's own script VM, rather than the plugin's.
+--
+-- The plugin can already create a ModuleScript and require it anywhere it's loaded (see
+-- Inject.luau). What it can't do that way is share the require cache: `require(SomeModule)` from
+-- the plugin builds a *fresh* copy of that module, so whatever state the running game accumulated
+-- in it is invisible. That makes the plugin VM useless for the thing you most want during a
+-- playtest -- looking at what a module actually holds right now.
+--
+-- The fix is a short-lived Script living in the game, exposing a BindableFunction. The plugin
+-- hands it a ModuleScript and the `require` happens on the game's side of the fence, against the
+-- game's cache. Only strings come back: a BindableFunction copies tables and chokes on functions,
+-- and a module table is usually full of functions, so it's rendered to text before it crosses.
+--
+-- Everything here is created at runtime inside a playtest DataModel, so it disappears when the
+-- playtest stops. Nothing touches the saved place.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Inject = require(script.Parent.Inject)
+local Serialize = require(script.Parent.Serialize)
+
+local BRIDGE_NAME = "__VMCP_GameBridge"
+local INVOKE_NAME = "__VMCP_GameInvoke"
+local SERIALIZE_NAME = "__VMCP_Serialize"
+local READY_TIMEOUT = 5
+
+local GameVm = {}
+
+local BRIDGE_SOURCE = string.format(
+	[[
+local here = script.Parent
+local Serialize = require(here:WaitForChild("%s"))
+
+local previous = here:FindFirstChild("%s")
+if previous then
+	previous:Destroy()
+end
+
+local bindable = Instance.new("BindableFunction")
+bindable.Name = "%s"
+bindable.Archivable = false
+bindable.Parent = here
+
+bindable.OnInvoke = function(payload)
+	if typeof(payload) ~= "Instance" or not payload:IsA("ModuleScript") then
+		return { ok = false, text = "payload must be a ModuleScript" }
+	end
+	local ok, value = pcall(require, payload)
+	return { ok = ok, text = if ok then Serialize.Render(value) else tostring(value) }
+end
+]],
+	SERIALIZE_NAME,
+	INVOKE_NAME,
+	INVOKE_NAME
+)
+
+-- Server code goes in ServerScriptService; client code goes in this player's PlayerScripts, which
+-- is the only container on a client where a LocalScript created at runtime will actually run.
+local function container(): (Instance?, string?)
+	if RunService:IsServer() then
+		return ServerScriptService, nil
+	end
+	local player = Players.LocalPlayer
+	if not player then
+		return nil, "no LocalPlayer, so this isn't a client DataModel"
+	end
+	local scripts = player:FindFirstChild("PlayerScripts")
+	return scripts, if scripts then nil else "this client has no PlayerScripts yet"
+end
+
+local function ensure(): (BindableFunction?, string?)
+	if RunService:IsEdit() then
+		return nil,
+			"there's no game VM in edit mode -- this needs a playtest. Start one with the playtest "
+				.. "tool, or use the plugin context, which runs in Studio itself."
+	end
+
+	local parent, problem = container()
+	if not parent then
+		return nil, problem
+	end
+
+	local existing = parent:FindFirstChild(INVOKE_NAME)
+	if existing and existing:IsA("BindableFunction") then
+		return existing, nil
+	end
+
+	local ok, failure = pcall(function()
+		local previous = parent:FindFirstChild(BRIDGE_NAME)
+		if previous then
+			previous:Destroy()
+		end
+
+		local serializer = Instance.new("ModuleScript")
+		serializer.Name = SERIALIZE_NAME
+		serializer.Source = (script.Parent.Serialize :: ModuleScript).Source
+		serializer.Archivable = false
+		serializer.Parent = parent
+
+		local bridge: any = Instance.new(if RunService:IsServer() then "Script" else "LocalScript")
+		bridge.Name = BRIDGE_NAME
+		bridge.Source = BRIDGE_SOURCE
+		bridge.Archivable = false
+		bridge.Parent = parent
+	end)
+	if not ok then
+		return nil, `couldn't install the game bridge: {failure}`
+	end
+
+	-- The bridge is an ordinary game script, so it starts on its own schedule, not ours.
+	local deadline = os.clock() + READY_TIMEOUT
+	repeat
+		local bindable = parent:FindFirstChild(INVOKE_NAME)
+		if bindable and bindable:IsA("BindableFunction") then
+			return bindable, nil
+		end
+		task.wait()
+	until os.clock() >= deadline
+
+	return nil, "the game bridge script never started -- is the playtest actually running?"
+end
+
+-- Returns ok plus the rendered result. The snippet runs as a function body, so `return` works.
+function GameVm.Run(source: string): (boolean, string)
+	local bindable, problem = ensure()
+	if not bindable then
+		return false, problem :: string
+	end
+
+	local module, refusal = Inject.Module(`return (function() {source}\nend)()`)
+	if not module then
+		return false, refusal :: string
+	end
+
+	local ok, reply = pcall(function()
+		return bindable:Invoke(module)
+	end)
+	pcall(function()
+		module:Destroy()
+	end)
+
+	if not ok then
+		return false, `the game bridge refused the call: {reply}`
+	end
+	if type(reply) ~= "table" then
+		return false, "the game bridge answered with something unreadable"
+	end
+	return reply.ok == true, tostring(reply.text)
+end
+
+-- The reason this module exists: requires the module the *game* holds, with whatever state it has
+-- built up by now, and renders it. `path` is a dotted DataModel path.
+function GameVm.Require(path: string): (boolean, string)
+	if type(path) ~= "string" or path == "" then
+		return false, 'Require takes a dotted path, like "ReplicatedStorage.Modules.Combat"'
+	end
+
+	-- Resolved on the game's side rather than here, so a path pointing at something only the
+	-- server can see still works.
+	return GameVm.Run(table.concat({
+		`local path = {string.format("%q", path)}`,
+		"local current = game",
+		'for segment in string.gmatch(path, "[^%.]+") do',
+		"	local found = current:FindFirstChild(segment)",
+		"	if not found and current == game then",
+		"		found = (pcall(game.GetService, game, segment)) and game:GetService(segment) or nil",
+		"	end",
+		'	if not found then error("nothing at " .. path) end',
+		"	current = found",
+		"end",
+		"return require(current)",
+	}, "\n"))
+end
+
+-- Serialize is handed to snippets alongside this, so a caller that wants the plugin-side renderer
+-- rather than the game-side one has it.
+GameVm.Serialize = Serialize
+
+return GameVm
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="7">
+        <Properties>
+          <string name="Name">Inject</string>
+          <string name="Source"><![CDATA[--!strict
+--!optimize 2
+
+-- Compiles and runs a chunk of Luau in the plugin's own context.
+--
+-- `loadstring` isn't involved and doesn't need to be: a plugin has PluginSecurity in whatever
+-- DataModel it's loaded into, so it can write a ModuleScript's Source and require it. That works
+-- in the edit DataModel and in a playtest alike, with LoadStringEnabled off.
+--
+-- Fresh every call is the whole trick: `require` caches by instance, so reusing one would hand
+-- back the first run's result forever no matter what the source says now.
+--
+-- The scratch folder lives in CoreGui, not the place. CoreGui isn't saved, so a crash mid-run
+-- leaves nothing behind to commit and nothing for Rojo to fight with.
+
+local CoreGui = game:GetService("CoreGui")
+
+local FOLDER_NAME = "VMCP_Exec"
+local DEFAULT_TIMEOUT = 10
+
+local Inject = {}
+
+local scratch: Folder? = nil
+local counter = 0
+
+local function folder(): Folder
+	local existing = scratch
+	if existing and existing.Parent then
+		return existing
+	end
+
+	-- First call of the session also sweeps: anything already here is an orphan from a plugin
+	-- reload or a Studio crash, and nothing in it was worth keeping.
+	local stale = CoreGui:FindFirstChild(FOLDER_NAME)
+	if stale then
+		stale:Destroy()
+	end
+
+	local created = Instance.new("Folder")
+	created.Name = FOLDER_NAME
+	created.Parent = CoreGui
+	scratch = created
+	return created
+end
+
+local INJECTION_DENIED = "Studio won't let VMCP create scripts, so run_luau can't work. Open the "
+	.. "Plugins ribbon, click Plugin Management, and allow script injection for VMCP."
+
+-- Returns a ModuleScript holding `source`, parented into the scratch folder.
+function Inject.Module(source: string): (ModuleScript?, string?)
+	counter += 1
+	local ok, created = pcall(function()
+		local module = Instance.new("ModuleScript")
+		module.Name = `chunk{counter}`
+		module.Source = source
+		return module
+	end)
+	if not ok then
+		return nil, `{INJECTION_DENIED} ({created})`
+	end
+
+	local module = created :: ModuleScript
+	module.Parent = folder()
+	return module, nil
+end
+
+-- Wrapping in a function is what lets a snippet with no `return` work at all -- a ModuleScript
+-- body that returns nothing is a hard require error. The wrapper stays on line 1 so a syntax
+-- error still reports the snippet's own line numbers.
+local function wrap(source: string, parameters: string): string
+	return `return function({parameters}) {source}\nend`
+end
+
+-- Compiles without running past the top level, and hands back the callable. Separating this from
+-- running is what lets a timeline check its whole payload before the playtest starts, and compile
+-- each event once instead of once per firing.
+function Inject.Compile(source: string, parameters: string?): (((...any) -> ...any)?, string?)
+	local module, refusal = Inject.Module(wrap(source, parameters or "vmcp"))
+	if not module then
+		return nil, refusal
+	end
+
+	local ok, chunk = pcall(require, module)
+	pcall(function()
+		module:Destroy()
+	end)
+	if not ok then
+		return nil, tostring(chunk)
+	end
+	return chunk :: any, nil
+end
+
+-- Returns ok plus either the snippet's return value or the failure text. `env` is handed to the
+-- snippet as its `vmcp` argument.
+function Inject.Run(source: string, env: { [string]: any }?, timeout: number?): (boolean, any)
+	local chunk, refusal = Inject.Compile(source)
+	if not chunk then
+		return false, refusal
+	end
+
+	local ok, produced = false, nil :: any
+	local done = false
+	local thread = task.spawn(function()
+		ok, produced = pcall(chunk, env or {})
+		done = true
+	end)
+
+	-- A snippet that yields forever would otherwise wedge the plugin until Studio restarts. A
+	-- tight loop with no yield still hangs everything, and nothing in Luau can preempt that.
+	local limit = timeout or DEFAULT_TIMEOUT
+	local deadline = os.clock() + limit
+	while not done and os.clock() < deadline do
+		task.wait()
+	end
+	if not done then
+		pcall(task.cancel, thread)
+		return false, `the snippet was still running after {limit}s and was cancelled`
+	end
+
+	return ok, produced
+end
+
+return Inject
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="8">
+        <Properties>
+          <string name="Name">Portable</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Turns arbitrary Luau values into something that survives a trip through JSON, and back again.
+--
+-- This exists because the interesting values in VMCP are captured in one DataModel and used in
+-- another: the server sees what a client really sent to a remote, and the client is where you
+-- replay it. Serialize.Render is for reading; this is for round-tripping.
+--
+-- Instances cross as their path and are resolved again on the far side, so a captured argument
+-- naming the local player's character comes back as *that* DataModel's copy of it.
+
+local Path = require(script.Parent.Parent.Path)
+
+local Portable = {}
+
+local MAX_DEPTH = 4
+local MAX_ELEMENTS = 40
+local MAX_STRING = 2000
+
+-- A hole in an array can't be expressed in JSON, and remote arguments are full of them.
+local NIL = { __t = "nil" }
+
+local function capture(value: any, depth: number): any
+	local kind = typeof(value)
+	if kind == "nil" then
+		return NIL
+	end
+	if kind == "boolean" or kind == "number" then
+		return value
+	end
+	if kind == "string" then
+		return if #value > MAX_STRING then string.sub(value, 1, MAX_STRING) else value
+	end
+	if kind == "Instance" then
+		return { __t = "Instance", path = value:GetFullName(), class = value.ClassName }
+	end
+	if kind == "Vector3" then
+		return { __t = "Vector3", x = value.X, y = value.Y, z = value.Z }
+	end
+	if kind == "Vector2" then
+		return { __t = "Vector2", x = value.X, y = value.Y }
+	end
+	if kind == "CFrame" then
+		return { __t = "CFrame", components = { value:GetComponents() } }
+	end
+	if kind == "Color3" then
+		return { __t = "Color3", r = value.R, g = value.G, b = value.B }
+	end
+	if kind == "UDim2" then
+		return { __t = "UDim2", xs = value.X.Scale, xo = value.X.Offset, ys = value.Y.Scale, yo = value.Y.Offset }
+	end
+	if kind == "EnumItem" then
+		return { __t = "EnumItem", enum = tostring(value.EnumType), name = value.Name }
+	end
+	if kind ~= "table" then
+		return { __t = "opaque", kind = kind, text = tostring(value) }
+	end
+
+	if depth >= MAX_DEPTH then
+		return { __t = "opaque", kind = "table", text = "too deep" }
+	end
+
+	local out: { [any]: any } = {}
+	local count = 0
+	for key, item in value do
+		count += 1
+		if count > MAX_ELEMENTS then
+			break
+		end
+		local name = if type(key) == "string" or type(key) == "number" then key else tostring(key)
+		out[name] = capture(item, depth + 1)
+	end
+	return out
+end
+
+local RESTORERS: { [string]: (any) -> any } = {
+	["nil"] = function(): any
+		return nil
+	end,
+	Instance = function(entry): any
+		local found = Path.Resolve(entry.path)
+		return found
+	end,
+	Vector3 = function(entry): any
+		return Vector3.new(entry.x, entry.y, entry.z)
+	end,
+	Vector2 = function(entry): any
+		return Vector2.new(entry.x, entry.y)
+	end,
+	CFrame = function(entry): any
+		return CFrame.new(table.unpack(entry.components))
+	end,
+	Color3 = function(entry): any
+		return Color3.new(entry.r, entry.g, entry.b)
+	end,
+	UDim2 = function(entry): any
+		return UDim2.new(entry.xs, entry.xo, entry.ys, entry.yo)
+	end,
+	EnumItem = function(entry): any
+		local enum = (Enum :: any)[entry.enum]
+		return if enum then enum[entry.name] else nil
+	end,
+	opaque = function(): any
+		return nil
+	end,
+}
+
+local function restore(entry: any): any
+	if type(entry) ~= "table" then
+		return entry
+	end
+
+	local tag = entry.__t
+	if type(tag) == "string" then
+		local restorer = RESTORERS[tag]
+		return if restorer then restorer(entry) else nil
+	end
+
+	local out: { [any]: any } = {}
+	for key, item in entry do
+		out[key] = restore(item)
+	end
+	return out
+end
+
+-- A packed argument list (table.pack, so `n` is the real length holes and all) in, a JSON-safe
+-- array out. The length is kept separately for the same reason table.pack keeps it.
+function Portable.CaptureArgs(packed: { any }): { any }
+	local out = {}
+	for index = 1, (packed :: any).n or #packed do
+		out[index] = capture(packed[index], 0)
+	end
+	out.n = (packed :: any).n or #packed
+	return out
+end
+
+function Portable.RestoreArgs(captured: { any }): ({ any }, number)
+	local out = {}
+	local count = (captured :: any).n or #captured
+	for index = 1, count do
+		out[index] = restore(captured[index])
+	end
+	return out, count
+end
+
+Portable.Capture = function(value: any): any
+	return capture(value, 0)
+end
+
+Portable.Restore = restore
+
+-- What an argument *is*, in one word, for a report. Reads off the captured form so it works on
+-- arguments that came from another DataModel.
+function Portable.Describe(entry: any): string
+	if type(entry) ~= "table" then
+		return typeof(entry)
+	end
+	local tag = entry.__t
+	if type(tag) == "string" then
+		if tag == "Instance" then
+			return `{entry.class} {entry.path}`
+		end
+		return tag
+	end
+	return "table"
+end
+
+return Portable
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="9">
+        <Properties>
+          <string name="Name">Serialize</string>
+          <string name="Source"><![CDATA[--!strict
+--!optimize 2
+
+-- Renders an arbitrary Luau value as readable text, so a snippet can `return` anything and the
+-- other end sees it instead of "table: 0x55f1c0". Roblox datatypes come back as the constructor
+-- you would type to rebuild them; Instances as their class and full path.
+--
+-- The caps are the point as much as the formatting: `return workspace` should cost a few lines,
+-- not the whole place over the socket.
+
+local MAX_DEPTH = 5
+local MAX_ELEMENTS = 60
+local MAX_STRING = 400
+local INDENT = "  "
+
+local Serialize = {}
+
+local function num(value: number): string
+	if value % 1 == 0 and math.abs(value) < 1e15 then
+		return string.format("%d", value)
+	end
+	return string.format("%.4g", value)
+end
+
+local function quote(text: string): string
+	local clipped = text
+	if #text > MAX_STRING then
+		clipped = `{string.sub(text, 1, MAX_STRING)}... (+{#text - MAX_STRING} more)`
+	end
+	-- %q escapes a newline as backslash-newline, which is valid Luau but wraps the output.
+	return (string.format("%q", clipped):gsub("\\n", "\n"))
+end
+
+local RENDERERS: { [string]: (any) -> string } = {
+	Vector3 = function(v): string
+		return `Vector3.new({num(v.X)}, {num(v.Y)}, {num(v.Z)})`
+	end,
+	Vector2 = function(v): string
+		return `Vector2.new({num(v.X)}, {num(v.Y)})`
+	end,
+	Color3 = function(c): string
+		return `Color3.new({num(c.R)}, {num(c.G)}, {num(c.B)})`
+	end,
+	UDim = function(u): string
+		return `UDim.new({num(u.Scale)}, {num(u.Offset)})`
+	end,
+	UDim2 = function(u): string
+		return `UDim2.new({num(u.X.Scale)}, {num(u.X.Offset)}, {num(u.Y.Scale)}, {num(u.Y.Offset)})`
+	end,
+	Rect = function(r): string
+		return `Rect.new({num(r.Min.X)}, {num(r.Min.Y)}, {num(r.Max.X)}, {num(r.Max.Y)})`
+	end,
+	NumberRange = function(r): string
+		return `NumberRange.new({num(r.Min)}, {num(r.Max)})`
+	end,
+	BrickColor = function(b): string
+		return `BrickColor.new("{b.Name}")`
+	end,
+	CFrame = function(c): string
+		local position = c.Position
+		local rx, ry, rz = c:ToEulerAnglesXYZ()
+		local origin = `CFrame.new({num(position.X)}, {num(position.Y)}, {num(position.Z)})`
+		if rx == 0 and ry == 0 and rz == 0 then
+			return origin
+		end
+		return `{origin} * CFrame.Angles({num(rx)}, {num(ry)}, {num(rz)})`
+	end,
+	Instance = function(instance): string
+		return `<{instance.ClassName} {instance:GetFullName()}>`
+	end,
+	EnumItem = function(item): string
+		return tostring(item)
+	end,
+	Enum = function(enum): string
+		return `Enum.{tostring(enum)}`
+	end,
+	buffer = function(b): string
+		return `<buffer, {buffer.len(b)} bytes>`
+	end,
+}
+
+local function isIdentifier(key: any): boolean
+	return type(key) == "string" and string.match(key, "^[%a_][%w_]*$") ~= nil
+end
+
+local function render(value: any, depth: number, open: { [any]: boolean }): string
+	local kind = typeof(value)
+	if kind == "string" then
+		return quote(value)
+	end
+	if kind == "number" then
+		return num(value)
+	end
+	if kind == "boolean" or kind == "nil" then
+		return tostring(value)
+	end
+	if kind ~= "table" then
+		local renderer = RENDERERS[kind]
+		return if renderer then renderer(value) else `<{kind} {tostring(value)}>`
+	end
+
+	-- `open` holds the tables on the path to here, not every table already seen -- the same table
+	-- twice in a list is fine to print twice, only a loop is a problem.
+	if open[value] then
+		return "<cycle>"
+	end
+	if depth >= MAX_DEPTH then
+		return "<table, too deep>"
+	end
+	open[value] = true
+
+	local lines = {}
+	local pad = string.rep(INDENT, depth + 1)
+	local arrayLength = #value
+	local truncated = false
+
+	for index = 1, arrayLength do
+		if #lines >= MAX_ELEMENTS then
+			truncated = true
+			break
+		end
+		table.insert(lines, `{pad}{render(value[index], depth + 1, open)},`)
+	end
+	for key, item in value do
+		if type(key) == "number" and key % 1 == 0 and key >= 1 and key <= arrayLength then
+			continue
+		end
+		if #lines >= MAX_ELEMENTS then
+			truncated = true
+			break
+		end
+		local name = if isIdentifier(key) then key else `[{render(key, depth + 1, open)}]`
+		table.insert(lines, `{pad}{name} = {render(item, depth + 1, open)},`)
+	end
+	open[value] = nil
+
+	if #lines == 0 then
+		return "{}"
+	end
+	if truncated then
+		table.insert(lines, `{pad}-- more entries not shown`)
+	end
+	return "{\n" .. table.concat(lines, "\n") .. "\n" .. string.rep(INDENT, depth) .. "}"
+end
+
+function Serialize.Render(value: any): string
+	return render(value, 0, {})
+end
+
+return Serialize
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="Folder" referent="10">
+      <Properties>
+        <string name="Name">Lib</string>
+      </Properties>
+      <Item class="ModuleScript" referent="11">
+        <Properties>
+          <string name="Name">Anim</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Compiles per-joint tracks into the Keyframe/Pose trees the engine wants, and reads them back.
+--
+-- The authoring model is "the right arm does this over time". The engine's format is "at t=0.3,
+-- here is every joint in the body". The first is how animation is thought about and the second is
+-- what has to be written, so the whole job here is the translation between them: union every
+-- track's timestamps, fill each keyframe's pose tree from the rig, and interpolate the joints
+-- that have no key at that moment.
+--
+-- Easing is written on the key it leaves *from*, because Pose.EasingStyle describes how to reach
+-- the next keyframe's value, not this one's.
+
+local KeyframeSequenceProvider = game:GetService("KeyframeSequenceProvider")
+
+local Rig = require(script.Parent.Rig)
+
+local Anim = {}
+
+export type Key = {
+	time: number,
+	-- Degrees, XYZ. Shorthand for the common case; `cframe` wins if both are given.
+	angles: { number }?,
+	cframe: CFrame?,
+	-- "Cubic/Out", "Quad/InOut", "Linear". Applies from this key toward the next.
+	easing: string?,
+	weight: number?,
+}
+
+export type Tracks = { [string]: { Key } }
+
+export type Compiled = {
+	id: string,
+	length: number,
+	joints: { string },
+	keyframes: number,
+}
+
+local function cframeOf(key: Key): CFrame
+	if key.cframe then
+		return key.cframe
+	end
+	local angles = key.angles or { 0, 0, 0 }
+	return CFrame.Angles(math.rad(angles[1] or 0), math.rad(angles[2] or 0), math.rad(angles[3] or 0))
+end
+
+local function easingOf(key: Key): (Enum.PoseEasingStyle, Enum.PoseEasingDirection)
+	local style, direction = string.match(key.easing or "Linear", "^(%a+)/?(%a*)$")
+	local resolved = (Enum.PoseEasingStyle :: any)[style or "Linear"] or Enum.PoseEasingStyle.Linear
+	local towards = (Enum.PoseEasingDirection :: any)[direction ~= "" and direction or "Out"]
+	return resolved, towards or Enum.PoseEasingDirection.Out
+end
+
+-- The value of one joint at an arbitrary time. Before the first key it holds the first value,
+-- after the last it holds the last, and between two it lerps -- so a joint keyed only at the ends
+-- still has a sensible pose in every keyframe the other joints introduced.
+local function sample(keys: { Key }, at: number): CFrame
+	if #keys == 0 then
+		return CFrame.identity
+	end
+	if at <= keys[1].time then
+		return cframeOf(keys[1])
+	end
+
+	for index = 1, #keys - 1 do
+		local from, to = keys[index], keys[index + 1]
+		if at >= from.time and at <= to.time then
+			local span = to.time - from.time
+			local alpha = if span > 0 then (at - from.time) / span else 1
+			return cframeOf(from):Lerp(cframeOf(to), alpha)
+		end
+	end
+	return cframeOf(keys[#keys])
+end
+
+local function keyAt(keys: { Key }, at: number): Key?
+	for _, key in keys do
+		if math.abs(key.time - at) < 1e-4 then
+			return key
+		end
+	end
+	return nil
+end
+
+-- Also returns the union of every track's timestamps, which is the keyframe list: a keyframe
+-- holds the whole body, so any joint moving at time t forces a pose for every joint at time t.
+local function validate(rig: Rig.Rig, tracks: Tracks): ({ number }, { string }, string?)
+	local times: { number } = {}
+	local touched: { string } = {}
+
+	for joint, keys in tracks do
+		if not rig.byName[joint] then
+			return {}, {}, `this rig has no joint named "{joint}". It has:\n{Rig.Describe(rig)}`
+		end
+		if type(keys) ~= "table" or #keys == 0 then
+			return {}, {}, `track "{joint}" has no keys`
+		end
+		table.insert(touched, joint)
+
+		table.sort(keys, function(a, b)
+			return a.time < b.time
+		end)
+		for _, key in keys do
+			if type(key.time) ~= "number" or key.time < 0 then
+				return {}, {}, `a key on "{joint}" has no usable time`
+			end
+			if not table.find(times, key.time) then
+				table.insert(times, key.time)
+			end
+		end
+	end
+
+	if #times == 0 then
+		return {}, {}, "no tracks, so there's nothing to compile"
+	end
+	table.sort(times)
+	return times, touched, nil
+end
+
+-- Returns a temporary hash id usable straight away as Animation.AnimationId. Studio only, and
+-- nothing is uploaded -- which is what makes previewing an animation a one-call loop.
+function Anim.Compile(
+	model: Instance,
+	tracks: Tracks,
+	options: { priority: string?, loop: boolean? }?
+): (Compiled?, string?)
+	local rig, problem = Rig.Build(model)
+	if not rig then
+		return nil, problem
+	end
+
+	local times, joints, bad = validate(rig, tracks)
+	if bad then
+		return nil, bad
+	end
+
+	local sequence = Instance.new("KeyframeSequence")
+	sequence.Name = model.Name
+	local settings = options or ({} :: { priority: string?, loop: boolean? })
+	sequence.Loop = settings.loop ~= false
+	local priority = (Enum.AnimationPriority :: any)[settings.priority or "Action"]
+	if priority then
+		sequence.Priority = priority
+	end
+
+	for _, at in times do
+		local keyframe = Instance.new("Keyframe")
+		keyframe.Time = at
+
+		local pose = Rig.PoseTree(rig, function(joint: string): CFrame?
+			local keys = tracks[joint]
+			return if keys then sample(keys, at) else nil
+		end)
+
+		-- Easing and weight are per-pose and only meaningful where the author actually put a key.
+		for _, descendant in pose:GetDescendants() do
+			local keys = tracks[descendant.Name]
+			local key = if keys then keyAt(keys, at) else nil
+			if key and descendant:IsA("Pose") then
+				descendant.EasingStyle, descendant.EasingDirection = easingOf(key)
+				if key.weight then
+					descendant.Weight = key.weight
+				end
+			end
+		end
+
+		pose.Parent = keyframe
+		keyframe.Parent = sequence
+	end
+
+	-- KeyframeSequence.Length reads 0 until the sequence is loaded, so the length is the last
+	-- keyframe time and nothing else.
+	local length = times[#times]
+	local ok, id = pcall(function()
+		return KeyframeSequenceProvider:RegisterKeyframeSequence(sequence)
+	end)
+	sequence:Destroy()
+	if not ok then
+		return nil, `couldn't register the sequence: {id}`
+	end
+
+	return { id = id, length = length, joints = joints, keyframes = #times }, nil
+end
+
+-- The other direction, so an uploaded animation can be pulled down with
+-- AnimationClipProvider:GetAnimationClipAsync, edited as tracks, and recompiled for preview
+-- without ever going back through the website.
+function Anim.Decompile(sequence: KeyframeSequence): Tracks
+	local tracks: Tracks = {}
+	local keyframes = sequence:GetKeyframes()
+	table.sort(keyframes, function(a, b)
+		return (a :: Keyframe).Time < (b :: Keyframe).Time
+	end)
+
+	for _, item in keyframes do
+		local keyframe = item :: Keyframe
+		for _, descendant in keyframe:GetDescendants() do
+			if not descendant:IsA("Pose") then
+				continue
+			end
+			-- An identity pose is the rest position, which is the same thing as having no key.
+			if descendant.CFrame == CFrame.identity then
+				continue
+			end
+			local keys = tracks[descendant.Name] or {}
+			tracks[descendant.Name] = keys
+			table.insert(keys, {
+				time = keyframe.Time,
+				cframe = descendant.CFrame,
+				easing = `{descendant.EasingStyle.Name}/{descendant.EasingDirection.Name}`,
+				weight = if descendant.Weight ~= 1 then descendant.Weight else nil,
+			})
+		end
+	end
+	return tracks
+end
+
+return Anim
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="12">
+        <Properties>
+          <string name="Name">Bench</string>
+          <string name="Source"><![CDATA[--!strict
+--!optimize 2
+
+-- Runs a function a lot of times and says how long it took.
+--
+-- The point isn't the total -- that you could time yourself. It's the distribution: a function
+-- whose mean is fine and whose p99 is forty times the median is the one causing the hitch, and an
+-- average hides that completely. Pair it with `perFrame` to reproduce the shape of real load
+-- instead of a tight loop the scheduler never sees.
+
+local RunService = game:GetService("RunService")
+
+local Bench = {}
+
+export type Options = {
+	-- Total calls. Defaults to 1000, or unlimited when `seconds` is set.
+	times: number?,
+	-- Stop after this long however many calls that took.
+	seconds: number?,
+	-- Calls per frame. Without it the calls run back to back with no yielding at all.
+	perFrame: number?,
+	-- Passed to the function on every call.
+	args: { any }?,
+	-- Calls to make and throw away first, so JIT warmup and lazy init don't skew the numbers.
+	warmup: number?,
+}
+
+export type Report = {
+	calls: number,
+	errors: number,
+	firstError: string?,
+	totalMs: number,
+	meanMs: number,
+	minMs: number,
+	maxMs: number,
+	p50Ms: number,
+	p95Ms: number,
+	p99Ms: number,
+	elapsedSeconds: number,
+}
+
+local DEFAULT_TIMES = 1000
+local MAX_SAMPLES = 20000
+
+local function percentile(sorted: { number }, fraction: number): number
+	if #sorted == 0 then
+		return 0
+	end
+	local index = math.clamp(math.ceil(fraction * #sorted), 1, #sorted)
+	return sorted[index]
+end
+
+function Bench.Run(fn: (...any) -> ...any, options: Options?): Report
+	local settings = options or ({} :: Options)
+	local args = settings.args or {}
+	local limit = settings.times or (if settings.seconds then math.huge else DEFAULT_TIMES)
+	local perFrame = settings.perFrame
+	local deadline = if settings.seconds then os.clock() + settings.seconds else math.huge
+
+	for _ = 1, settings.warmup or 0 do
+		pcall(fn, table.unpack(args))
+	end
+
+	local samples: { number } = {}
+	local errors = 0
+	local firstError: string? = nil
+	local calls = 0
+	local started = os.clock()
+	local thisFrame = 0
+
+	while calls < limit and os.clock() < deadline do
+		local before = os.clock()
+		local ok, failure = pcall(fn, table.unpack(args))
+		local took = (os.clock() - before) * 1000
+
+		calls += 1
+		if #samples < MAX_SAMPLES then
+			table.insert(samples, took)
+		end
+		if not ok then
+			errors += 1
+			firstError = firstError or tostring(failure)
+		end
+
+		if perFrame then
+			thisFrame += 1
+			if thisFrame >= perFrame then
+				thisFrame = 0
+				RunService.Heartbeat:Wait()
+			end
+		end
+	end
+
+	local elapsed = os.clock() - started
+	table.sort(samples)
+
+	local total = 0
+	for _, sample in samples do
+		total += sample
+	end
+
+	return {
+		calls = calls,
+		errors = errors,
+		firstError = firstError,
+		totalMs = total,
+		meanMs = if #samples > 0 then total / #samples else 0,
+		minMs = if #samples > 0 then samples[1] else 0,
+		maxMs = if #samples > 0 then samples[#samples] else 0,
+		p50Ms = percentile(samples, 0.5),
+		p95Ms = percentile(samples, 0.95),
+		p99Ms = percentile(samples, 0.99),
+		elapsedSeconds = elapsed,
+	}
+end
+
+-- One line, because the full report in a timeline note is unreadable.
+function Bench.Summarise(report: Report): string
+	local shape = string.format(
+		"mean %.3fms, p50 %.3f, p95 %.3f, p99 %.3f, max %.3f",
+		report.meanMs,
+		report.p50Ms,
+		report.p95Ms,
+		report.p99Ms,
+		report.maxMs
+	)
+	local failures = if report.errors > 0 then `, {report.errors} errored ({report.firstError})` else ""
+	return `{report.calls} calls in {string.format("%.2f", report.elapsedSeconds)}s -- {shape}{failures}`
+end
+
+return Bench
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="13">
+        <Properties>
+          <string name="Name">Build</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Turns a region of the DataModel into Luau that rebuilds it, and back again.
+--
+-- The reason is cost, not elegance. Reading a build as a tree dump tells you what's there but
+-- nothing you can change; reading it as code means an edit is a diff on a few lines instead of a
+-- description of every part in the area. One region comes back as code, the change happens in the
+-- code, the code goes back.
+--
+-- The generated source is idempotent on purpose: it looks for a child by name before creating one,
+-- so running it twice updates rather than duplicating, and running an edited version only moves
+-- what actually changed. That's what makes "re-apply" safe without a differ.
+
+local CollectionService = game:GetService("CollectionService")
+
+local Build = {}
+
+-- Properties worth capturing, by the class that owns them. An instance takes every entry it IsA,
+-- so a MeshPart picks up the BasePart set and its own. There's no way to enumerate an instance's
+-- properties from Luau, so this is a curated list and knows nothing about anything not on it.
+local PROPERTIES: { { class: string, names: { string } } } = {
+	{
+		class = "BasePart",
+		names = {
+			"Size",
+			"CFrame",
+			"Anchored",
+			"CanCollide",
+			"CanTouch",
+			"CanQuery",
+			"Color",
+			"Material",
+			"Transparency",
+			"Reflectance",
+			"CastShadow",
+			"CollisionGroup",
+		},
+	},
+	{ class = "MeshPart", names = { "MeshId", "TextureID", "DoubleSided" } },
+	{ class = "SpecialMesh", names = { "MeshId", "TextureId", "Scale", "Offset", "MeshType" } },
+	{ class = "Decal", names = { "Texture", "Face", "Color3", "Transparency", "ZIndex" } },
+	{ class = "Texture", names = { "StudsPerTileU", "StudsPerTileV" } },
+	{ class = "Attachment", names = { "CFrame", "Visible" } },
+	{ class = "Light", names = { "Brightness", "Color", "Enabled", "Shadows" } },
+	{ class = "PointLight", names = { "Range" } },
+	{ class = "SpotLight", names = { "Range", "Angle", "Face" } },
+	{ class = "SurfaceLight", names = { "Range", "Angle", "Face" } },
+	{
+		class = "ParticleEmitter",
+		names = { "Rate", "Lifetime", "Speed", "Texture", "Color", "Enabled", "SpreadAngle" },
+	},
+	{ class = "Beam", names = { "Texture", "Width0", "Width1", "Color", "Enabled" } },
+	{ class = "SurfaceAppearance", names = { "ColorMap", "NormalMap", "MetalnessMap", "RoughnessMap" } },
+	{
+		class = "GuiObject",
+		names = {
+			"Size",
+			"Position",
+			"AnchorPoint",
+			"BackgroundColor3",
+			"BackgroundTransparency",
+			"BorderSizePixel",
+			"ZIndex",
+			"Visible",
+		},
+	},
+	{ class = "TextLabel", names = { "Text", "TextColor3", "TextSize", "Font", "TextWrapped", "TextXAlignment" } },
+	{ class = "ImageLabel", names = { "Image", "ImageColor3", "ImageTransparency", "ScaleType" } },
+	{ class = "UICorner", names = { "CornerRadius" } },
+	{ class = "UIStroke", names = { "Thickness", "Color", "Transparency", "ApplyStrokeMode" } },
+	{
+		class = "UIListLayout",
+		names = { "Padding", "FillDirection", "SortOrder", "HorizontalAlignment", "VerticalAlignment" },
+	},
+}
+
+local MAX_DEPTH = 12
+local MAX_NODES = 800
+
+local function num(value: number): string
+	if value ~= value then
+		return "0 / 0"
+	end
+	if value == math.huge or value == -math.huge then
+		return if value > 0 then "math.huge" else "-math.huge"
+	end
+	if value % 1 == 0 and math.abs(value) < 1e15 then
+		return string.format("%d", value)
+	end
+	return string.format("%.4g", value)
+end
+
+-- Every value that can appear in the generated source, written the way you'd type it. Anything
+-- not here is skipped rather than guessed at, which is why the property list above is curated.
+local function literal(value: any): string?
+	local kind = typeof(value)
+	if kind == "string" then
+		return string.format("%q", value)
+	end
+	if kind == "number" then
+		return num(value)
+	end
+	if kind == "boolean" then
+		return tostring(value)
+	end
+	if kind == "Vector3" then
+		return `Vector3.new({num(value.X)}, {num(value.Y)}, {num(value.Z)})`
+	end
+	if kind == "Vector2" then
+		return `Vector2.new({num(value.X)}, {num(value.Y)})`
+	end
+	if kind == "Color3" then
+		return `Color3.new({num(value.R)}, {num(value.G)}, {num(value.B)})`
+	end
+	if kind == "UDim" then
+		return `UDim.new({num(value.Scale)}, {num(value.Offset)})`
+	end
+	if kind == "UDim2" then
+		return `UDim2.new({num(value.X.Scale)}, {num(value.X.Offset)}, {num(value.Y.Scale)}, {num(value.Y.Offset)})`
+	end
+	if kind == "NumberRange" then
+		return `NumberRange.new({num(value.Min)}, {num(value.Max)})`
+	end
+	if kind == "EnumItem" then
+		return tostring(value)
+	end
+	if kind == "BrickColor" then
+		return `BrickColor.new("{value.Name}")`
+	end
+	if kind == "CFrame" then
+		local position = value.Position
+		local rx, ry, rz = value:ToEulerAnglesXYZ()
+		local origin = `CFrame.new({num(position.X)}, {num(position.Y)}, {num(position.Z)})`
+		if rx == 0 and ry == 0 and rz == 0 then
+			return origin
+		end
+		return `{origin} * CFrame.Angles({num(rx)}, {num(ry)}, {num(rz)})`
+	end
+	return nil
+end
+
+local function propertiesFor(instance: Instance): { string }
+	local names: { string } = {}
+	for _, entry in PROPERTIES do
+		if not instance:IsA(entry.class) then
+			continue
+		end
+		for _, name in entry.names do
+			if not table.find(names, name) then
+				table.insert(names, name)
+			end
+		end
+	end
+	return names
+end
+
+-- Only what differs from a fresh instance of the same class. A part dump that spells out every
+-- default is mostly noise, and noise is the thing this module exists to remove.
+local function defaults(className: string): Instance?
+	local ok, fresh = pcall(Instance.new, className)
+	return if ok then fresh else nil
+end
+
+local HEADER = [[
+-- Generated by VMCP. Edit freely and run it again: `ensure` updates what's already there rather
+-- than making a second copy, so only what you changed moves.
+
+local function ensure(parent, name, class)
+	local found = parent:FindFirstChild(name)
+	if found and found.ClassName ~= class then
+		found:Destroy()
+		found = nil
+	end
+	if not found then
+		found = Instance.new(class)
+		found.Name = name
+		found.Parent = parent
+	end
+	return found
+end
+
+return function(root)
+]]
+
+export type Options = {
+	depth: number?,
+	maxNodes: number?,
+	-- Include attributes and CollectionService tags. On by default; they're usually the part that
+	-- actually drives behaviour.
+	tags: boolean?,
+}
+
+-- Returns the source, plus how many instances it covered.
+function Build.Dump(root: Instance, options: Options?): (string, number)
+	local settings = options or ({} :: Options)
+	local depthLimit = math.clamp(settings.depth or MAX_DEPTH, 1, MAX_DEPTH)
+	local nodeLimit = math.clamp(settings.maxNodes or MAX_NODES, 1, MAX_NODES)
+	local wantTags = settings.tags ~= false
+
+	local lines = { HEADER }
+	local count = 0
+	local truncated = false
+
+	local function emit(instance: Instance, parentVar: string, depth: number)
+		if count >= nodeLimit then
+			truncated = true
+			return
+		end
+		count += 1
+		local variable = `n{count}`
+
+		table.insert(
+			lines,
+			`\tlocal {variable} = ensure({parentVar}, {string.format("%q", instance.Name)}, {string.format(
+				"%q",
+				instance.ClassName
+			)})`
+		)
+
+		local fresh = defaults(instance.ClassName)
+		for _, name in propertiesFor(instance) do
+			local ok, value = pcall(function()
+				return (instance :: any)[name]
+			end)
+			if not ok then
+				continue
+			end
+			if fresh then
+				local sameOk, same = pcall(function()
+					return (fresh :: any)[name] == value
+				end)
+				if sameOk and same then
+					continue
+				end
+			end
+			local written = literal(value)
+			if written then
+				table.insert(lines, `\t{variable}.{name} = {written}`)
+			end
+		end
+
+		if wantTags then
+			for name, value in instance:GetAttributes() do
+				local written = literal(value)
+				if written then
+					table.insert(lines, `\t{variable}:SetAttribute({string.format("%q", name)}, {written})`)
+				end
+			end
+			for _, tag in CollectionService:GetTags(instance) do
+				table.insert(
+					lines,
+					`\tgame:GetService("CollectionService"):AddTag({variable}, {string.format("%q", tag)})`
+				)
+			end
+		end
+
+		if fresh then
+			fresh:Destroy()
+		end
+		if depth >= depthLimit then
+			return
+		end
+		for _, child in instance:GetChildren() do
+			emit(child, variable, depth + 1)
+		end
+	end
+
+	for _, child in root:GetChildren() do
+		emit(child, "root", 1)
+	end
+
+	if truncated then
+		table.insert(lines, `\t-- stopped at {nodeLimit} instances; narrow the root or raise maxNodes`)
+	end
+	table.insert(lines, "\treturn root")
+	table.insert(lines, "end")
+	return table.concat(lines, "\n"), count
+end
+
+-- Runs a dump against a root. The source returns a function taking the root, so applying it
+-- somewhere else is how you copy a region -- same code, different parent.
+function Build.Apply(source: string, root: Instance): (boolean, string?)
+	local Inject = require(script.Parent.Parent.Exec.Inject)
+	local chunk, problem = Inject.Compile(source, "")
+	if not chunk then
+		return false, problem
+	end
+
+	local ok, produced = pcall(chunk)
+	if not ok then
+		return false, tostring(produced)
+	end
+	if type(produced) ~= "function" then
+		return false, "that source didn't return a function -- a Build dump ends with `return function(root)`"
+	end
+
+	local ran, failure = pcall(produced, root)
+	return ran, if ran then nil else tostring(failure)
+end
+
+return Build
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="14">
+        <Properties>
+          <string name="Name">Canvas</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- An EditableImage that writes everything down.
+--
+-- The drawing itself is the engine's -- DrawRectangle, DrawCircle, DrawLine all exist and are
+-- faster than anything written here would be. What earns this module its place is the recording:
+-- the same list of operations goes back to Node, which replays it into a PNG. So one snippet
+-- gives a live preview in Studio and a file on disk, from one description.
+
+local AssetService = game:GetService("AssetService")
+
+-- The engine's hard cap. An EditableImage can't be resized either, so a bigger one means a new
+-- image and a DrawImageTransformed into it.
+local MAX_SIZE = 1024
+
+local Canvas = {}
+
+export type Op = { [string]: any }
+
+export type Canvas = {
+	image: EditableImage,
+	width: number,
+	height: number,
+	ops: { Op },
+	Clear: (self: Canvas, color: Color3, alpha: number?) -> Canvas,
+	Rect: (self: Canvas, x: number, y: number, w: number, h: number, color: Color3, alpha: number?) -> Canvas,
+	Circle: (self: Canvas, x: number, y: number, radius: number, color: Color3, alpha: number?) -> Canvas,
+	Line: (self: Canvas, x1: number, y1: number, x2: number, y2: number, color: Color3, thickness: number?) -> Canvas,
+	Content: (self: Canvas) -> Content,
+	Recording: (self: Canvas) -> { [string]: any },
+}
+
+local Methods = {}
+Methods.__index = Methods
+
+local function record(self: any, op: Op): any
+	table.insert(self.ops, op)
+	return self
+end
+
+function Methods.Clear(self: any, color: Color3, alpha: number?): any
+	self.image:DrawRectangle(Vector2.zero, Vector2.new(self.width, self.height), color, 1 - (alpha or 1))
+	return record(self, { kind = "clear", color = { color.R, color.G, color.B }, alpha = alpha or 1 })
+end
+
+function Methods.Rect(self: any, x: number, y: number, w: number, h: number, color: Color3, alpha: number?): any
+	self.image:DrawRectangle(Vector2.new(x, y), Vector2.new(w, h), color, 1 - (alpha or 1))
+	return record(
+		self,
+		{ kind = "rect", x = x, y = y, w = w, h = h, color = { color.R, color.G, color.B }, alpha = alpha or 1 }
+	)
+end
+
+function Methods.Circle(self: any, x: number, y: number, radius: number, color: Color3, alpha: number?): any
+	self.image:DrawCircle(Vector2.new(x, y), radius, color, 1 - (alpha or 1))
+	return record(
+		self,
+		{ kind = "circle", x = x, y = y, r = radius, color = { color.R, color.G, color.B }, alpha = alpha or 1 }
+	)
+end
+
+function Methods.Line(self: any, x1: number, y1: number, x2: number, y2: number, color: Color3, thickness: number?): any
+	local width = thickness or 1
+	self.image:DrawLine(Vector2.new(x1, y1), Vector2.new(x2, y2), color, 0, Enum.ImageCombineType.Overwrite, width)
+	return record(self, {
+		kind = "line",
+		x1 = x1,
+		y1 = y1,
+		x2 = x2,
+		y2 = y2,
+		color = { color.R, color.G, color.B },
+		thickness = width,
+	})
+end
+
+-- Assign to an ImageLabel's ImageContent to see it. Only one EditableImage refreshes per frame on
+-- the display side, so a wall of live previews updates one at a time.
+function Methods.Content(self: any): Content
+	return Content.fromObject(self.image)
+end
+
+-- Hand this back from a run_luau snippet as `postProcess` and the VMCP server replays it to a PNG.
+function Methods.Recording(self: any): { [string]: any }
+	return { kind = "png", width = self.width, height = self.height, ops = self.ops }
+end
+
+function Canvas.new(width: number, height: number): (Canvas?, string?)
+	if width < 1 or height < 1 or width > MAX_SIZE or height > MAX_SIZE then
+		return nil, `an EditableImage is 1 to {MAX_SIZE} pixels on a side; asked for {width}x{height}`
+	end
+
+	local ok, image = pcall(function()
+		return AssetService:CreateEditableImage({ Size = Vector2.new(width, height) })
+	end)
+	if not ok then
+		return nil, `couldn't create the image: {image}`
+	end
+
+	return setmetatable({ image = image, width = width, height = height, ops = {} }, Methods) :: any, nil
+end
+
+return Canvas
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="15">
+        <Properties>
+          <string name="Name">Exploit</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Does to your remotes what an exploiter would, from a real client, through the real network path.
+--
+-- The point is that a remote handler is only as safe as its worst caller, and the worst caller
+-- doesn't use your UI. It sends the wrong types, sends nothing, sends a table where you wanted a
+-- number, and sends it four hundred times a second. None of that is reachable by calling the
+-- handler directly, which is why this lives in a client-context timeline event.
+--
+-- Blind junk only gets you so far, though: a handler that bails on the first argument never shows
+-- you what the fourth one does. So the interesting half of this file works off what the game
+-- *really* sends -- captured by Remotes.Shapes() on the server, replayed here, and broken one
+-- argument at a time in the ways that matter for the type that argument actually is.
+--
+-- Nothing here reaches outside the place, and nothing bypasses anything the engine enforces --
+-- it's your own remotes called rudely.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local Bench = require(script.Parent.Bench)
+local Path = require(script.Parent.Parent.Path)
+local Portable = require(script.Parent.Parent.Exec.Portable)
+local Serialize = require(script.Parent.Parent.Exec.Serialize)
+
+local Exploit = {}
+
+export type Report = Bench.Report
+
+local HUGE_STRING = string.rep("A", 10000)
+
+-- The values that break handlers with nothing to go on. Ordered roughly by how often they find
+-- something: nil and the wrong type first, then the numeric edges, then the ones that only matter
+-- if you index blindly.
+local JUNK: { any } = {
+	nil,
+	0,
+	-1,
+	math.huge,
+	-math.huge,
+	0 / 0,
+	2 ^ 53,
+	"",
+	"0",
+	HUGE_STRING,
+	true,
+	false,
+	{},
+	{ 1, 2, 3 },
+	Vector3.new(math.huge, 0, 0),
+	CFrame.identity,
+	workspace,
+}
+
+local function junk(): any
+	-- JUNK's first slot is nil, so #JUNK stops short of the real length; the count is fixed.
+	local index = math.random(1, 17)
+	return JUNK[index]
+end
+
+-- Instances worth substituting into an argument that wanted one: somebody else's character is what
+-- catches a missing ownership check, and a random part is what catches a missing "is this even the
+-- right kind of thing". Built from the place at call time, so it's this game's instances.
+local function pool(): { Instance }
+	local found: { Instance } = {}
+	local me = Players.LocalPlayer
+
+	for _, player in Players:GetPlayers() do
+		if player ~= me then
+			table.insert(found, player)
+			if player.Character then
+				table.insert(found, player.Character)
+			end
+		end
+	end
+	if me and me.Character then
+		table.insert(found, me.Character)
+		local part = me.Character:FindFirstChild("HumanoidRootPart")
+		if part then
+			table.insert(found, part)
+		end
+	end
+
+	for _, child in ReplicatedStorage:GetChildren() do
+		table.insert(found, child)
+		if #found > 24 then
+			break
+		end
+	end
+	for _, child in workspace:GetChildren() do
+		if child:IsA("BasePart") or child:IsA("Model") then
+			table.insert(found, child)
+		end
+		if #found > 32 then
+			break
+		end
+	end
+
+	if #found == 0 then
+		table.insert(found, workspace)
+	end
+	return found
+end
+
+local function fire(remote: Instance, args: { any }, count: number?): (boolean, any)
+	local width = count or #args
+	if remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent") then
+		return pcall(function()
+			(remote :: any):FireServer(table.unpack(args, 1, width))
+		end)
+	end
+	if remote:IsA("RemoteFunction") then
+		return pcall(function(): any
+			return (remote :: any):InvokeServer(table.unpack(args, 1, width))
+		end)
+	end
+	return false, `{remote:GetFullName()} is a {remote.ClassName}, not a remote`
+end
+
+local function guard(remote: Instance): string?
+	if not RunService:IsClient() then
+		return "this only means anything from a client -- put it in a client-context event"
+	end
+	if not (remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent") or remote:IsA("RemoteFunction")) then
+		return `{remote:GetFullName()} is a {remote.ClassName}, not a remote`
+	end
+	return nil
+end
+
+-- The same arguments, over and over. What this finds is missing rate limiting: if the handler is
+-- happy to run a thousand times a second, it will.
+function Exploit.Spam(remote: Instance, args: { any }?, options: Bench.Options?): (Report?, string?)
+	local problem = guard(remote)
+	if problem then
+		return nil, problem
+	end
+
+	local payload = args or {}
+	return Bench.Run(function()
+		fire(remote, payload)
+	end, options), nil
+end
+
+-- Junk arguments, every call. What this finds is missing validation: the handler that assumed the
+-- number was a number, or that the table it indexed had the field.
+function Exploit.Fuzz(remote: Instance, arity: number?, options: Bench.Options?): (Report?, string?)
+	local problem = guard(remote)
+	if problem then
+		return nil, problem
+	end
+
+	local width = math.clamp(arity or 2, 0, 8)
+	return Bench.Run(function()
+		local args = table.create(width)
+		for index = 1, width do
+			args[index] = junk()
+		end
+		fire(remote, args, width)
+	end, options),
+		nil
+end
+
+-- Fires every remote it can find once, with junk. A sweep to see what falls over before writing a
+-- targeted payload for whatever did.
+function Exploit.FuzzAll(root: Instance, arity: number?): (string, number)
+	local lines = {}
+	local touched = 0
+	for _, descendant in root:GetDescendants() do
+		if guard(descendant) then
+			continue
+		end
+		touched += 1
+		local report = Exploit.Fuzz(descendant, arity, { times = 1 })
+		local failed = report and report.errors > 0
+		if failed then
+			table.insert(lines, `  {descendant:GetFullName()} threw: {(report :: Report).firstError}`)
+		end
+	end
+
+	if #lines == 0 then
+		return `fired junk at {touched} remote(s); none of them threw`, touched
+	end
+	return `fired junk at {touched} remote(s):\n{table.concat(lines, "\n")}`, touched
+end
+
+export type Variant = { label: string, args: { any }, count: number }
+
+local function copy(args: { any }, count: number): { any }
+	local out = table.create(count)
+	for index = 1, count do
+		out[index] = args[index]
+	end
+	return out
+end
+
+-- What to do to a real argument, given what it really is. Each entry returns the replacements
+-- worth trying for that type -- `{ label, value }` pairs, because "nil" and "a table" are the same
+-- kind of test but tell you different things when one of them gets through.
+local function attacks(value: any, instances: { Instance }): { { label: string, value: any } }
+	local kind = typeof(value)
+
+	if kind == "number" then
+		return {
+			{ label = "negative", value = -math.abs(value) - 1 },
+			{ label = "huge", value = math.huge },
+			{ label = "nan", value = 0 / 0 },
+			{ label = "past 2^53", value = 2 ^ 53 },
+			{ label = "string instead of number", value = tostring(value) },
+		}
+	end
+	if kind == "string" then
+		return {
+			{ label = "empty string", value = "" },
+			{ label = "10k string", value = HUGE_STRING },
+			{ label = "number instead of string", value = 0 },
+			{ label = "unknown name", value = `{value}_NOPE` },
+		}
+	end
+	if kind == "boolean" then
+		return {
+			{ label = "flipped", value = not value },
+			{ label = "number instead of boolean", value = 1 },
+		}
+	end
+	if kind == "Instance" then
+		local swaps: { { label: string, value: any } } = {}
+		for _ = 1, math.min(3, #instances) do
+			local other = instances[math.random(1, #instances)]
+			table.insert(swaps, { label = `someone else's {other.ClassName}`, value = other })
+		end
+		table.insert(swaps, { label = "string instead of instance", value = (value :: Instance):GetFullName() })
+		return swaps
+	end
+	if kind == "table" then
+		return {
+			{ label = "empty table", value = {} },
+			{ label = "number instead of table", value = 0 },
+			{ label = "huge table", value = table.create(10000, 1) },
+		}
+	end
+	if kind == "Vector3" then
+		return {
+			{ label = "far away", value = Vector3.new(1e9, 1e9, 1e9) },
+			{ label = "nan vector", value = Vector3.new(0 / 0, 0, 0) },
+			{ label = "number instead of vector", value = 0 },
+		}
+	end
+
+	return { { label = "junk", value = junk() } }
+end
+
+-- Every way this particular call can be broken, one break at a time. One argument changed per
+-- variant on purpose: if two are wrong you learn which check fired, not which is missing.
+function Exploit.Variants(args: { any }, count: number?): { Variant }
+	local width = count or #args
+	local instances = pool()
+	local variants: { Variant } = { { label = "unchanged", args = copy(args, width), count = width } }
+
+	for index = 1, width do
+		local original = args[index]
+		local label = `arg {index} ({typeof(original)})`
+
+		local dropped = copy(args, width)
+		dropped[index] = nil
+		table.insert(variants, { label = `{label}: nil`, args = dropped, count = width })
+
+		for _, attack in attacks(original, instances) do
+			local changed = copy(args, width)
+			changed[index] = attack.value
+			table.insert(variants, { label = `{label}: {attack.label}`, args = changed, count = width })
+		end
+	end
+
+	table.insert(variants, { label = "no arguments at all", args = {}, count = 0 })
+	if width > 0 then
+		local extra = copy(args, width)
+		extra[width + 1] = junk()
+		table.insert(variants, { label = "one extra argument", args = extra, count = width + 1 })
+	end
+
+	return variants
+end
+
+export type Attempt = { label: string, ok: boolean, detail: string }
+
+-- Fires every variant once and says what came back. This is the tailored half: the arguments are
+-- the game's own, so the handler gets far enough in to be interesting.
+--
+-- A RemoteFunction answers directly -- an error is the handler throwing, and a returned value is
+-- what it was willing to give you. A RemoteEvent gives the caller nothing at all, so the only way
+-- to see what it did is the server's own logs and state, which a timeline collects anyway.
+function Exploit.Tailor(remote: Instance, args: { any }, count: number?): ({ Attempt }?, string?)
+	local problem = guard(remote)
+	if problem then
+		return nil, problem
+	end
+
+	local answers = remote:IsA("RemoteFunction")
+	local attempts: { Attempt } = {}
+	for _, variant in Exploit.Variants(args, count) do
+		local ok, produced = fire(remote, variant.args, variant.count)
+		local detail = if not ok
+			then tostring(produced)
+			elseif answers then `returned {Serialize.Render(produced)}`
+			else "sent"
+		table.insert(attempts, { label = variant.label, ok = ok, detail = detail })
+		task.wait()
+	end
+	return attempts, nil
+end
+
+-- The whole loop in one call: shapes captured on the server (Remotes.Shapes, crossed through ctx),
+-- every remote in them replayed and broken here on the client.
+function Exploit.FromTraffic(shapes: { any }): string
+	if type(shapes) ~= "table" or #shapes == 0 then
+		return "no captured traffic -- watch the remotes on the server first, and make the game send something"
+	end
+
+	local lines: { string } = {}
+	for _, shape in shapes do
+		local resolved = Path.Resolve(shape.remote)
+		if not resolved then
+			table.insert(lines, `{shape.remote}: not in this DataModel`)
+			continue
+		end
+
+		local args, count = Portable.RestoreArgs(shape.sample or {})
+		local attempts, problem = Exploit.Tailor(resolved, args, count)
+		if not attempts then
+			return problem :: string
+		end
+
+		local interesting = {}
+		for _, attempt in attempts do
+			if not attempt.ok or string.find(attempt.detail, "returned", 1, true) then
+				table.insert(interesting, `    {attempt.label} -> {attempt.detail}`)
+			end
+		end
+
+		table.insert(
+			lines,
+			`  {shape.remote} ({#attempts} variants, signature: {table.concat(shape.signature or {}, ", ")})`
+		)
+		if #interesting > 0 then
+			table.insert(lines, table.concat(interesting, "\n"))
+		else
+			table.insert(lines, "    every variant was accepted silently -- check the server's state and logs")
+		end
+	end
+
+	return `replayed and broke the game's own traffic:\n{table.concat(lines, "\n")}`
+end
+
+Exploit.Summarise = Bench.Summarise
+
+return Exploit
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="16">
+        <Properties>
+          <string name="Name">Remotes</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Watches remote traffic, so "what is this thing actually sending" stops being a guess.
+--
+-- Two different mechanisms, because remotes aren't symmetrical. A RemoteEvent can be *observed*:
+-- connecting a second listener to OnServerEvent doesn't disturb the first, so watching one is
+-- free and can't break the game. A RemoteFunction has exactly one callback, so the only way to
+-- see a call is to take the callback, put our own in front, and hand the arguments on -- a real
+-- hook. Stop() puts the originals back; a watch left running when a playtest ends dies with it.
+
+local RunService = game:GetService("RunService")
+
+local Path = require(script.Parent.Parent.Path)
+local Portable = require(script.Parent.Parent.Exec.Portable)
+local Serialize = require(script.Parent.Parent.Exec.Serialize)
+
+local Remotes = {}
+
+export type Call = {
+	remote: string,
+	direction: string,
+	from: string?,
+	at: number,
+	args: string,
+	-- The same arguments in a form that survives ctx and can be rebuilt in another DataModel, so
+	-- what a client really sent can be replayed and mutated from a client event.
+	captured: { any },
+}
+
+local MAX_CALLS = 500
+
+local calls: { Call } = {}
+local connections: { RBXScriptConnection } = {}
+local restores: { () -> () } = {}
+
+local function record(remote: Instance, direction: string, from: string?, args: { any })
+	if #calls >= MAX_CALLS then
+		return
+	end
+	table.insert(calls, {
+		remote = remote:GetFullName(),
+		direction = direction,
+		from = from,
+		at = os.clock(),
+		args = Serialize.Render(args),
+		captured = Portable.CaptureArgs(args),
+	})
+end
+
+local function watchEvent(remote: RemoteEvent | UnreliableRemoteEvent)
+	if RunService:IsServer() then
+		table.insert(
+			connections,
+			(remote :: any).OnServerEvent:Connect(function(player: Player, ...)
+				record(remote, "client to server", player.Name, table.pack(...))
+			end)
+		)
+		return
+	end
+	table.insert(
+		connections,
+		(remote :: any).OnClientEvent:Connect(function(...)
+			record(remote, "server to client", nil, table.pack(...))
+		end)
+	)
+end
+
+-- The invasive half. Saved and restored rather than left in place, because leaving a wrapper on a
+-- live RemoteFunction after the watch ends would quietly change the game's behaviour.
+local function hookFunction(remote: RemoteFunction)
+	local property = if RunService:IsServer() then "OnServerInvoke" else "OnClientInvoke"
+	local original = (remote :: any)[property]
+	if type(original) ~= "function" then
+		-- Nothing has claimed it yet. Hooking now would make us the handler, and there'd be no
+		-- real one to pass the call to.
+		return
+	end
+	(remote :: any)[property] = function(...)
+		if RunService:IsServer() then
+			-- OnServerInvoke gets the player as the first argument; the payload is what comes after,
+			-- so a captured call can be replayed from a client without the player baked into it.
+			local player = select(1, ...) :: any
+			record(
+				remote,
+				"invoke server",
+				if typeof(player) == "Instance" then player.Name else nil,
+				table.pack(select(2, ...))
+			)
+		else
+			record(remote, "invoke client", nil, table.pack(...))
+		end
+		return original(...)
+	end
+
+	table.insert(restores, function()
+		(remote :: any)[property] = original
+	end)
+end
+
+function Remotes.Watch(remote: Instance): string?
+	if remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent") then
+		watchEvent(remote :: any)
+		return nil
+	end
+	if remote:IsA("RemoteFunction") then
+		hookFunction(remote)
+		return nil
+	end
+	return `{remote:GetFullName()} is a {remote.ClassName}, not a remote`
+end
+
+-- Every remote under `root`, plus any added later, so a remote created after the watch started
+-- still gets seen.
+function Remotes.WatchAll(root: Instance): number
+	local found = 0
+	for _, descendant in root:GetDescendants() do
+		if not Remotes.Watch(descendant) then
+			found += 1
+		end
+	end
+	table.insert(
+		connections,
+		root.DescendantAdded:Connect(function(descendant: Instance)
+			Remotes.Watch(descendant)
+		end)
+	)
+	return found
+end
+
+function Remotes.Calls(): { Call }
+	return calls
+end
+
+export type Shape = {
+	remote: string,
+	class: string,
+	direction: string,
+	calls: number,
+	-- One word per argument position, from the most recent call.
+	signature: { string },
+	-- Real arguments, as sent. Feed them to Exploit.Tailor and it breaks them in the ways that
+	-- matter for the types they actually are.
+	sample: { any },
+}
+
+-- What the game's own traffic looks like: every remote seen, with a real set of arguments. JSON
+-- safe on purpose -- write it to ctx from a server event and read it from a client event, and the
+-- fuzzer stops guessing at shapes it could have just been told.
+function Remotes.Shapes(): { Shape }
+	local byRemote: { [string]: Shape } = {}
+	local order: { string } = {}
+
+	for _, call in calls do
+		local shape = byRemote[call.remote]
+		if not shape then
+			local instance = Path.Resolve(call.remote)
+			shape = {
+				remote = call.remote,
+				class = if instance then instance.ClassName else "unknown",
+				direction = call.direction,
+				calls = 0,
+				signature = {},
+				sample = {},
+			}
+			byRemote[call.remote] = shape
+			table.insert(order, call.remote)
+		end
+
+		shape.calls += 1
+		-- Last call wins: a later one is likelier to be the interesting in-game case than the
+		-- first, which is often an empty init ping.
+		shape.sample = call.captured
+		local signature = {}
+		for index = 1, (call.captured :: any).n or #call.captured do
+			table.insert(signature, Portable.Describe(call.captured[index]))
+		end
+		shape.signature = signature
+	end
+
+	local out: { Shape } = {}
+	for _, name in order do
+		table.insert(out, byRemote[name])
+	end
+	return out
+end
+
+function Remotes.Report(): string
+	if #calls == 0 then
+		return "no remote traffic seen"
+	end
+
+	local counts: { [string]: number } = {}
+	local order: { string } = {}
+	for _, call in calls do
+		local key = `{call.remote} ({call.direction})`
+		if not counts[key] then
+			table.insert(order, key)
+		end
+		counts[key] = (counts[key] or 0) + 1
+	end
+
+	local lines = { `{#calls} call(s) across {#order} remote(s):` }
+	for _, key in order do
+		table.insert(lines, `  {counts[key]}x {key}`)
+	end
+	table.insert(lines, "")
+	table.insert(lines, "most recent:")
+	for index = math.max(#calls - 9, 1), #calls do
+		local call = calls[index]
+		local who = if call.from then ` from {call.from}` else ""
+		table.insert(lines, `  {call.remote}{who} {call.args}`)
+	end
+	return table.concat(lines, "\n")
+end
+
+function Remotes.Stop()
+	for _, connection in connections do
+		connection:Disconnect()
+	end
+	table.clear(connections)
+	for _, restore in restores do
+		pcall(restore)
+	end
+	table.clear(restores)
+end
+
+function Remotes.Clear()
+	table.clear(calls)
+end
+
+return Remotes
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="17">
+        <Properties>
+          <string name="Name">Rig</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Derives a rig's pose hierarchy from the Motor6D graph it actually has.
+--
+-- This exists because of one trap that costs an afternoon every time: a Pose is *named* after a
+-- BasePart, but the CFrame on it drives the Motor6D joining that part to its **parent pose's**
+-- part. A Pose named LowerTorso drives the motor named Root. So a pose tree that looks sensible
+-- but doesn't mirror the real joint graph animates the wrong joints, and nothing errors -- the
+-- character just moves wrong.
+--
+-- Nothing here is hardcoded to a skeleton, so R6, R15 and custom rigs all work the same way.
+
+local Rig = {}
+
+export type Node = {
+	part: BasePart,
+	-- The motor that moves `part` relative to its parent. nil on the root, which nothing moves.
+	motor: Motor6D?,
+	children: { Node },
+}
+
+export type Rig = {
+	root: Node,
+	byName: { [string]: Node },
+	-- Every part name, parents before children, which is the order a pose tree has to be built in.
+	order: { string },
+}
+
+local function collect(model: Instance): ({ Motor6D }, { [BasePart]: true })
+	local motors: { Motor6D } = {}
+	local moved: { [BasePart]: true } = {}
+	for _, descendant in model:GetDescendants() do
+		if not descendant:IsA("Motor6D") then
+			continue
+		end
+		local child = descendant.Part1
+		if descendant.Part0 and child then
+			table.insert(motors, descendant)
+			moved[child] = true
+		end
+	end
+	return motors, moved
+end
+
+-- Walks the Motor6D graph out from the one part nothing else moves. Returns the problem instead
+-- of the rig when the graph doesn't describe a single tree, because every later step assumes it.
+function Rig.Build(model: Instance): (Rig?, string?)
+	local motors, moved = collect(model)
+	if #motors == 0 then
+		return nil, `{model:GetFullName()} has no Motor6Ds, so there's no rig to read`
+	end
+
+	local roots: { BasePart } = {}
+	for _, motor in motors do
+		local part0 = motor.Part0 :: BasePart
+		if not moved[part0] and not table.find(roots, part0) then
+			table.insert(roots, part0)
+		end
+	end
+	if #roots == 0 then
+		return nil, "every part in this rig is driven by a motor, so the joints form a loop"
+	end
+	if #roots > 1 then
+		local names = {}
+		for _, part in roots do
+			table.insert(names, part.Name)
+		end
+		return nil, `this rig has {#roots} unmoved parts ({table.concat(names, ", ")}); it needs exactly one root`
+	end
+
+	local byName: { [string]: Node } = {}
+	local order: { string } = {}
+
+	local function node(part: BasePart, motor: Motor6D?): Node
+		local created: Node = { part = part, motor = motor, children = {} }
+		byName[part.Name] = created
+		table.insert(order, part.Name)
+		return created
+	end
+
+	local root = node(roots[1], nil)
+	local frontier = { root }
+	while #frontier > 0 do
+		local current = table.remove(frontier) :: Node
+		for _, motor in motors do
+			if motor.Part0 ~= current.part then
+				continue
+			end
+			local child = node(motor.Part1 :: BasePart, motor)
+			table.insert(current.children, child)
+			table.insert(frontier, child)
+		end
+	end
+
+	if #order < #motors + 1 then
+		return nil, `only {#order} of {#motors + 1} parts are reachable from {root.part.Name} -- the rig is in pieces`
+	end
+	return { root = root, byName = byName, order = order }, nil
+end
+
+-- Builds one keyframe's worth of Poses: the same shape as the rig, one Pose per part, named after
+-- the part but driving the motor above it. `cframeFor` supplies each joint's transform; anything
+-- it has no opinion on stays at identity, which is the joint's rest position.
+function Rig.PoseTree(rig: Rig, cframeFor: (partName: string) -> CFrame?): Pose
+	local function build(node: Node): Pose
+		local pose = Instance.new("Pose")
+		pose.Name = node.part.Name
+		pose.CFrame = cframeFor(node.part.Name) or CFrame.identity
+		for _, child in node.children do
+			build(child).Parent = pose
+		end
+		return pose
+	end
+	return build(rig.root)
+end
+
+-- Names the rig knows, so a typo in a track can be reported as "no such joint" instead of
+-- animating nothing and looking like a broken export.
+function Rig.Describe(rig: Rig): string
+	local lines = {}
+	local function walk(node: Node, depth: number)
+		local motor = if node.motor then ` via {node.motor.Name}` else " (root)"
+		table.insert(lines, `{string.rep("  ", depth)}{node.part.Name}{motor}`)
+		for _, child in node.children do
+			walk(child, depth + 1)
+		end
+	end
+	walk(rig.root, 0)
+	return table.concat(lines, "\n")
+end
+
+return Rig
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="18">
+        <Properties>
+          <string name="Name">Style</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Two small checks around StyleRule, both of which exist because the engine fails quietly here.
+--
+-- StyleRule:SetProperties ignores a property name the target class doesn't have. No error, no
+-- warning -- the rule just does less than it says, and the usual next move is to go and rewrite
+-- the selector, which was never the problem. StyleRule.SelectorError is the same shape of trap in
+-- the other direction: the message is there to read, but nothing makes you read it.
+
+local Style = {}
+
+-- Instance.new is the only honest way to ask "does this class have this property". A probe costs
+-- one instance that's thrown away immediately, and the answer is exact.
+local function probe(className: string): (Instance?, string?)
+	local ok, instance = pcall(Instance.new, className)
+	if not ok then
+		return nil,
+			`can't check against "{className}" -- either it isn't a class or it isn't creatable, `
+				.. "which is the case for abstract ones like GuiObject"
+	end
+	return instance, nil
+end
+
+-- Returns the property names the class doesn't have. Empty means everything would land.
+function Style.Check(className: string, properties: { [string]: any }): ({ string }, string?)
+	local instance, problem = probe(className)
+	if not instance then
+		return {}, problem
+	end
+
+	local missing = {}
+	for name in properties do
+		if not pcall(function()
+			return (instance :: any)[name]
+		end) then
+			table.insert(missing, name)
+		end
+	end
+	instance:Destroy()
+
+	table.sort(missing)
+	return missing, nil
+end
+
+-- Checks first, then applies. Returns the names it refused to set, so a typo shows up as a list
+-- rather than as a rule that mysteriously does nothing.
+function Style.Apply(rule: StyleRule, className: string, properties: { [string]: any }): ({ string }, string?)
+	local missing, problem = Style.Check(className, properties)
+	if problem then
+		return {}, problem
+	end
+
+	local wanted = {}
+	for name, value in properties do
+		if not table.find(missing, name) then
+			wanted[name] = value
+		end
+	end
+	rule:SetProperties(wanted)
+	return missing, nil
+end
+
+-- Sets a selector and hands back whatever the engine made of it. An empty return means it parsed.
+function Style.Selector(rule: StyleRule, selector: string): string?
+	rule.Selector = selector
+	local complaint = rule.SelectorError
+	return if complaint ~= "" then complaint else nil
+end
+
+return Style
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="Folder" referent="19">
+      <Properties>
+        <string name="Name">Log</string>
+      </Properties>
+      <Item class="ModuleScript" referent="20">
+        <Properties>
+          <string name="Name">Buffer</string>
+          <string name="Source"><![CDATA[--!strict
+--!optimize 2
+
+-- A rolling record of everything Studio logs, hooked once at plugin load.
+--
+-- This is the part run_luau structurally cannot do: a snippet only ever sees its own output, but
+-- the errors worth reading are usually thrown by the place's own scripts, minutes before any tool
+-- ran. Buffer.Since also backs run_luau's output capture -- note the cursor, run, read the tail.
+
+local LogService = game:GetService("LogService")
+
+local CAPACITY = 500
+
+export type Entry = {
+	cursor: number,
+	time: number,
+	severity: string,
+	text: string,
+}
+
+local SEVERITY: { [Enum.MessageType]: string } = {
+	[Enum.MessageType.MessageOutput] = "print",
+	[Enum.MessageType.MessageInfo] = "info",
+	[Enum.MessageType.MessageWarning] = "warn",
+	[Enum.MessageType.MessageError] = "error",
+}
+
+local Buffer = {
+	-- Total entries ever written, so it doubles as a cursor that never repeats.
+	written = 0,
+}
+
+local entries: { Entry } = table.create(CAPACITY)
+local started = false
+
+local function push(messageType: Enum.MessageType, text: string, when: number)
+	Buffer.written += 1
+	entries[(Buffer.written - 1) % CAPACITY + 1] = {
+		cursor = Buffer.written,
+		time = when,
+		severity = SEVERITY[messageType] or "print",
+		text = text,
+	}
+end
+
+function Buffer.Start()
+	if started then
+		return
+	end
+	started = true
+
+	-- MessageOut only fires from here on, so whatever Studio already has scrolls in first. Only
+	-- the plugin can do that -- GetLogHistory is PluginSecurity and this module is also injected
+	-- into playtest DataModels, where the backfill simply isn't available.
+	pcall(function()
+		for _, item in LogService:GetLogHistory() do
+			push(item.messageType, item.message, item.timestamp)
+		end
+	end)
+	LogService.MessageOut:Connect(function(text: string, messageType: Enum.MessageType)
+		push(messageType, text, os.time())
+	end)
+end
+
+-- Entries newer than `cursor`, oldest first, plus how many fell off the ring before we got to
+-- them -- a caller that asked for a gap it can't have should be able to say so.
+function Buffer.Since(cursor: number): ({ Entry }, number)
+	local oldest = math.max(Buffer.written - CAPACITY, 0)
+	local dropped = math.max(oldest - cursor, 0)
+
+	local out = {}
+	for index = math.max(cursor, oldest) + 1, Buffer.written do
+		table.insert(out, entries[(index - 1) % CAPACITY + 1])
+	end
+	return out, dropped
+end
+
+return Buffer
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="ModuleScript" referent="21">
+      <Properties>
+        <string name="Name">Panel</string>
+        <string name="Source"><![CDATA[--!strict
+--!optimize 2
+
+-- The panel's instance tree and its styling. There is no protocol, no state machine and no
+-- validation in here -- it builds the widgets, styles them, and hands them back for you to wire.
+--
+--   local root = Panel.Mount(parent)
+--
+--   Panel.ConnectButton     TextButton
+--   Panel.DisconnectButton  TextButton  (starts disabled; set .Interactable)
+--   Panel.PortInput         TextBox
+--   Panel.TokenInput        TextBox
+--   Panel.StatusLine        TextLabel   the sentence under the buttons
+--   Panel.StatusWord        TextLabel   the word beside the lamp
+--
+--   Panel.SetSignal("Idle" | "Work" | "Live" | "Fault")   lamp + hairline colour; Work animates
+--   Panel.SetTokenOpen(open)                              the auth-token drawer
+--   Panel.SetStatusWord(text)                              the word beside the lamp
+--   Panel.SetStatusLine(text)                              the sentence under the buttons
+--   Panel.SetConnectEnabled(enabled)                       ConnectButton.Interactable
+--   Panel.SetDisconnectEnabled(enabled)                    DisconnectButton.Interactable
+--   Panel.Destroy()
+--
+--   Panel.ConnectRequested      ()             Connect button clicked
+--   Panel.DisconnectRequested   ()             Disconnect button clicked
+--   Panel.PortChanged           (text: string) PortInput text edited
+--   Panel.TokenChanged          (text: string) TokenInput text edited
+--
+-- Clicking the disclosure row toggles the drawer on its own. Everything else is yours.
+
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local Style = require(script.Style)
+
+local ADDRESS_PREFIX = "ws://127.0.0.1:"
+local NARROW_WIDTH = 240
+local FIELD_H = 32
+local PAD = 16
+
+local EASE = TweenInfo.new(0.18, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+
+-- Filled in by Mount; this is the panel's whole public surface.
+local Panel = {
+	Root = nil :: any,
+	ConnectButton = nil :: any,
+	DisconnectButton = nil :: any,
+	PortInput = nil :: any,
+	TokenInput = nil :: any,
+	StatusLine = nil :: any,
+	StatusWord = nil :: any,
+	ConnectRequested = nil :: any,
+	DisconnectRequested = nil :: any,
+	PortChanged = nil :: any,
+	TokenChanged = nil :: any,
+}
+
+Panel._connectRequestedBindable = Instance.new("BindableEvent")
+Panel._disconnectRequestedBindable = Instance.new("BindableEvent")
+Panel._portChangedBindable = Instance.new("BindableEvent")
+Panel._tokenChangedBindable = Instance.new("BindableEvent")
+Panel.ConnectRequested = Panel._connectRequestedBindable.Event
+Panel.DisconnectRequested = Panel._disconnectRequestedBindable.Event
+Panel.PortChanged = Panel._portChangedBindable.Event
+Panel.TokenChanged = Panel._tokenChangedBindable.Event
+
+local gradient: UIGradient
+local tokenGroup: Frame
+local toggleWord: TextLabel
+local sweep: RBXScriptConnection? = nil
+local tokenOpen = false
+
+---------------------------------------------------------------------- tree helpers
+
+local orders: { [Instance]: number } = {}
+
+local function new(class: string, props: { [string]: any }, parent: Instance?): any
+	local inst = Instance.new(class)
+	for key, value in props do
+		(inst :: any)[key] = value
+	end
+	-- Siblings lay out in the order they are written below, so nothing hand-numbers LayoutOrder.
+	if parent and inst:IsA("GuiObject") then
+		local n = (orders[parent] or 0) + 1
+		orders[parent] = n
+		inst.LayoutOrder = n
+	end
+	inst.Parent = parent
+	return inst
+end
+
+-- A transparent auto-height container and its layout. Every group in the panel is one of these.
+local function box(name: string, parent: Instance, dir: Enum.FillDirection, gap: number): Frame
+	local frame = new("Frame", {
+		Name = name,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+	}, parent)
+	new("UIListLayout", {
+		FillDirection = dir,
+		Padding = UDim.new(0, gap),
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}, frame)
+	return frame
+end
+
+local function pad(parent: Instance, x: number, y: number)
+	new("UIPadding", {
+		PaddingLeft = UDim.new(0, x),
+		PaddingRight = UDim.new(0, x),
+		PaddingTop = UDim.new(0, y),
+		PaddingBottom = UDim.new(0, y),
+	}, parent)
+end
+
+local function label(name: string, text: string, parent: Instance): TextLabel
+	local created = new("TextLabel", {
+		Name = name,
+		Text = text,
+		AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2.fromOffset(0, 14),
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, parent)
+	created:AddTag("FieldLabel")
+	return created
+end
+
+-- A bordered input row. Active so the frame reports :Hover to the stroke rule.
+local function field(name: string, parent: Instance): Frame
+	local frame = new("Frame", { Name = name, Size = UDim2.new(1, 0, 0, FIELD_H), Active = true }, parent)
+	frame:AddTag("Field")
+	new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, frame)
+	return frame
+end
+
+local function button(name: string, text: string, role: string, parent: Instance): TextButton
+	local btn = new("TextButton", { Name = name, Text = text }, parent)
+	btn:AddTag("Btn")
+	btn:AddTag(role)
+	return btn
+end
+
+---------------------------------------------------------------------- presentation
+
+-- The lamp and the hairline share one colour. "Work" is the only one that animates, and the
+-- sweep runs for exactly as long as that signal is showing.
+function Panel.SetSignal(name: string)
+	Style.SetSignal(name)
+
+	local animate = name == "Work"
+	gradient.Enabled = animate
+
+	if not animate then
+		if sweep then
+			sweep:Disconnect()
+			sweep = nil
+		end
+	elseif not sweep then
+		sweep = RunService.Heartbeat:Connect(function()
+			gradient.Offset = Vector2.new((os.clock() * 0.9) % 2 - 1, 0)
+		end)
+	end
+end
+
+function Panel.SetTokenOpen(open: boolean)
+	if tokenOpen == open then
+		return
+	end
+	tokenOpen = open
+
+	TweenService:Create(tokenGroup, EASE, {
+		Size = UDim2.new(1, 0, 0, if open then FIELD_H else 0),
+	}):Play()
+	toggleWord.Text = if open then "Hide" else "Show"
+
+	if not open and Panel.TokenInput:IsFocused() then
+		Panel.TokenInput:ReleaseFocus()
+	end
+end
+
+function Panel.SetStatusWord(text: string)
+	Panel.StatusWord.Text = text
+end
+
+function Panel.SetStatusLine(text: string)
+	Panel.StatusLine.Text = text
+end
+
+function Panel.SetConnectEnabled(enabled: boolean)
+	Panel.ConnectButton.Interactable = enabled
+end
+
+function Panel.SetDisconnectEnabled(enabled: boolean)
+	Panel.DisconnectButton.Interactable = enabled
+end
+
+---------------------------------------------------------------------- tree
+
+function Panel.Mount(parent: Instance): Frame
+	local root = new("Frame", {
+		Name = "VmcpRoot",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+	}, parent)
+	new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Vertical,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}, root)
+
+	-- header: wordmark left, lamp and one-word status right
+	local header = new("Frame", {
+		Name = "Header",
+		Size = UDim2.new(1, 0, 0, 48),
+		BackgroundTransparency = 1,
+	}, root)
+	pad(header, PAD, 0)
+
+	new("TextLabel", {
+		Name = "Wordmark",
+		Text = "VMCP",
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 0, 0.5, 0),
+		AutomaticSize = Enum.AutomaticSize.XY,
+	}, header)
+
+	local statusGroup = box("StatusGroup", header, Enum.FillDirection.Horizontal, 6)
+	statusGroup.AnchorPoint = Vector2.new(1, 0.5)
+	statusGroup.Position = UDim2.new(1, 0, 0.5, 0)
+	statusGroup.Size = UDim2.fromOffset(0, 16)
+	statusGroup.AutomaticSize = Enum.AutomaticSize.X
+
+	new("Frame", { Name = "Lamp", Size = UDim2.fromOffset(8, 8) }, statusGroup)
+	Panel.StatusWord = label("StatusWord", "not connected", statusGroup)
+
+	-- the hero: a full-bleed hairline carrying the signal colour
+	local signalRule = new("Frame", { Name = "SignalRule", Size = UDim2.new(1, 0, 0, 1) }, root)
+	gradient = new("UIGradient", {
+		Enabled = false,
+		Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.7),
+			NumberSequenceKeypoint.new(0.42, 0.7),
+			NumberSequenceKeypoint.new(0.5, 0),
+			NumberSequenceKeypoint.new(0.58, 0.7),
+			NumberSequenceKeypoint.new(1, 0.7),
+		}),
+	}, signalRule)
+
+	local body = box("Body", root, Enum.FillDirection.Vertical, PAD)
+	pad(body, PAD, PAD)
+
+	-- port field: spells out the whole address, so the number is never a bare mystery integer
+	local portGroup = box("PortGroup", body, Enum.FillDirection.Vertical, 6)
+	label("PortLabel", "Bridge port", portGroup).Size = UDim2.new(1, 0, 0, 12)
+
+	local portField = field("PortField", portGroup)
+	new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}, portField)
+
+	new("TextLabel", {
+		Name = "PortPrefix",
+		Text = ADDRESS_PREFIX,
+		AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2.new(0, 0, 1, 0),
+	}, portField)
+
+	Panel.PortInput = new("TextBox", {
+		Name = "PortInput",
+		Text = "",
+		PlaceholderText = "8791",
+		Size = UDim2.new(0, 0, 1, 0),
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, portField)
+	new("UIFlexItem", { FlexMode = Enum.UIFlexMode.Fill }, Panel.PortInput)
+
+	-- buttons. The StyleQuery stacks them below NARROW_WIDTH; there is no second code path.
+	local buttonRow = box("ButtonRow", body, Enum.FillDirection.Horizontal, 8)
+	new("StyleQuery", { Name = "Narrow" }, buttonRow):SetConditions({
+		MinSize = Vector2.zero,
+		MaxSize = Vector2.new(NARROW_WIDTH, math.huge),
+	})
+
+	Panel.ConnectButton = button("Connect", "Connect", "Fill", buttonRow)
+	new("UIFlexItem", { FlexMode = Enum.UIFlexMode.Fill }, Panel.ConnectButton)
+	Panel.DisconnectButton = button("Disconnect", "Disconnect", "Ghost", buttonRow)
+	Panel.DisconnectButton.Interactable = false
+
+	-- footer
+	local footer = box("Footer", body, Enum.FillDirection.Vertical, 8)
+
+	Panel.StatusLine = label("StatusLine", "Not connected", footer)
+	Panel.StatusLine.Size = UDim2.new(1, 0, 0, 12)
+	Panel.StatusLine.AutomaticSize = Enum.AutomaticSize.None
+	Panel.StatusLine.TextTruncate = Enum.TextTruncate.AtEnd
+
+	local disclosure = new("TextButton", { Name = "Disclosure", Text = "", Size = UDim2.new(1, 0, 0, 14) }, footer)
+	new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+		Padding = UDim.new(0, 6),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}, disclosure)
+	label("DisclosureLabel", "Auth token", disclosure)
+	-- A word, not a caret glyph: it says what clicking does and needs no icon system.
+	toggleWord = label("ToggleWord", "Show", disclosure)
+
+	tokenGroup = new("Frame", {
+		Name = "TokenGroup",
+		Size = UDim2.new(1, 0, 0, 0),
+		ClipsDescendants = true,
+		BackgroundTransparency = 1,
+	}, footer)
+
+	Panel.TokenInput = new("TextBox", {
+		Name = "TokenInput",
+		Text = "",
+		PlaceholderText = "paste the auth token",
+		Size = UDim2.new(1, 0, 1, 0),
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	}, field("TokenField", tokenGroup))
+
+	Style.Attach(root)
+	disclosure.Activated:Connect(function()
+		Panel.SetTokenOpen(not tokenOpen)
+	end)
+
+	Panel.ConnectButton.Activated:Connect(function()
+		Panel._connectRequestedBindable:Fire()
+	end)
+	Panel.DisconnectButton.Activated:Connect(function()
+		Panel._disconnectRequestedBindable:Fire()
+	end)
+	Panel.PortInput.FocusLost:Connect(function()
+		Panel._portChangedBindable:Fire(Panel.PortInput.Text)
+	end)
+	Panel.TokenInput.FocusLost:Connect(function()
+		Panel._tokenChangedBindable:Fire(Panel.TokenInput.Text)
+	end)
+
+	table.clear(orders)
+	Panel.SetSignal("Idle")
+	Panel.Root = root
+	return root
+end
+
+function Panel.Destroy()
+	Panel.SetSignal("Idle")
+	Style.Destroy()
+	if Panel.Root then
+		Panel.Root:Destroy()
+	end
+	Panel._connectRequestedBindable:Destroy()
+	Panel._disconnectRequestedBindable:Destroy()
+	Panel._portChangedBindable:Destroy()
+	Panel._tokenChangedBindable:Destroy()
+end
+
+return Panel
+]]></string>
+      </Properties>
+      <Item class="ModuleScript" referent="22">
+        <Properties>
+          <string name="Name">Style</string>
+          <string name="Source"><![CDATA[--!strict
+--!optimize 2
+
+-- The panel's whole visual system. Two token sheets (one per Studio theme) hold the values;
+-- one rule sheet holds the rules and derives from whichever theme is live. Connection state is
+-- a single attribute write -- every rule referencing $Signal re-resolves and eases there itself.
+
+local FONT_UI = "rbxasset://fonts/families/BuilderSans.json"
+local FONT_MONO = "rbxasset://fonts/families/RobotoMono.json"
+
+-- Theme-independent tokens, copied onto both theme sheets so no derive chain is needed.
+local SHARED: { [string]: any } = {
+	Rad = UDim.new(0, 6),
+	RadBtn = UDim.new(0, 5),
+	FontUI = Font.new(FONT_UI, Enum.FontWeight.Medium),
+	FontStrong = Font.new(FONT_UI, Enum.FontWeight.SemiBold),
+	FontMono = Font.new(FONT_MONO, Enum.FontWeight.Medium),
+	SizeWordmark = 12,
+	SizeBody = 13,
+	SizeMono = 14,
+	SizeMicro = 11,
+}
+
+local DARK = {
+	Ground = Color3.fromHex("0F1113"),
+	Raised = Color3.fromHex("181B1E"),
+	HairlineStrong = Color3.fromHex("343A40"),
+	Ink = Color3.fromHex("E6E9EC"),
+	InkDim = Color3.fromHex("8B949C"),
+	InkFaint = Color3.fromHex("7A848C"),
+	SignalIdle = Color3.fromHex("5C666E"),
+	SignalWork = Color3.fromHex("E0A44A"),
+	SignalLive = Color3.fromHex("3ECF8E"),
+	SignalFault = Color3.fromHex("FF6B5E"),
+}
+
+local LIGHT = {
+	Ground = Color3.fromHex("F4F5F6"),
+	Raised = Color3.fromHex("FFFFFF"),
+	HairlineStrong = Color3.fromHex("CBD1D5"),
+	Ink = Color3.fromHex("14171A"),
+	InkDim = Color3.fromHex("5C666E"),
+	InkFaint = Color3.fromHex("7A848C"),
+	SignalIdle = Color3.fromHex("9AA3AA"),
+	SignalWork = Color3.fromHex("B77A16"),
+	SignalLive = Color3.fromHex("1F9E68"),
+	SignalFault = Color3.fromHex("D4362A"),
+}
+
+local EASE = TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local EASE_FAST = TweenInfo.new(0.12, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+
+-- Rules are layered: structure loses to role, role loses to interaction state, and a
+-- non-interactable control wins over everything.
+local BASE, ROLE, STATE, OFF = 0, 10, 20, 30
+
+local Style = {}
+
+local sheets: { style: StyleSheet, dark: StyleSheet, light: StyleSheet }? = nil
+local signalName = "Idle"
+local dark = true
+
+local function tokenSheet(name: string, palette: { [string]: any }, container: Instance): StyleSheet
+	local sheet = Instance.new("StyleSheet")
+	sheet.Name = name
+	for key, value in palette do
+		sheet:SetAttribute(key, value)
+	end
+	for key, value in SHARED do
+		sheet:SetAttribute(key, value)
+	end
+	sheet.Parent = container
+	return sheet
+end
+
+-- The sheets live inside the tree they style, so the panel carries its own styling wherever it
+-- is mounted and a single Destroy on the root takes the whole thing with it.
+local function build(container: Instance)
+	local darkSheet = tokenSheet("VmcpDarkTokens", DARK, container)
+	local lightSheet = tokenSheet("VmcpLightTokens", LIGHT, container)
+
+	local style = Instance.new("StyleSheet")
+	style.Name = "VmcpStyle"
+	style.Parent = container
+	style:SetDerives({ darkSheet })
+
+	local function rule(selector: string, priority: number, props: { [string]: any }): StyleRule
+		local r = Instance.new("StyleRule")
+		r.Selector = selector
+		r.Priority = priority
+		r:SetProperties(props)
+		r.Parent = style
+		return r
+	end
+
+	rule("#VmcpRoot", BASE, { BackgroundColor3 = "$Ground", BorderSizePixel = 0 })
+
+	-- The signal: a full-bleed hairline and a lamp, both carrying the one colour that means state.
+	local signalRule = rule("#SignalRule", BASE, { BackgroundColor3 = "$Signal", BorderSizePixel = 0 })
+	local lampRule = rule("#Lamp", BASE, { BackgroundColor3 = "$Signal", BorderSizePixel = 0 })
+	rule("#Lamp::UICorner", BASE, { CornerRadius = UDim.new(1, 0) })
+	signalRule:SetPropertyTransition("BackgroundColor3", EASE)
+	lampRule:SetPropertyTransition("BackgroundColor3", EASE)
+
+	-- Type
+	rule("#Wordmark", BASE, {
+		FontFace = "$FontStrong",
+		TextSize = "$SizeWordmark",
+		TextColor3 = "$Ink",
+		BackgroundTransparency = 1,
+	})
+	rule("#StatusWord, #StatusLine, .FieldLabel", BASE, {
+		FontFace = "$FontUI",
+		TextSize = "$SizeMicro",
+		TextColor3 = "$InkDim",
+		BackgroundTransparency = 1,
+	})
+
+	-- Fields. Active = true so the frame reports :Hover for the stroke rule below.
+	rule(".Field", ROLE, { BackgroundColor3 = "$Raised", BorderSizePixel = 0 })
+	rule(".Field::UICorner", ROLE, { CornerRadius = "$Rad" })
+	-- Border mode, not the Contextual default: on a transparent background Contextual outlines the
+	-- glyphs instead of the edge.
+	local fieldStroke = rule(".Field::UIStroke", ROLE, {
+		Color = "$HairlineStrong",
+		Thickness = 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	})
+	rule(".Field:Hover::UIStroke", STATE, { Color = "$InkFaint" })
+	fieldStroke:SetPropertyTransition("Color", EASE_FAST)
+
+	rule("#PortPrefix", BASE, {
+		FontFace = "$FontMono",
+		TextSize = "$SizeMono",
+		TextColor3 = "$InkFaint",
+		BackgroundTransparency = 1,
+	})
+	rule("TextBox", BASE, {
+		FontFace = "$FontMono",
+		TextSize = "$SizeMono",
+		TextColor3 = "$Ink",
+		PlaceholderColor3 = "$InkFaint",
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ClearTextOnFocus = false,
+	})
+
+	-- Buttons. Connect is an inverted neutral fill, not a blue -- the only saturated colour on
+	-- the panel is the signal, so nothing else competes with it.
+	-- Size lives here rather than on the instances: a property set directly on an instance beats
+	-- every rule, which would make the @Narrow override below a no-op.
+	rule(".Btn", BASE, {
+		FontFace = "$FontUI",
+		TextSize = "$SizeBody",
+		Size = UDim2.new(0, 104, 0, 34),
+		BorderSizePixel = 0,
+		AutoButtonColor = false,
+	})
+	rule(".Btn::UICorner", BASE, { CornerRadius = "$RadBtn" })
+
+	local fill = rule(".Fill", ROLE, {
+		BackgroundColor3 = "$Ink",
+		TextColor3 = "$Ground",
+		BackgroundTransparency = 0,
+	})
+	rule(".Fill:Hover", STATE, { BackgroundTransparency = 0.08 })
+	rule(".Fill:Press", STATE, { BackgroundTransparency = 0.2 })
+	-- Only the return eases; press-in stays instant so the control feels connected to the click.
+	fill:SetPropertyTransition("BackgroundTransparency", EASE_FAST)
+
+	local ghost = rule(".Ghost", ROLE, {
+		BackgroundColor3 = "$Raised",
+		BackgroundTransparency = 1,
+		TextColor3 = "$Ink",
+	})
+	local ghostStroke = rule(".Ghost::UIStroke", ROLE, {
+		Color = "$HairlineStrong",
+		Thickness = 1,
+		Transparency = 0,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	})
+	rule(".Ghost:Hover", STATE, { BackgroundTransparency = 0 })
+	rule(".Ghost:Press", STATE, { TextColor3 = "$SignalFault" })
+	rule(".Ghost:Press::UIStroke", STATE, { Color = "$SignalFault" })
+	ghost:SetPropertyTransition("BackgroundTransparency", EASE_FAST)
+	ghost:SetPropertyTransition("TextColor3", EASE_FAST)
+	ghostStroke:SetPropertyTransition("Color", EASE_FAST)
+
+	-- GuiState has no Disabled, so an off control is Interactable = false and styled here. It goes
+	-- fully transparent rather than to a filled slab, so the one live control keeps the weight.
+	rule(".Btn:NonInteractable", OFF, {
+		BackgroundTransparency = 1,
+		TextColor3 = "$InkFaint",
+	})
+	rule(".Btn:NonInteractable::UIStroke", OFF, { Transparency = 1 })
+
+	rule("#Disclosure", BASE, {
+		FontFace = "$FontUI",
+		TextSize = "$SizeMicro",
+		TextColor3 = "$InkDim",
+		BackgroundTransparency = 1,
+		AutoButtonColor = false,
+		BorderSizePixel = 0,
+	})
+	local disclosureHover = rule("#Disclosure:Hover", STATE, { TextColor3 = "$Ink" })
+	disclosureHover:SetPropertyTransition("TextColor3", EASE_FAST)
+
+	-- The narrow layout is a media query, not a second code path: the button row's UIListLayout
+	-- is phantom, so the @Narrow rule simply overrides it.
+	rule("#ButtonRow::UIListLayout", BASE, {
+		FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 8),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+	})
+	rule("@Narrow::UIListLayout", ROLE, { FillDirection = Enum.FillDirection.Vertical })
+	rule("@Narrow >> .Btn", ROLE, { Size = UDim2.new(1, 0, 0, 34) })
+
+	sheets = { style = style, dark = darkSheet, light = lightSheet }
+end
+
+local function applySignal()
+	local live = sheets
+	if not live then
+		return
+	end
+	live.dark:SetAttribute("Signal", DARK["Signal" .. signalName])
+	live.light:SetAttribute("Signal", LIGHT["Signal" .. signalName])
+end
+
+-- Creates the sheets on first call, then links them to `root` and everything beneath it.
+function Style.Attach(root: Instance)
+	if not sheets then
+		build(root)
+	end
+	local live = sheets :: any
+
+	local link = Instance.new("StyleLink")
+	link.Name = "VmcpStyleLink"
+	link.StyleSheet = live.style
+	link.Parent = root
+
+	applySignal()
+end
+
+-- `name` is one of Idle, Work, Live, Fault.
+function Style.SetSignal(name: string)
+	if signalName == name then
+		return
+	end
+	signalName = name
+	applySignal()
+end
+
+function Style.SetTheme(isDark: boolean)
+	local live = sheets
+	if not live then
+		dark = isDark
+		return
+	end
+	if dark == isDark then
+		return
+	end
+	dark = isDark
+
+	live.style:SetDerives({ if isDark then live.dark else live.light })
+end
+
+function Style.Destroy()
+	local live = sheets
+	if not live then
+		return
+	end
+	live.style:Destroy()
+	live.dark:Destroy()
+	live.light:Destroy()
+	sheets = nil
+end
+
+return Style
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="ModuleScript" referent="23">
+      <Properties>
+        <string name="Name">Path</string>
+        <string name="Source"><![CDATA[--!strict
+--!optimize 2
+
+-- Turns a dotted DataModel path like "Workspace.Rig.Torso" into the Instance it names, and says
+-- which segment went missing when it can't. Every tool that takes a `root` argument goes through
+-- this, so they all fail the same readable way.
+
+local Path = {}
+
+function Path.Resolve(path: string): (Instance?, string?)
+	local current: Instance = game
+	for segment in string.gmatch(path, "[^%.]+") do
+		if current == game then
+			if segment == "game" then
+				continue
+			end
+			-- A service that has never been touched isn't a child of game yet, so FindFirstChild
+			-- alone would miss half the DataModel.
+			local ok, service = pcall(game.GetService, game, segment)
+			if ok and service then
+				current = service
+				continue
+			end
+		end
+
+		local child = current:FindFirstChild(segment)
+		if not child then
+			return nil, `no instance at "{path}" -- "{segment}" isn't under {current:GetFullName()}`
+		end
+		current = child
+	end
+	return current, nil
+end
+
+return Path
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="Folder" referent="24">
+      <Properties>
+        <string name="Name">Playtest</string>
+      </Properties>
+      <Item class="ModuleScript" referent="25">
+        <Properties>
+          <string name="Name">Session</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Starting and stopping the one playtest a Studio window is allowed to have.
+--
+-- There is very little to it now. Nothing is injected into the place and nothing is saved, because
+-- the plugin loads into the playtest's DataModels by itself -- so all this does is press the
+-- button and remember whether it was the one that pressed it.
+
+local Session = {}
+
+local state = {
+	ours = false,
+	players = 0,
+	startedAt = 0,
+}
+
+local function service(): any
+	return game:GetService("StudioTestService")
+end
+
+function Session.IsRunning(): boolean
+	return not service().EditModeActive
+end
+
+-- One player gets Play Solo: a single DataModel that is both server and client, and far quicker to
+-- start than the real thing. Two or more needs a genuine multiplayer test.
+function Session.Start(players: number): string?
+	if Session.IsRunning() then
+		return "a playtest is already running -- stop that one first"
+	end
+
+	state.ours = true
+	state.players = players
+	state.startedAt = os.clock()
+
+	-- Both calls yield until the test ends, and the plugin has to stay answerable the whole time a
+	-- session is open, so the waiting happens on its own thread.
+	task.spawn(function()
+		local studio = service()
+		local ok, failure
+		if players <= 1 then
+			ok, failure = pcall(studio.ExecutePlayModeAsync, studio, {})
+		else
+			ok, failure = pcall(studio.ExecuteMultiplayerTestAsync, studio, players, {})
+		end
+		if not ok then
+			warn(`[VMCP] the playtest would not start: {failure}`)
+		end
+		state.ours = false
+	end)
+	return nil
+end
+
+function Session.Status(): { [string]: any }
+	local running = Session.IsRunning()
+	return {
+		running = running,
+		-- Studio's own Play button counts as a playtest; it just is not one we started, so we
+		-- should not stop it out from under anyone either.
+		ours = running and state.ours,
+		players = if running then state.players else nil,
+		seconds = if running then math.floor(os.clock() - state.startedAt) else nil,
+	}
+end
+
+function Session.Forget()
+	state.ours = false
+end
+
+return Session
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="Folder" referent="26">
+      <Properties>
+        <string name="Name">Timeline</string>
+      </Properties>
+      <Item class="ModuleScript" referent="27">
+        <Properties>
+          <string name="Name">Runtime</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- The two halves of running a timeline inside one DataModel: the shared context, and the clock.
+--
+-- The context isn't held here. The edit DataModel, the test server and each test client are
+-- separate processes running separate copies of this plugin, so the socket back to VMCP is the
+-- only thing all of them can touch -- every read and write is a round trip. That's slower than a
+-- table and it's the only version that's actually correct, so treat `ctx.thing` as a network read
+-- and pull it into a local if you need it more than once.
+
+local UserInputService = game:GetService("UserInputService")
+
+local Bridge = require(script.Parent.Parent.Bridge)
+
+local Runtime = {}
+
+export type Event = {
+	at: number,
+	blocking: boolean?,
+	label: string?,
+	run: (ctx: any, input: any, vmcp: any) -> ...any,
+}
+
+local DEFAULT_AWAIT = 5
+-- Await polls instead of waiting on a signal, because what it's waiting for may be set in another
+-- process entirely. Every tick is a round trip, so this is deliberately slower than a frame.
+local AWAIT_POLL = 0.05
+
+local Methods = {}
+
+local function origin(self: any): string
+	return rawget(self, "__origin") :: string
+end
+
+-- Blocks until another context sets `key`. This is what turns a racy read into something the
+-- payload declares rather than a coin flip, and a miss is recorded -- so an assertion that fails
+-- because the value never arrived says so, instead of quietly reading nil.
+function Methods.Await(self: any, key: string, timeout: number?): any
+	local limit = timeout or DEFAULT_AWAIT
+	local deadline = os.clock() + limit
+
+	repeat
+		local value = Bridge.CtxGet(key)
+		if value ~= nil then
+			return value
+		end
+		task.wait(AWAIT_POLL)
+	until os.clock() >= deadline
+
+	Bridge.CtxNote(`[{origin(self)}] Await("{key}") gave up after {limit}s`)
+	return nil
+end
+
+function Methods.Note(self: any, text: string)
+	Bridge.CtxNote(`[{origin(self)}] {text}`)
+end
+
+function Methods.Snapshot(_: any): { [string]: any }
+	local snapshot = Bridge.CtxSnapshot()
+	return if snapshot then snapshot.values else {}
+end
+
+local Proxy = {
+	__index = function(self: any, key: string): any
+		local method = Methods[key]
+		if method then
+			return method
+		end
+		return Bridge.CtxGet(key)
+	end,
+	__newindex = function(self: any, key: string, value: any)
+		Bridge.CtxSet(key, value, origin(self))
+	end,
+}
+
+-- `where` names this context in the write log: "plugin", "server", "client 2".
+function Runtime.Context(where: string): any
+	return setmetatable({ __origin = where }, Proxy)
+end
+
+-- How late an event may fire before it's worth mentioning. A frame of slop is normal; a tenth of
+-- a second means something before it ran long.
+local OVERRUN = 0.1
+
+-- Fires each event when its time comes, then holds until `duration` so trailing effects land. A
+-- yielding event never delays the next one unless it asked to with `blocking`, which is what a
+-- setup step wants. Running late is recorded rather than silently shifting everything after it.
+function Runtime.Run(events: { Event }, ctx: any, input: any, vmcp: any, duration: number, note: (string) -> ())
+	table.sort(events, function(a, b)
+		return a.at < b.at
+	end)
+
+	local started = os.clock()
+	local function fire(event: Event)
+		local ok, err = pcall(event.run, ctx, input, vmcp)
+		if not ok then
+			local label = if event.label then ` ({event.label})` else ""
+			note(`event at {event.at}s{label} failed: {err}`)
+		end
+	end
+
+	for _, event in events do
+		local elapsed = os.clock() - started
+		if event.at > elapsed then
+			task.wait(event.at - elapsed)
+		elseif elapsed - event.at > OVERRUN then
+			note(`event at {event.at}s fired {string.format("%.2f", elapsed - event.at)}s late`)
+		end
+
+		if event.blocking then
+			fire(event)
+		else
+			task.spawn(fire, event)
+		end
+	end
+
+	local remaining = duration - (os.clock() - started)
+	if remaining > 0 then
+		task.wait(remaining)
+	end
+end
+
+local BUTTONS: { [string]: Enum.UserInputType } = {
+	left = Enum.UserInputType.MouseButton1,
+	right = Enum.UserInputType.MouseButton2,
+	middle = Enum.UserInputType.MouseButton3,
+}
+
+local TAP_SECONDS = 0.05
+
+-- Every one of these throws on contact with the topbar, a core-bound key like Escape, a button
+-- that's already down, or a mouse delta without a locked cursor. A failed keypress should cost
+-- one line in the log, not the whole run, so each call is wrapped and the reason kept.
+function Runtime.Input(): any
+	local virtual = (UserInputService :: any):CreateVirtualInput()
+	local held: { [string]: Enum.KeyCode? } = {}
+	local down: { [string]: Enum.UserInputType? } = {}
+	local input = { problems = {} :: { string } }
+
+	local function attempt(what: string, action: () -> ...any): boolean
+		local ok, err = pcall(action)
+		if not ok then
+			table.insert(input.problems, `{what}: {err}`)
+		end
+		return ok
+	end
+
+	local function keyCode(name: string): Enum.KeyCode?
+		local code = (Enum.KeyCode :: any)[name]
+		if not code then
+			table.insert(input.problems, `no KeyCode named "{name}"`)
+		end
+		return code
+	end
+
+	function input.Hold(_: any, name: string)
+		local code = keyCode(name)
+		if not code or held[name] then
+			return
+		end
+		local pressed = attempt(`Hold "{name}"`, function()
+			virtual:SendKey(true, code)
+		end)
+		if pressed then
+			held[name] = code
+		end
+	end
+
+	function input.Release(_: any, name: string)
+		local code = held[name]
+		if not code then
+			return
+		end
+		held[name] = nil
+		attempt(`Release "{name}"`, function()
+			virtual:SendKey(false, code)
+		end)
+	end
+
+	function input.Tap(self: any, name: string, hold: number?)
+		input.Hold(self, name)
+		task.wait(hold or TAP_SECONDS)
+		input.Release(self, name)
+	end
+
+	function input.Move(_: any, x: number, y: number)
+		attempt(`Move to {x},{y}`, function()
+			virtual:SendMousePosition(Vector2.new(x, y))
+		end)
+	end
+
+	function input.Click(self: any, x: number, y: number, button: string?)
+		local name = button or "left"
+		local which = BUTTONS[name]
+		if not which then
+			table.insert(input.problems, `no mouse button named "{name}"`)
+			return
+		end
+
+		local at = Vector2.new(x, y)
+		input.Move(self, x, y)
+		local pressed = attempt(`Click {name} at {x},{y}`, function()
+			virtual:SendMouseButton(at, which, true)
+		end)
+		if not pressed then
+			return
+		end
+
+		down[name] = which
+		task.wait(TAP_SECONDS)
+		down[name] = nil
+		attempt(`Release {name} button`, function()
+			virtual:SendMouseButton(at, which, false)
+		end)
+	end
+
+	function input.Drag(self: any, x1: number, y1: number, x2: number, y2: number, steps: number?)
+		local count = math.max(steps or 10, 1)
+		local from, to = Vector2.new(x1, y1), Vector2.new(x2, y2)
+
+		input.Move(self, x1, y1)
+		local pressed = attempt("Drag press", function()
+			virtual:SendMouseButton(from, Enum.UserInputType.MouseButton1, true)
+		end)
+		if not pressed then
+			return
+		end
+		down.left = Enum.UserInputType.MouseButton1
+
+		for step = 1, count do
+			local point = from:Lerp(to, step / count)
+			attempt("Drag move", function()
+				virtual:SendMousePosition(point)
+			end)
+			task.wait()
+		end
+
+		down.left = nil
+		attempt("Drag release", function()
+			virtual:SendMouseButton(to, Enum.UserInputType.MouseButton1, false)
+		end)
+	end
+
+	function input.Type(_: any, text: string)
+		attempt(`Type {#text} chars`, function()
+			virtual:SendTextInput(text)
+		end)
+	end
+
+	function input.Scroll(_: any, x: number, y: number, amount: number)
+		attempt(`Scroll {amount}`, function()
+			virtual:SendPointerAction(Vector2.new(x, y), { Wheel = amount })
+		end)
+	end
+
+	-- Runs at teardown however the run ended, because a Hold whose Release never came -- an event
+	-- that errored between the two, say -- leaves that key down for everything after it.
+	function input.ReleaseEverything(_: any)
+		for name, code in held do
+			held[name] = nil
+			attempt(`Release "{name}"`, function()
+				virtual:SendKey(false, code)
+			end)
+		end
+		for name, which in down do
+			down[name] = nil
+			attempt(`Release {name} button`, function()
+				virtual:SendMouseButton(Vector2.zero, which, false)
+			end)
+		end
+	end
+
+	return input
+end
+
+return Runtime
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="Folder" referent="28">
+      <Properties>
+        <string name="Name">Tools</string>
+      </Properties>
+      <Item class="ModuleScript" referent="29">
+        <Properties>
+          <string name="Name">GetBuild</string>
+          <string name="Source"><![CDATA[--!strict
+
+local Build = require(script.Parent.Parent.Lib.Build)
+local Path = require(script.Parent.Parent.Path)
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "get_build",
+	description = "Returns a region of the place as Luau that rebuilds it -- one line per property "
+		.. "that differs from the class default, plus attributes and tags. Use it instead of "
+		.. "get_tree when you intend to change something: a tree dump tells you what's there, this "
+		.. "gives you something you can edit and run back. The generated code updates what's "
+		.. "already there rather than duplicating it, so applying an edited version only moves "
+		.. "what actually changed. Run it back with run_luau.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			root = {
+				type = "string",
+				description = 'Dotted path to the region, like "Workspace.Arena". Defaults to Workspace.',
+			},
+			depth = {
+				type = "integer",
+				description = "How many levels below the root to include. Defaults to 12.",
+				minimum = 1,
+				maximum = 12,
+			},
+			maxNodes = {
+				type = "integer",
+				description = "Stop after this many instances. Defaults to 800.",
+				minimum = 1,
+				maximum = 800,
+			},
+			tags = {
+				type = "boolean",
+				description = "Include attributes and CollectionService tags. On by default.",
+			},
+		},
+	},
+	tags = { title = "Get Build", readOnly = true, idempotent = true },
+}
+
+function Tool.Run(arguments: { root: string?, depth: number?, maxNodes: number?, tags: boolean? }): Result
+	local root: Instance = workspace
+	if type(arguments.root) == "string" and arguments.root ~= "" then
+		local found, problem = Path.Resolve(arguments.root :: string)
+		if not found then
+			return { content = { { type = "text", text = problem :: string } }, isError = true }
+		end
+		root = found
+	end
+
+	local source, count = Build.Dump(root, {
+		depth = arguments.depth,
+		maxNodes = arguments.maxNodes,
+		tags = arguments.tags,
+	})
+	if count == 0 then
+		return { content = { { type = "text", text = `{root:GetFullName()} has nothing in it` } } }
+	end
+
+	return {
+		content = {
+			{ type = "text", text = `{count} instance(s) under {root:GetFullName()}:\n\n{source}` },
+		},
+	}
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="30">
+        <Properties>
+          <string name="Name">GetLogs</string>
+          <string name="Source"><![CDATA[--!strict
+
+local Buffer = require(script.Parent.Parent.Log.Buffer)
+
+local DEFAULT_COUNT = 50
+local MAX_COUNT = 300
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "get_logs",
+	description = "Reads Studio's output window from a buffer the plugin has been filling since "
+		.. "it loaded. This is how you see an error thrown by the place's own scripts -- run_luau "
+		.. "only ever shows you output from its own snippet.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			count = {
+				type = "integer",
+				description = "How many of the most recent lines to return. Defaults to 50.",
+				minimum = 1,
+				maximum = MAX_COUNT,
+			},
+			severity = {
+				type = "string",
+				description = "Only lines at this level. Defaults to everything.",
+				enum = { "print", "info", "warn", "error" },
+			},
+			sinceSeconds = {
+				type = "number",
+				description = "Only lines logged in the last this many seconds.",
+				minimum = 1,
+			},
+			match = {
+				type = "string",
+				description = "Only lines matching this Luau string pattern (not a regex).",
+			},
+		},
+	},
+	tags = { title = "Get Logs", readOnly = true },
+}
+
+function Tool.Run(arguments: { count: number?, severity: string?, sinceSeconds: number?, match: string? }): Result
+	local all, dropped = Buffer.Since(0)
+	local severity = arguments.severity
+	local match = arguments.match
+	local cutoff = if arguments.sinceSeconds then os.time() - arguments.sinceSeconds else nil
+
+	local kept = {}
+	for _, entry in all do
+		if severity and entry.severity ~= severity then
+			continue
+		end
+		if cutoff and entry.time < cutoff then
+			continue
+		end
+		if match then
+			-- A bad pattern raises rather than returning nothing, and "malformed pattern" is a
+			-- much more useful answer than an empty log.
+			local ok, found = pcall(string.find, entry.text, match)
+			if not ok then
+				return {
+					content = { { type = "text", text = `match isn't a valid pattern: {found}` } },
+					isError = true,
+				}
+			end
+			if not found then
+				continue
+			end
+		end
+		table.insert(kept, entry)
+	end
+
+	if #kept == 0 then
+		return { content = { { type = "text", text = "no log lines matched" } } }
+	end
+
+	local count = math.clamp(arguments.count or DEFAULT_COUNT, 1, MAX_COUNT)
+	local first = math.max(#kept - count + 1, 1)
+	local lines = {}
+	for index = first, #kept do
+		local entry = kept[index]
+		table.insert(lines, `{os.date("%H:%M:%S", entry.time)} [{entry.severity}] {entry.text}`)
+	end
+
+	if first > 1 or dropped > 0 then
+		table.insert(lines, 1, `-- showing the last {#lines} of {#kept + dropped} lines`)
+	end
+
+	return { content = { { type = "text", text = table.concat(lines, "\n") } } }
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="31">
+        <Properties>
+          <string name="Name">GetTree</string>
+          <string name="Source"><![CDATA[--!strict
+
+local Path = require(script.Parent.Parent.Path)
+
+local DEFAULT_DEPTH = 3
+local DEFAULT_MAX_NODES = 300
+local HARD_MAX_NODES = 2000
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "get_tree",
+	description = "Lists what's under an instance, as an indented tree of name and class. Takes "
+		.. "a root so you can look at one model instead of the whole place; the default depth is "
+		.. "shallow on purpose. Use the className filter to answer 'where are the Motor6Ds' "
+		.. "without reading everything in between.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			root = {
+				type = "string",
+				description = 'Dotted path to start from, like "Workspace.Rig". Defaults to game.',
+			},
+			depth = {
+				type = "integer",
+				description = "How many levels below the root to show. Defaults to 3.",
+				minimum = 1,
+				maximum = 20,
+			},
+			className = {
+				type = "string",
+				description = "Only list instances that IsA this class. Their ancestors are still "
+					.. "shown so the paths make sense.",
+			},
+			maxNodes = {
+				type = "integer",
+				description = "Stop after this many instances. Defaults to 300.",
+				minimum = 1,
+				maximum = HARD_MAX_NODES,
+			},
+		},
+	},
+	tags = { title = "Get Tree", readOnly = true, idempotent = true },
+}
+
+type Walk = {
+	lines: { string },
+	className: string?,
+	maxNodes: number,
+	depth: number,
+	visited: number,
+	skipped: number,
+}
+
+-- Returns whether anything at or below `instance` matched, so a filtered walk can drop branches
+-- that contain nothing interesting instead of printing the whole skeleton.
+local function walk(state: Walk, instance: Instance, depth: number): boolean
+	if state.visited >= state.maxNodes then
+		state.skipped += 1
+		return false
+	end
+	state.visited += 1
+
+	local matched = state.className == nil or instance:IsA(state.className :: string)
+	local mark = #state.lines + 1
+	table.insert(state.lines, `{string.rep("  ", depth)}{instance.Name} ({instance.ClassName})`)
+
+	if depth < state.depth then
+		for _, child in instance:GetChildren() do
+			matched = walk(state, child, depth + 1) or matched
+		end
+	end
+
+	if not matched then
+		table.remove(state.lines, mark)
+	end
+	return matched
+end
+
+function Tool.Run(arguments: { root: string?, depth: number?, className: string?, maxNodes: number? }): Result
+	local rootPath = arguments.root
+	local root: Instance = game
+	if type(rootPath) == "string" and rootPath ~= "" then
+		local found, problem = Path.Resolve(rootPath)
+		if not found then
+			return { content = { { type = "text", text = problem :: string } }, isError = true }
+		end
+		root = found
+	end
+
+	local className = arguments.className
+	if className ~= nil and type(className) ~= "string" then
+		return { content = { { type = "text", text = "className must be a string" } }, isError = true }
+	end
+
+	local state: Walk = {
+		lines = {},
+		className = className,
+		maxNodes = math.clamp(arguments.maxNodes or DEFAULT_MAX_NODES, 1, HARD_MAX_NODES),
+		depth = math.clamp(arguments.depth or DEFAULT_DEPTH, 1, 20),
+		visited = 0,
+		skipped = 0,
+	}
+
+	walk(state, root, 0)
+
+	if #state.lines == 0 then
+		-- IsA returns false for a misspelled class rather than erroring, so an empty result and a
+		-- typo are the same thing from here. Saying both beats guessing which one it was.
+		local why = if className
+			then `nothing under {root:GetFullName()} is a {className} -- check the spelling if you expected hits`
+			else `{root:GetFullName()} is empty`
+		return { content = { { type = "text", text = why } } }
+	end
+
+	if state.skipped > 0 then
+		table.insert(state.lines, `-- stopped at {state.maxNodes} instances; raise maxNodes or narrow the root`)
+	end
+
+	return { content = { { type = "text", text = table.concat(state.lines, "\n") } } }
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="32">
+        <Properties>
+          <string name="Name">Peer</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Plumbing, not a tool anyone calls directly: it's tagged internal, so the server keeps it out of
+-- the list it advertises but still routes tool/invoke to it.
+--
+-- Everything here is something only a DataModel can answer about itself. "ping" is how the edit
+-- session finds out a playtest's DataModels have finished connecting, and "stop" is how a playtest
+-- ends -- EndTest only works from inside the test server, which the edit session isn't.
+
+local Bridge = require(script.Parent.Parent.Bridge)
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "peer",
+	description = "Internal. Reports on, or ends, the DataModel it runs in.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			action = { type = "string", enum = { "ping", "stop" } },
+			context = { type = "string", enum = { "plugin", "server", "client" } },
+			player = { type = "integer", minimum = 1 },
+		},
+		required = { "action" },
+	},
+	tags = { title = "Peer", internal = true },
+}
+
+function Tool.Run(arguments: { action: string? }): Result
+	if arguments.action == "stop" then
+		local ok, failure = pcall(function()
+			(game:GetService("StudioTestService") :: any):EndTest("stopped by VMCP")
+		end)
+		if not ok then
+			return { content = { { type = "text", text = `couldn't end the test: {failure}` } }, isError = true }
+		end
+		return { content = { { type = "text", text = "ended the playtest" } } }
+	end
+
+	local connection = Bridge.Connection()
+	local index = connection.peerIndex
+	local who = if index == nil then connection.role else `{connection.role} {index}`
+	return { content = { { type = "text", text = `{who} is up` } } }
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="33">
+        <Properties>
+          <string name="Name">Playtest</string>
+          <string name="Source"><![CDATA[--!strict
+
+local Bridge = require(script.Parent.Parent.Bridge)
+local Session = require(script.Parent.Parent.Playtest.Session)
+
+local MAX_PLAYERS = 8
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "playtest",
+	description = "Starts, stops or reports on a live playtest, and leaves it running between "
+		.. "calls. While one is open, run_luau with context server or client runs inside the real "
+		.. "game instead of paying to start one each time, and run_timeline uses it rather than "
+		.. "launching its own. One player gets Play Solo, which is much quicker to start; two or "
+		.. "more gets a real multiplayer test. One playtest per Studio window.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			action = {
+				type = "string",
+				description = "start opens a playtest, stop ends it, status says what's running.",
+				enum = { "start", "stop", "status" },
+			},
+			players = {
+				type = "integer",
+				description = "How many test clients to launch. Defaults to 1, max 8.",
+				minimum = 1,
+				maximum = MAX_PLAYERS,
+			},
+		},
+		required = { "action" },
+	},
+	tags = { title = "Playtest", destructive = true },
+	-- Launching a server plus clients is slow enough that the default would trip on a cold start.
+	timeoutMs = 120000,
+}
+
+local function text(body: string, isError: boolean?): Result
+	return { content = { { type = "text", text = body } }, isError = isError }
+end
+
+function Tool.Run(arguments: { action: string?, players: number? }): Result
+	local action = arguments.action
+
+	if action == "status" then
+		local status = Session.Status()
+		if not status.running then
+			return text("No playtest is running.")
+		end
+		local whose = if status.ours then "" else " (started outside VMCP)"
+		return text(`A playtest has been running for {status.seconds}s{whose}.`)
+	end
+
+	if action == "stop" then
+		if not Session.IsRunning() then
+			return text("No playtest is running.")
+		end
+		-- EndTest only works from inside the test server, and the edit session isn't it. The call
+		-- goes out to the VMCP server and back into the running game's own copy of the plugin.
+		local reached, result = Bridge.Invoke("peer", { action = "stop", context = "server" }, 20)
+		Session.Forget()
+		if not reached then
+			return text(`couldn't reach the test server to stop it: {tostring(result)}`, true)
+		end
+		return text("Asked the playtest to stop. Check status in a second or two.")
+	end
+
+	if action ~= "start" then
+		return text(`action must be start, stop or status -- got "{tostring(action)}"`, true)
+	end
+
+	local failure = Session.Start(math.clamp(arguments.players or 1, 1, MAX_PLAYERS))
+	if failure then
+		return text(failure, true)
+	end
+
+	return text(
+		"Playtest starting. Give it a few seconds, then run_luau with context server or client "
+			.. "runs inside it, sharing the require cache with the game's own scripts when you ask "
+			.. "for the game VM."
+	)
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="34">
+        <Properties>
+          <string name="Name">Print</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- An example tool. A tool module is two things: a `Definition` that goes into the `tools`
+-- list at handshake time, and a `Run` that takes the decoded arguments and returns the
+-- result for the tool/call reply. docs/protocol.md has the rest.
+--
+-- Definition fields:
+--   name          [A-Za-z0-9_-], 1-64 chars, unique in the place. What Claude calls.
+--   description   Claude reads this to pick the tool -- write it for a person.
+--   inputSchema   JSON Schema, passed to Claude untouched and never enforced by the
+--                 server, so Run checks its own arguments.
+--   outputSchema  optional; if you declare it, send structuredContent back too.
+--   tags          optional; what the tool does to the place.
+--   timeoutMs     optional; overrides the 30s default. A long job is better off sending
+--                 tool/progress -- every progress message restarts the timeout.
+--
+-- Schema rules that bite:
+--   `type = "object"` is required at the root of every schema.
+--   An array needs `items`: { type = "array", items = { type = "string" } }.
+--   A nested object needs its own `type` and `properties` -- never a bare {}, which
+--   Luau encodes as [].
+--   `required` is a list of names, not a string.
+--
+-- Tags, all optional:
+--   title        friendlier display name than the id
+--   readOnly     changes nothing
+--   destructive  can overwrite or destroy existing work
+--   idempotent   running it twice is the same as running it once
+--   external     reaches outside the place: HTTP, Creator Store, filesystem
+-- A misspelled tag is a hard error, not a silent no-op. `idempotent` also gets you retry
+-- safety: the server caches the result under a retryKey it adds itself, nothing to handle.
+--
+-- Run returns { content = {...} }, plus `isError = true` for a failure Claude should read
+-- and correct itself from -- bad arguments, nothing selected. A JSON-RPC error reads as
+-- the plugin falling over instead. Anything that isn't a content table gets wrapped in a
+-- text block, so `return "done"` is fine while prototyping.
+
+export type Result = {
+	content: { { type: "text", text: string } },
+	structuredContent: { [string]: any }?,
+	isError: boolean?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "print",
+	description = "Prints a message to the Studio output window.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			message = { type = "string", description = "The text to print." },
+			times = {
+				type = "integer",
+				description = "How many times to print it. Defaults to 1.",
+				minimum = 1,
+				maximum = 10,
+			},
+		},
+		required = { "message" },
+	},
+	outputSchema = {
+		type = "object",
+		properties = {
+			printed = { type = "integer", description = "How many lines were printed." },
+		},
+	},
+	tags = { title = "Print", readOnly = true, idempotent = true },
+}
+
+function Tool.Run(arguments: { message: string?, times: number? }): Result
+	local message = arguments.message
+	if type(message) ~= "string" or message == "" then
+		return {
+			content = { { type = "text", text = "message must be a non-empty string" } },
+			isError = true,
+		}
+	end
+
+	local times = arguments.times or 1
+	for _ = 1, times do
+		print(`[VMCP] {message}`)
+	end
+
+	-- The text block goes out even with structuredContent -- some clients ignore structured
+	-- output entirely.
+	return {
+		content = { { type = "text", text = `Printed {times}x: {message}` } },
+		structuredContent = { printed = times },
+	}
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="35">
+        <Properties>
+          <string name="Name">RunLuau</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- The broad one. Everything the narrow builders would have done is a snippet through here.
+--
+-- Where it runs is the server's business, not this file's: a call naming a live context is routed
+-- to the copy of the plugin loaded into that DataModel, and this same code runs there. So the only
+-- choice left here is which VM inside that DataModel -- the plugin's, or the game's own.
+
+local Buffer = require(script.Parent.Parent.Log.Buffer)
+local Env = require(script.Parent.Parent.Env)
+local GameVm = require(script.Parent.Parent.Exec.GameVm)
+local Inject = require(script.Parent.Parent.Exec.Inject)
+local Serialize = require(script.Parent.Parent.Exec.Serialize)
+
+local MAX_TIMEOUT = 60
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+	postProcess: { [string]: any }?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "run_luau",
+	description = "Runs Luau and returns what it returned plus anything it printed. `return` a "
+		.. "value to see it -- Instances, CFrames and nested tables all come back readable. "
+		.. "context picks the DataModel: plugin is Studio's edit session, server and client are a "
+		.. "live playtest (start one with the playtest tool first). vm picks which VM inside it: "
+		.. "plugin is the default and can reach everything, game shares the require cache with the "
+		.. "running game's own scripts, which is the only way to see the real state a module has "
+		.. "built up. `vmcp` holds the library, and vmcp.Tool calls any other VMCP tool.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			code = {
+				type = "string",
+				description = "Luau source. Runs as a function body, so `return` works and is how "
+					.. "you get a value back.",
+			},
+			context = {
+				type = "string",
+				description = "Which DataModel. Defaults to plugin.",
+				enum = { "plugin", "server", "client" },
+			},
+			player = {
+				type = "integer",
+				description = "Which test client, 1-based. Only meaningful with context client.",
+				minimum = 1,
+				maximum = 8,
+			},
+			vm = {
+				type = "string",
+				description = "plugin (default) or game. game shares the running scripts' require "
+					.. "cache, so require(SomeModule) hands back the live one rather than a fresh "
+					.. "copy. Needs a playtest, and the result is rendered to text on the game's "
+					.. "side, so only the text comes back.",
+				enum = { "plugin", "game" },
+			},
+			timeoutSeconds = {
+				type = "number",
+				description = "Give up after this long. Defaults to 10, max 60.",
+				minimum = 1,
+				maximum = MAX_TIMEOUT,
+			},
+		},
+		required = { "code" },
+	},
+	tags = { title = "Run Luau", destructive = true },
+	timeoutMs = 70000,
+}
+
+function Tool.Run(arguments: { code: string?, vm: string?, timeoutSeconds: number? }): Result
+	local code = arguments.code
+	if type(code) ~= "string" or code == "" then
+		return { content = { { type = "text", text = "code must be a non-empty string" } }, isError = true }
+	end
+
+	local timeout = math.clamp(arguments.timeoutSeconds or 10, 1, MAX_TIMEOUT)
+	local cursor = Buffer.written
+
+	local ok: boolean
+	local rendered: string
+	local directive: { [string]: any }? = nil
+
+	if arguments.vm == "game" then
+		ok, rendered = GameVm.Run(code)
+	else
+		local produced: any
+		ok, produced = Inject.Run(code, Env, timeout)
+		-- A snippet asks for work on the VMCP server -- writing a Canvas recording out as a PNG,
+		-- so far -- by returning a table with a postProcess field. It rides back untouched.
+		directive = if ok and type(produced) == "table" then produced.postProcess else nil
+
+		if directive then
+			rendered = `a {tostring(directive.kind)} job for the VMCP server to finish`
+		elseif ok then
+			rendered = Serialize.Render(produced)
+		else
+			rendered = tostring(produced)
+		end
+	end
+
+	-- MessageOut lands a frame after the print that caused it, so without this the snippet's last
+	-- line of output is always missing.
+	task.wait()
+	local logged = Buffer.Since(cursor)
+
+	local parts = { if ok then `returned: {rendered}` else `error: {rendered}` }
+	if #logged > 0 then
+		local lines = {}
+		for _, entry in logged do
+			table.insert(lines, `  [{entry.severity}] {entry.text}`)
+		end
+		-- Studio logs everything to one place, so a noisy game script can land in here too.
+		table.insert(parts, `output during the run:\n{table.concat(lines, "\n")}`)
+	end
+
+	return {
+		content = { { type = "text", text = table.concat(parts, "\n\n") } },
+		isError = not ok,
+		postProcess = directive,
+	}
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="36">
+        <Properties>
+          <string name="Name">RunTimeline</string>
+          <string name="Source"><![CDATA[--!strict
+
+local Bridge = require(script.Parent.Parent.Bridge)
+local Inject = require(script.Parent.Parent.Exec.Inject)
+local Runtime = require(script.Parent.Parent.Timeline.Runtime)
+local Session = require(script.Parent.Parent.Playtest.Session)
+
+local MAX_PLAYERS = 8
+local MAX_DURATION = 60
+local MAX_EVENTS = 200
+local PEER_TIMEOUT = 90
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "run_timeline",
+	description = "Runs a batched test: one list of Luau snippets, each with a time and a context, "
+		.. "fired on a shared clock across Studio itself, a real server and real clients, ending in "
+		.. "an assertion. Contexts share ctx -- write ctx.thing = 1 anywhere and read ctx.thing "
+		.. 'anywhere else, or ctx:Await("thing", 2) to wait for it rather than hope. Every event '
+		.. "also gets vmcp: vmcp.Tool calls any other VMCP tool in any context, vmcp.Game.Require "
+		.. "reads a live module's real state, vmcp.Remotes watches remote traffic, vmcp.Exploit "
+		.. "replays the game's own remote traffic with its arguments broken, vmcp.Bench times a "
+		.. "function under load. Client events also "
+		.. "get input, for real keys and clicks. Starts its own playtest if one isn't already open.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			events = {
+				type = "array",
+				description = "What happens and when.",
+				items = {
+					type = "object",
+					properties = {
+						at = { type = "number", description = "Seconds after the start.", minimum = 0 },
+						context = {
+							type = "string",
+							description = "plugin is Studio's edit session; server and client are the live game.",
+							enum = { "plugin", "server", "client" },
+						},
+						player = {
+							type = "integer",
+							description = "Which client, 1-based. Client events only; defaults to 1.",
+							minimum = 1,
+							maximum = MAX_PLAYERS,
+						},
+						code = {
+							type = "string",
+							description = "Luau. Runs as a function body with ctx, input and vmcp in scope.",
+						},
+						blocking = {
+							type = "boolean",
+							description = "Hold the schedule until this finishes. For setup steps.",
+						},
+						label = { type = "string", description = "Name for the log." },
+					},
+					required = { "at", "context", "code" },
+				},
+			},
+			duration = {
+				type = "number",
+				description = "Seconds to keep running after the last event, so trailing effects land.",
+				minimum = 0,
+				maximum = MAX_DURATION,
+			},
+			players = {
+				type = "integer",
+				description = "Test clients to launch, if a playtest isn't already open. Defaults to 1.",
+				minimum = 1,
+				maximum = MAX_PLAYERS,
+			},
+			assertion = {
+				type = "string",
+				description = "Luau run in Studio at the end, with ctx in scope. Return true to pass.",
+			},
+			keepOpen = {
+				type = "boolean",
+				description = "Leave the playtest running afterwards instead of stopping it.",
+			},
+		},
+		required = { "events" },
+	},
+	tags = { title = "Run Timeline", destructive = true },
+	timeoutMs = 300000,
+}
+
+local function text(body: string, isError: boolean?): Result
+	return { content = { { type = "text", text = body } }, isError = isError }
+end
+
+local function validate(events: any): (number, string?)
+	if type(events) ~= "table" or #events == 0 then
+		return 0, "events must be a non-empty array"
+	end
+	if #events > MAX_EVENTS then
+		return 0, `that's {#events} events; the cap is {MAX_EVENTS}`
+	end
+
+	local longest = 0
+	for index, event in events do
+		if type(event) ~= "table" then
+			return 0, `events[{index}] must be an object`
+		end
+		if type(event.at) ~= "number" or event.at < 0 then
+			return 0, `events[{index}].at must be a number of seconds`
+		end
+		local context = event.context
+		if context ~= "plugin" and context ~= "server" and context ~= "client" then
+			return 0, `events[{index}].context must be plugin, server or client`
+		end
+		if type(event.code) ~= "string" or event.code == "" then
+			return 0, `events[{index}].code must be a non-empty string`
+		end
+		longest = math.max(longest, event.at)
+	end
+	return longest, nil
+end
+
+type Bundle = { context: string, player: number?, origin: string, events: { any } }
+
+-- One bundle per DataModel. A client event names its player, so two clients are two bundles and
+-- each one only ever hears about its own events.
+local function split(events: { any }): { Bundle }
+	local parts: { Bundle } = {}
+	local byKey: { [string]: Bundle } = {}
+
+	for _, event in events do
+		local player = if event.context == "client" then (event.player or 1) else nil
+		local key = if player then `client{player}` else event.context
+		local part = byKey[key]
+		if not part then
+			local created: Bundle = {
+				context = event.context,
+				player = player,
+				origin = if player then `client {player}` else event.context,
+				events = {},
+			}
+			byKey[key] = created
+			table.insert(parts, created)
+			part = created
+		end
+		table.insert((part :: Bundle).events, event)
+	end
+	return parts
+end
+
+-- A playtest DataModel takes a few seconds to boot and connect, and there's no event for it: the
+-- edit session only finds out by asking the server whether anyone has answered yet.
+local function waitForPeers(parts: { Bundle }): string?
+	local deadline = os.clock() + PEER_TIMEOUT
+	for _, part in parts do
+		if part.context == "plugin" then
+			continue
+		end
+
+		local up = false
+		local last = "never answered"
+		repeat
+			local reached, result = Bridge.Invoke("peer", {
+				action = "ping",
+				context = part.context,
+				player = part.player,
+			}, 10)
+			up = reached and result ~= nil and result.isError ~= true
+			if not up then
+				last = if reached then "not up yet" else tostring(result)
+				task.wait(0.5)
+			end
+		until up or os.clock() >= deadline
+
+		if not up then
+			return `{part.origin} never came up ({last})`
+		end
+	end
+	return nil
+end
+
+-- Run in the edit session, after everything else has stopped, against the context as it finally
+-- stands. Keeping it out of the timeline is the point: it judges the run, it isn't part of it.
+local function runAssertion(source: string): (boolean, string)
+	local run, problem = Inject.Compile(source, "ctx, input, vmcp")
+	if not run then
+		return false, `the assertion didn't compile: {problem}`
+	end
+
+	local env = require(script.Parent.Parent.Env)
+	local ok, produced = pcall(run, Runtime.Context("assertion"), nil, env)
+	if not ok then
+		return false, `the assertion errored: {produced}`
+	end
+	if produced == true then
+		return true, "assertion passed"
+	end
+	return false, `assertion returned {tostring(produced)}`
+end
+
+local function render(passed: boolean, verdict: string, snapshot: any): Result
+	local lines = { if passed then `PASS -- {verdict}` else `FAIL -- {verdict}` }
+
+	if snapshot and snapshot.values and next(snapshot.values) ~= nil then
+		table.insert(lines, "")
+		table.insert(lines, "context at the end:")
+		for key, value in snapshot.values do
+			table.insert(lines, `  {key} = {tostring(value)}`)
+		end
+	end
+
+	if snapshot and snapshot.writes and #snapshot.writes > 0 then
+		table.insert(lines, "")
+		table.insert(lines, "writes, in the order they happened:")
+		for _, write in snapshot.writes do
+			table.insert(lines, `  {write.from} set {write.key}`)
+		end
+	end
+
+	if snapshot and snapshot.notes and #snapshot.notes > 0 then
+		table.insert(lines, "")
+		table.insert(lines, "notes and output:")
+		for _, note in snapshot.notes do
+			table.insert(lines, `  {note}`)
+		end
+	end
+
+	return { content = { { type = "text", text = table.concat(lines, "\n") } }, isError = not passed }
+end
+
+function Tool.Run(arguments: {
+	events: any,
+	duration: number?,
+	players: number?,
+	assertion: string?,
+	keepOpen: boolean?,
+}): Result
+	local longest, problem = validate(arguments.events)
+	if problem then
+		return text(problem, true)
+	end
+
+	local parts = split(arguments.events)
+	local needsGame = false
+	for _, part in parts do
+		needsGame = needsGame or part.context ~= "plugin"
+	end
+
+	-- Started only if the payload actually needs a running game, and stopped again only if this
+	-- call is what started it. A playtest someone else opened stays open.
+	local weStarted = false
+	if needsGame and not Session.IsRunning() then
+		local failure = Session.Start(math.clamp(arguments.players or 1, 1, MAX_PLAYERS))
+		if failure then
+			return text(failure, true)
+		end
+		weStarted = true
+	end
+
+	local function finish(result: Result): Result
+		if weStarted and not arguments.keepOpen then
+			Bridge.Invoke("peer", { action = "stop", context = "server" }, 20)
+			Session.Forget()
+		end
+		return result
+	end
+
+	local waited = waitForPeers(parts)
+	if waited then
+		return finish(text(waited, true))
+	end
+
+	Bridge.CtxClear()
+	-- The tail runs past the last event, so the two add up rather than the payload having to state
+	-- a duration longer than its own schedule.
+	local duration = longest + math.clamp(arguments.duration or 1, 0, MAX_DURATION)
+
+	local running = 0
+	local failures: { string } = {}
+	for _, part in parts do
+		running += 1
+		task.spawn(function()
+			local reached, result = Bridge.Invoke("timeline_part", {
+				context = part.context,
+				player = part.player,
+				origin = part.origin,
+				events = part.events,
+				duration = duration,
+			}, duration + 60)
+
+			if not reached then
+				table.insert(failures, `{part.origin}: {tostring(result)}`)
+			elseif result.isError then
+				table.insert(failures, `{part.origin}: {result.content[1].text}`)
+			end
+			running -= 1
+		end)
+	end
+
+	local deadline = os.clock() + duration + 90
+	while running > 0 and os.clock() < deadline do
+		task.wait(0.1)
+	end
+	if running > 0 then
+		table.insert(failures, `{running} context(s) never finished`)
+	end
+
+	local snapshot = Bridge.CtxSnapshot()
+	for _, failure in failures do
+		if snapshot and snapshot.notes then
+			table.insert(snapshot.notes, failure)
+		end
+	end
+
+	local passed, verdict = true, "no assertion"
+	if arguments.assertion then
+		passed, verdict = runAssertion(arguments.assertion)
+	elseif #failures > 0 then
+		passed, verdict = false, "no assertion given, and a context failed"
+	end
+
+	return finish(render(passed, verdict, snapshot))
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="37">
+        <Properties>
+          <string name="Name">SearchScripts</string>
+          <string name="Source"><![CDATA[--!strict
+
+local Bridge = require(script.Parent.Parent.Bridge)
+local Path = require(script.Parent.Parent.Path)
+
+local DEFAULT_MAX_RESULTS = 40
+local HARD_MAX_RESULTS = 200
+local MAX_CONTEXT = 10
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "search_scripts",
+	description = "Searches the source of every script under a root and returns the matching "
+		.. "lines with their paths. The pattern is a Luau string pattern, not a regex -- use "
+		.. "%w and %s, and escape a literal dot as %.. Reads what Studio currently has, which "
+		.. "isn't always what's on disk -- pass drift = true instead of a pattern to get the "
+		.. "list of scripts where the two disagree.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			pattern = {
+				type = "string",
+				description = "Luau string pattern to search for. Required unless drift is set.",
+			},
+			drift = {
+				type = "boolean",
+				description = "Skip searching and instead report every script whose source no "
+					.. 'longer matches the file Rojo syncs it from. Answers "is Studio showing '
+					.. 'me the same code as the repo" in one call.',
+			},
+			root = {
+				type = "string",
+				description = 'Dotted path to search under, like "ServerScriptService". Defaults to game.',
+			},
+			contextLines = {
+				type = "integer",
+				description = "Lines of surrounding source to show around each hit. Defaults to 0.",
+				minimum = 0,
+				maximum = MAX_CONTEXT,
+			},
+			maxResults = {
+				type = "integer",
+				description = "Stop after this many matching lines. Defaults to 40.",
+				minimum = 1,
+				maximum = HARD_MAX_RESULTS,
+			},
+		},
+	},
+	tags = { title = "Search Scripts", readOnly = true, idempotent = true },
+}
+
+-- FNV-1a, 32 bit. The server runs the same thing over the file on disk; agreeing exactly with it
+-- matters far more than the hash being a good one, since all either side ever does is compare a
+-- file against itself.
+local function mul32(a: number, b: number): number
+	-- Split because a * 16777619 loses low bits once a is near 2^32 -- doubles run out of mantissa
+	-- well before the product fits.
+	local high = bit32.band(bit32.rshift(a, 16) * b, 0xFFFF)
+	return bit32.band(bit32.lshift(high, 16) + bit32.band(a, 0xFFFF) * b, 0xFFFFFFFF)
+end
+
+local function fingerprint(source: string): number
+	-- Line endings and a trailing newline are the editor's business, not a real difference.
+	local text = source:gsub("\r\n", "\n"):gsub("%s+$", "")
+	local hash = 2166136261
+	for index = 1, #text do
+		hash = mul32(bit32.bxor(hash, string.byte(text, index)), 16777619)
+	end
+	return hash
+end
+
+local function checkDrift(root: Instance): Result
+	local scripts = {}
+	local unreadable = 0
+	for _, instance in root:GetDescendants() do
+		if not instance:IsA("LuaSourceContainer") then
+			continue
+		end
+		local readable, source = pcall(function()
+			return (instance :: any).Source
+		end)
+		if not readable or type(source) ~= "string" then
+			unreadable += 1
+			continue
+		end
+		table.insert(scripts, {
+			path = instance:GetFullName(),
+			className = instance.ClassName,
+			hash = fingerprint(source),
+		})
+	end
+
+	local ok, payload = Bridge.Request("source/drift", { scripts = scripts }, 30)
+	if not ok then
+		return { content = { { type = "text", text = tostring(payload) } }, isError = true }
+	end
+
+	local drift = payload.drift or {}
+	if #drift == 0 then
+		local text = `Studio and {payload.projectPath} agree on all {#scripts} script(s).`
+		if unreadable > 0 then
+			text ..= ` {unreadable} couldn't be read -- allow script injection for VMCP in Plugin Management.`
+		end
+		return { content = { { type = "text", text = text } } }
+	end
+
+	local lines = { `{#drift} of {#scripts} script(s) disagree with {payload.projectPath}:` }
+	for _, entry in drift do
+		local where = if entry.file then ` -> {entry.file}` else ""
+		table.insert(lines, `  {entry.problem}: {entry.path}{where}`)
+	end
+	table.insert(lines, "")
+	table.insert(lines, '"not in studio" means the file exists but never synced; "not on disk"')
+	table.insert(lines, "means the script was made in Studio and Rojo has nothing to write it to.")
+
+	return { content = { { type = "text", text = table.concat(lines, "\n") } } }
+end
+
+local function splitLines(source: string): { string }
+	local lines = {}
+	for line in string.gmatch(source .. "\n", "([^\n]*)\n") do
+		table.insert(lines, line)
+	end
+	return lines
+end
+
+function Tool.Run(
+	arguments: { pattern: string?, root: string?, contextLines: number?, maxResults: number?, drift: boolean? }
+): Result
+	local root: Instance = game
+	if type(arguments.root) == "string" and arguments.root ~= "" then
+		local found, why = Path.Resolve(arguments.root :: string)
+		if not found then
+			return { content = { { type = "text", text = why :: string } }, isError = true }
+		end
+		root = found
+	end
+
+	if arguments.drift then
+		return checkDrift(root)
+	end
+
+	local pattern = arguments.pattern
+	if type(pattern) ~= "string" or pattern == "" then
+		return {
+			content = { { type = "text", text = "pass either a pattern to search for or drift = true" } },
+			isError = true,
+		}
+	end
+	local valid, problem = pcall(string.find, "", pattern)
+	if not valid then
+		return { content = { { type = "text", text = `pattern isn't valid: {problem}` } }, isError = true }
+	end
+
+	local context = math.clamp(arguments.contextLines or 0, 0, MAX_CONTEXT)
+	local limit = math.clamp(arguments.maxResults or DEFAULT_MAX_RESULTS, 1, HARD_MAX_RESULTS)
+
+	local out = {}
+	local hits = 0
+	local unreadable = 0
+	local truncated = false
+
+	for _, instance in root:GetDescendants() do
+		if not instance:IsA("LuaSourceContainer") then
+			continue
+		end
+		-- Reading Source needs the same script injection permission writing it does.
+		local readable, source = pcall(function()
+			return (instance :: any).Source
+		end)
+		if not readable or type(source) ~= "string" then
+			unreadable += 1
+			continue
+		end
+		if not string.find(source, pattern) then
+			continue
+		end
+
+		local lines = splitLines(source)
+		for number, line in lines do
+			if not string.find(line, pattern) then
+				continue
+			end
+			if hits >= limit then
+				truncated = true
+				break
+			end
+			hits += 1
+
+			table.insert(out, `{instance:GetFullName()}:{number}`)
+			for index = math.max(number - context, 1), math.min(number + context, #lines) do
+				local marker = if index == number then ">" else " "
+				table.insert(out, `{marker} {index}: {lines[index]}`)
+			end
+		end
+		if truncated then
+			break
+		end
+	end
+
+	if hits == 0 then
+		local text = `no script under {root:GetFullName()} matched`
+		if unreadable > 0 then
+			text ..= `. {unreadable} script(s) couldn't be read -- allow script injection for VMCP in Plugin Management`
+		end
+		return { content = { { type = "text", text = text } } }
+	end
+
+	if truncated then
+		table.insert(out, `-- stopped at {limit} matches; narrow the pattern or the root`)
+	end
+	if unreadable > 0 then
+		table.insert(out, `-- {unreadable} script(s) couldn't be read (script injection not allowed)`)
+	end
+
+	return { content = { { type = "text", text = table.concat(out, "\n") } } }
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="38">
+        <Properties>
+          <string name="Name">TimelinePart</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Plumbing: the half of run_timeline that runs inside one DataModel. Tagged internal, so it never
+-- shows up in the tool list -- run_timeline invokes it once per context, and the server routes
+-- each call to the right place.
+
+local RunService = game:GetService("RunService")
+
+local Bridge = require(script.Parent.Parent.Bridge)
+local Buffer = require(script.Parent.Parent.Log.Buffer)
+local Env = require(script.Parent.Parent.Env)
+local Inject = require(script.Parent.Parent.Exec.Inject)
+local Runtime = require(script.Parent.Parent.Timeline.Runtime)
+
+local MAX_LOG_LINES = 60
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "timeline_part",
+	description = "Internal. Runs one context's share of a timeline.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			events = { type = "array", items = { type = "object" } },
+			duration = { type = "number" },
+			origin = { type = "string" },
+			context = { type = "string", enum = { "plugin", "server", "client" } },
+			player = { type = "integer", minimum = 1 },
+		},
+		required = { "events" },
+	},
+	tags = { title = "Timeline Part", internal = true },
+	timeoutMs = 300000,
+}
+
+function Tool.Run(arguments: { events: any, duration: number?, origin: string? }): Result
+	local events = arguments.events
+	if type(events) ~= "table" then
+		return { content = { { type = "text", text = "events must be an array" } }, isError = true }
+	end
+
+	local connection = Bridge.Connection()
+	local origin = arguments.origin or connection.role
+	local ctx = Runtime.Context(origin)
+
+	-- Compiled up front, all of them, before the clock starts: an event that doesn't compile
+	-- should stop the run rather than fire a hole in the middle of it.
+	local compiled: { Runtime.Event } = {}
+	for index, spec in events do
+		local run, problem = Inject.Compile(spec.code, "ctx, input, vmcp")
+		if not run then
+			local label = spec.label or `events[{index}]`
+			return {
+				content = { { type = "text", text = `{label} didn't compile: {problem}` } },
+				isError = true,
+			}
+		end
+		table.insert(compiled, { at = spec.at, blocking = spec.blocking, label = spec.label, run = run })
+	end
+
+	-- Input only exists on a client: UserInputService is client-side, and a virtual keypress on
+	-- the server would have nothing to press against.
+	local input = if RunService:IsClient() then Runtime.Input() else nil
+	local cursor = Buffer.written
+
+	Runtime.Run(compiled, ctx, input, Env, arguments.duration or 0, function(text: string)
+		ctx:Note(text)
+	end)
+
+	if input then
+		input:ReleaseEverything()
+		for _, problem in input.problems do
+			ctx:Note(`input: {problem}`)
+		end
+	end
+
+	-- Output goes back as context notes rather than in this reply, because run_timeline reads the
+	-- context and never sees the individual replies.
+	task.wait()
+	local logged = Buffer.Since(cursor)
+	for index, entry in logged do
+		if index > MAX_LOG_LINES then
+			ctx:Note(`... and {#logged - MAX_LOG_LINES} more lines of output`)
+			break
+		end
+		ctx:Note(`[{entry.severity}] {entry.text}`)
+	end
+
+	return { content = { { type = "text", text = `{origin} ran {#compiled} event(s)` } } }
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+</roblox>
