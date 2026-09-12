@@ -272,6 +272,12 @@ function scheduleRetry()
 	end)
 end
 
+-- Fires a message at the server with no reply expected. Peer commands go this way: nothing comes
+-- back, all that matters is that the running test hears about it.
+function Bridge.Notify(method: string, params: { [string]: any }): boolean
+	return (send({ jsonrpc = "2.0", method = method, params = params }))
+end
+
 -- Asks the server a question and waits for the answer. The server can reach the filesystem and
 -- the plugin can't, which is the only reason this direction exists.
 --
@@ -329,6 +335,12 @@ function Bridge.Disconnect()
 	state.wantConnected = false
 	closeSocket()
 	report("Idle", "not connected", "Disconnected.")
+end
+
+-- What a playtest harness needs baked into it to call home: the same port and token this socket
+-- is using, and this session's id, which is what pairs the peer with this window.
+function Bridge.Connection(): { port: string?, token: string?, sessionId: string }
+	return { port = state.port, token = state.token, sessionId = state.sessionId }
 end
 
 function Bridge.IsConnected(): boolean

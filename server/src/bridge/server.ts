@@ -96,6 +96,13 @@ function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegist
 			return;
 		}
 
+		// Anything addressed to the peer passes straight through. The plugin can't reach a test
+		// DataModel itself, so this is the only way it can tell its own playtest anything.
+		if (msg.method.startsWith("peer/")) {
+			if (session.peer?.isOpen) session.peer.forward(msg.method, msg.params);
+			return;
+		}
+
 		if (msg.method === "source/drift") {
 			const map = rojoMap();
 			if (!map || map.isEmpty) {
@@ -131,6 +138,12 @@ function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegist
 		clearTimeout(handshakeTimer);
 		if (!session) return;
 		session.dispose(reason);
+		if (session.role === "playtest-server") {
+			registry.detachPeer(session);
+			return;
+		}
+		// A plugin going away takes its peer with it -- the test DataModel dies with the window.
+		session.peer?.closeSocket(VmcpCloseCode.Superseded, "the Studio window closed");
 		registry.remove(session);
 	};
 
@@ -195,6 +208,21 @@ function handleHello(
 		session.revision = params.revision;
 		session.reportedRevision = params.revision;
 	}
+
+	if (params.role === "playtest-server") {
+		session.role = params.role;
+		session.linkId = params.linkId;
+		// A peer that can't find its plugin is an orphan from a Studio window that already closed,
+		// and nothing will ever call it.
+		if (!registry.attachPeer(session)) {
+			replyError(socket, msg, VmcpErrorCode.NoSession, `no plugin session "${params.linkId}" to attach to`);
+			reject(socket, "unattached playtest peer");
+			return undefined;
+		}
+		replyOk(socket, msg, { protocolVersion: PROTOCOL_VERSION });
+		return session;
+	}
+
 	registry.add(session);
 	replyOk(socket, msg, { protocolVersion: PROTOCOL_VERSION });
 	return session;

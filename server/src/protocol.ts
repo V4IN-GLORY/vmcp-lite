@@ -37,6 +37,13 @@ export interface ToolDefinition {
 	timeoutMs?: number;
 }
 
+/**
+ * "plugin" is a Studio window's edit session and owns the tool list. "playtest-server" is the
+ * harness running inside a live test DataModel: it registers nothing and exists only so calls
+ * that need a running game have somewhere to go.
+ */
+export type SessionRole = "plugin" | "playtest-server";
+
 export interface HelloParams {
 	token: string;
 	/** Identifies this Studio window. Sessions are keyed on it, not on the place. */
@@ -47,6 +54,10 @@ export interface HelloParams {
 	protocolVersion?: number;
 	/** Optional starting revision, so the first call doesn't report a change that isn't one. */
 	revision?: number;
+	/** Defaults to "plugin". */
+	role?: SessionRole;
+	/** A peer sends the sessionId of the plugin that spawned it, which is what pairs the two. */
+	linkId?: string;
 }
 
 export interface ToolsChangedParams {
@@ -82,6 +93,8 @@ export type ToolResult = {
 	content: ToolResultContent[];
 	structuredContent?: Record<string, unknown>;
 	isError?: boolean;
+	/** Work the plugin can't do itself and is asking this side to finish. See postprocess.ts. */
+	postProcess?: Record<string, unknown>;
 };
 
 /** JSON-RPC error codes. -32000 and below are ours. */
@@ -259,6 +272,11 @@ export function coerceToolResult(value: unknown): ToolResult {
 				? candidate.structuredContent
 				: undefined;
 
+		const directive =
+			typeof candidate.postProcess === "object" && candidate.postProcess !== null
+				? (candidate.postProcess as Record<string, unknown>)
+				: undefined;
+
 		if (Array.isArray(candidate.content)) {
 			const content = candidate.content
 				.filter((item) => typeof item?.text === "string")
@@ -268,6 +286,7 @@ export function coerceToolResult(value: unknown): ToolResult {
 				const result: ToolResult = { content };
 				if (structured) result.structuredContent = structured;
 				if (candidate.isError) result.isError = true;
+				if (directive) result.postProcess = directive;
 				return result;
 			}
 		}

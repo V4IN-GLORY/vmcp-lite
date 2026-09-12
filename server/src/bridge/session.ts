@@ -8,6 +8,7 @@ import {
 	type IncomingMessage,
 	type JsonRpcResponse,
 	type ProgressParams,
+	type SessionRole,
 	type ToolDefinition,
 	type ToolResult,
 } from "../protocol.js";
@@ -42,6 +43,12 @@ export class Session {
 	revision?: number;
 	/** The last revision the MCP client was told about, so notices only fire on a change. */
 	reportedRevision?: number;
+
+	role: SessionRole = "plugin";
+	/** Set on a peer: the sessionId of the plugin whose playtest it belongs to. */
+	linkId?: string;
+	/** Set on a plugin: its live playtest peer, while one is running. */
+	peer?: Session;
 
 	constructor(
 		private readonly socket: WebSocket,
@@ -79,6 +86,12 @@ export class Session {
 			this.pending.set(id, call);
 			this.socket.send(JSON.stringify({ jsonrpc: "2.0", id, method: "tool/call", params: { name, arguments: args } }));
 		});
+	}
+
+	/** One-way, no reply: how a plugin's peer commands reach the test DataModel it spawned. */
+	forward(method: string, params: unknown): void {
+		if (this.closed) return;
+		this.socket.send(JSON.stringify({ jsonrpc: "2.0", method, params }));
 	}
 
 	private startTimer(id: number, name: string, timeoutMs: number): NodeJS.Timeout {

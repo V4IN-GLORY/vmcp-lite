@@ -318,6 +318,95 @@ hot-reload path while you're iterating.
 
 Omit `id` if you don't want a reply.
 
+## 7. `role` and `linkId` — playtest peers
+
+A second kind of client connects to the same bridge: the harness VMCP injects into a live playtest
+server. It sends `"role": "playtest-server"` in `session/hello`, along with `"linkId"` set to the
+**plugin's** `sessionId`. That pairing is the whole point — it tells the server which Studio window
+the running game belongs to.
+
+A peer registers no tools and never appears in the tool list. What it gets instead is routing: when
+an MCP call carries `"context": "server"` and the plugin that owns it has a live peer, the server
+sends that `tool/call` to the peer rather than to the plugin. With no peer, it goes to the plugin as
+usual, which runs the code in a one-shot test of its own.
+
+A peer whose `linkId` matches nothing is refused with `-32003` and closed — it's an orphan from a
+window that already went away. A plugin disconnecting closes its peer with `4000`.
+
+## 8. `peer/*` — the plugin talking to its own playtest
+
+A plugin can't reach a test DataModel at all, not even the one it started. Anything it needs to say
+goes through the server: a notification whose method starts with `peer/` is forwarded verbatim to
+that session's peer, with no reply either way.
+
+```json
+{ "jsonrpc": "2.0", "method": "peer/stop" }
+```
+
+If there's no peer, the message is dropped silently — there was nothing to tell.
+
+## 9. `source/drift` — the plugin asking the server
+
+The one request that goes plugin to server. Studio can read its own scripts but not the disk; the
+server can do both halves of the comparison, so the plugin sends what it has and gets back only the
+disagreements.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "source/drift",
+  "params": {
+    "scripts": [
+      { "path": "ReplicatedStorage.Shared.Hello", "className": "ModuleScript", "hash": 1709500481 }
+    ]
+  }
+}
+```
+
+`hash` is FNV-1a 32-bit over the source with CRLF normalised to LF and trailing whitespace stripped.
+The server hashes the file the same way, so the two only differ when the content really does.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "ok": true,
+    "projectPath": "D:\Studio Games\VMCP\default.project.json",
+    "drift": [
+      { "path": "ReplicatedStorage.Shared.Hello", "file": "…/src/shared/Hello.luau", "problem": "differs" }
+    ]
+  }
+}
+```
+
+`problem` is `differs`, `not on disk` (a script made in Studio that Rojo has nowhere to write), or
+`not in studio` (a file that never synced). Paths Rojo doesn't manage are skipped entirely. Refused
+with `-32600` when the server can't find a `default.project.json` — start it from the project
+folder, or point `VMCP_PROJECT` at one.
+
+## 10. `postProcess` — asking the server to finish a result
+
+A tool result may carry a `postProcess` object alongside `content`. It's for work the plugin
+genuinely can't do, which so far means writing a file:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "content": [{ "type": "text", "text": "drew a 256x256 image" }],
+    "postProcess": { "kind": "png", "name": "health-bar", "width": 256, "height": 256, "ops": [] }
+  }
+}
+```
+
+The server carries it out, appends a line of text saying what happened, and strips the directive —
+the MCP client never sees it. An unrecognised `kind` says so in that line rather than failing the
+call. Deliberately narrow: this is the only place the relay acts on a result instead of passing it
+through.
+
 ## Luau gotchas
 
 **Every schema needs `type = "object"` at its root.** MCP requires it. The server checks at

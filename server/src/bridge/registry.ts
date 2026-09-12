@@ -45,6 +45,28 @@ export class SessionRegistry extends EventEmitter {
 		this.rebuild();
 	}
 
+	get(sessionId: string): Session | undefined {
+		return this.sessions.get(sessionId);
+	}
+
+	/**
+	 * A peer hangs off the plugin session that spawned it rather than joining the registry: it
+	 * registers no tools, so listing it would only ever produce an empty contributor.
+	 */
+	attachPeer(peer: Session): boolean {
+		const plugin = peer.linkId ? this.sessions.get(peer.linkId) : undefined;
+		if (!plugin) return false;
+
+		plugin.peer = peer;
+		log(`playtest peer attached to ${plugin.placeName}`);
+		return true;
+	}
+
+	detachPeer(peer: Session): void {
+		const plugin = peer.linkId ? this.sessions.get(peer.linkId) : undefined;
+		if (plugin?.peer === peer) plugin.peer = undefined;
+	}
+
 	add(session: Session): void {
 		// A plugin reload can leave the old socket alive; evict it so it doesn't hold names.
 		const previous = this.sessions.get(session.sessionId);

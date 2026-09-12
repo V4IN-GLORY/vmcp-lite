@@ -43,15 +43,12 @@ end
 local INJECTION_DENIED = "Studio won't let VMCP create scripts, so run_luau can't work. Open the "
 	.. "Plugins ribbon, click Plugin Management, and allow script injection for VMCP."
 
--- Wrapping in a function is what lets a snippet with no `return` work at all -- a ModuleScript
--- body that returns nothing is a hard require error. The wrapper stays on line 1 so a syntax
--- error still reports the snippet's own line numbers.
 local function build(source: string): (ModuleScript?, string?)
 	counter += 1
 	local ok, created = pcall(function()
 		local module = Instance.new("ModuleScript")
 		module.Name = `chunk{counter}`
-		module.Source = `return function(vmcp) {source}\nend`
+		module.Source = source
 		return module
 	end)
 	if not ok then
@@ -60,10 +57,34 @@ local function build(source: string): (ModuleScript?, string?)
 	return created, nil
 end
 
+-- Wrapping in a function is what lets a snippet with no `return` work at all -- a ModuleScript
+-- body that returns nothing is a hard require error. The wrapper stays on line 1 so a syntax
+-- error still reports the snippet's own line numbers.
+local function wrap(source: string): string
+	return `return function(vmcp) {source}\nend`
+end
+
+-- Compiles source without running anything past its top level. The timeline payload is nothing
+-- but closures, so requiring it is a syntax check and nothing more -- which is the difference
+-- between catching the model's typo here and watching a test start with a dead harness in it.
+function Inject.Check(source: string): (boolean, string?)
+	local module, refusal = build(source)
+	if not module then
+		return false, refusal
+	end
+	module.Parent = folder()
+
+	local ok, failure = pcall(require, module)
+	pcall(function()
+		module:Destroy()
+	end)
+	return ok, if ok then nil else tostring(failure)
+end
+
 -- Returns ok plus either the snippet's return value or the failure text. `env` is handed to the
 -- snippet as its `vmcp` argument.
 function Inject.Run(source: string, env: { [string]: any }?, timeout: number?): (boolean, any)
-	local module, refusal = build(source)
+	local module, refusal = build(wrap(source))
 	if not module then
 		return false, refusal
 	end

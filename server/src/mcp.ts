@@ -9,6 +9,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { log } from "./config.js";
 import { RETRY_KEY, type ToolDefinition, type ToolResult } from "./protocol.js";
+import { runPostProcess } from "./postprocess.js";
 import { RetryCache } from "./retry-cache.js";
 import type { ExposedTool, SessionRegistry } from "./bridge/registry.js";
 import type { ProgressUpdate, Session } from "./bridge/session.js";
@@ -45,6 +46,10 @@ export async function startMcp(registry: SessionRegistry): Promise<Server> {
 		}
 
 		const args = (request.params.arguments ?? {}) as Record<string, unknown>;
+		// A call that names a live game context belongs to the playtest peer, not the plugin --
+		// the plugin can't reach a test DataModel at all. With no peer open it stays with the
+		// plugin, which spins up a one-shot session itself.
+		const target = wantsLiveGame(args) && session.peer?.isOpen ? session.peer : session;
 		const cacheKey = retryKeyFor(exposed, args);
 		if (cacheKey) {
 			const cached = retries.get(cacheKey);
@@ -65,7 +70,7 @@ export async function startMcp(registry: SessionRegistry): Promise<Server> {
 					};
 
 		try {
-			const result = withRevisionNotice(await session.call(exposed.tool.name, args, onProgress), session);
+			const result = withRevisionNotice(finish(await target.call(exposed.tool.name, args, onProgress)), session);
 			// Only a real reply is cached — a timeout is exactly what's worth retrying.
 			if (cacheKey) retries.set(cacheKey, result);
 			return result;
@@ -102,6 +107,23 @@ function withRevisionNotice(result: ToolResult, session: Session): ToolResult {
 			{ type: "text", text: `[the place changed — now at revision ${revision}; earlier reads may be stale]` },
 		],
 	};
+}
+
+/**
+ * Carries out a postProcess directive and folds the outcome into the text the caller sees. The
+ * directive itself never goes on to the MCP client — it was addressed to this server.
+ */
+function finish(result: ToolResult): ToolResult {
+	const { postProcess, ...rest } = result;
+	if (!postProcess) return result;
+
+	const outcome = runPostProcess(postProcess);
+	if (!outcome) return rest;
+	return { ...rest, content: [...rest.content, { type: "text", text: outcome }] };
+}
+
+function wantsLiveGame(args: Record<string, unknown>): boolean {
+	return args.context === "server" || args.context === "client";
 }
 
 function advertise(exposed: ExposedTool): Tool {

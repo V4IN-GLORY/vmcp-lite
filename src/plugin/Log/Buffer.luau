@@ -49,10 +49,14 @@ function Buffer.Start()
 	end
 	started = true
 
-	-- MessageOut only fires from here on, so whatever Studio already has scrolls in first.
-	for _, item in LogService:GetLogHistory() do
-		push(item.messageType, item.message, item.timestamp)
-	end
+	-- MessageOut only fires from here on, so whatever Studio already has scrolls in first. Only
+	-- the plugin can do that -- GetLogHistory is PluginSecurity and this module is also injected
+	-- into playtest DataModels, where the backfill simply isn't available.
+	pcall(function()
+		for _, item in LogService:GetLogHistory() do
+			push(item.messageType, item.message, item.timestamp)
+		end
+	end)
 	LogService.MessageOut:Connect(function(text: string, messageType: Enum.MessageType)
 		push(messageType, text, os.time())
 	end)
