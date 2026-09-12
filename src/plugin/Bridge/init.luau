@@ -53,6 +53,10 @@ local state = {
 	onStatus = nil :: ((signal: string, word: string, line: string) -> ())?,
 }
 
+-- Replies we're still waiting on, keyed by the id we sent. Only Bridge.Request puts anything in
+-- here; tool/call goes the other direction.
+local pending: { [number]: (ok: boolean, payload: any) -> () } = {}
+
 local function report(signal: string, word: string, line: string)
 	if state.onStatus then
 		state.onStatus(signal, word, line)
@@ -175,6 +179,16 @@ local function openSocket()
 			return
 		end
 
+		local waiter = if message.method == nil then pending[message.id] else nil
+		if waiter then
+			if message.error then
+				waiter(false, message.error.message)
+			else
+				waiter(true, message.result)
+			end
+			return
+		end
+
 		if message.id == state.helloId and not state.handshakeOk then
 			if message.error then
 				-- Wrong token or wrong protocol version. Retrying can't fix either.
@@ -209,6 +223,9 @@ local function openSocket()
 
 		local wasOpen, wasLive = state.opened, state.handshakeOk
 		state.socket = nil
+		for _, waiting in pending do
+			waiting(false, "the connection to the VMCP server dropped")
+		end
 		state.opened = false
 		state.handshakeOk = false
 
@@ -253,6 +270,41 @@ function scheduleRetry()
 			openSocket()
 		end
 	end)
+end
+
+-- Asks the server a question and waits for the answer. The server can reach the filesystem and
+-- the plugin can't, which is the only reason this direction exists.
+--
+-- Yields, so it can only be called from a tool's own thread -- Dispatch spawns one per call, so
+-- blocking here holds up that call and nothing else on the socket.
+function Bridge.Request(method: string, params: { [string]: any }, timeout: number?): (boolean, any)
+	if not state.handshakeOk then
+		return false, "not connected to the VMCP server"
+	end
+
+	local id = state.nextId
+	state.nextId += 1
+	local thread = coroutine.running()
+
+	pending[id] = function(ok: boolean, payload: any)
+		pending[id] = nil
+		task.spawn(thread, ok, payload)
+	end
+
+	local sent, failure = send({ jsonrpc = "2.0", id = id, method = method, params = params })
+	if not sent then
+		pending[id] = nil
+		return false, failure :: any
+	end
+
+	task.delay(timeout or 15, function()
+		local waiting = pending[id]
+		if waiting then
+			waiting(false, `the server didn't answer {method} in time`)
+		end
+	end)
+
+	return coroutine.yield()
 end
 
 function Bridge.Init(toolFolder: Instance, settings: { GetPlaceGuid: () -> string })

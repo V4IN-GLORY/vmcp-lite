@@ -16,6 +16,7 @@ import {
 	type RevisionParams,
 	type ToolsChangedParams,
 } from "../protocol.js";
+import { rojoMap, type ScriptHash } from "../rojo.js";
 import { Session } from "./session.js";
 import type { SessionRegistry } from "./registry.js";
 
@@ -91,6 +92,29 @@ function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegist
 				replyOk(socket, msg);
 			} catch (err) {
 				replyError(socket, msg, VmcpErrorCode.InvalidParams, (err as Error).message);
+			}
+			return;
+		}
+
+		if (msg.method === "source/drift") {
+			const map = rojoMap();
+			if (!map || map.isEmpty) {
+				replyError(
+					socket,
+					msg,
+					VmcpErrorCode.InvalidRequest,
+					"this server can't see a Rojo project, so it has nothing to compare Studio against. " +
+						"Start it from the project folder, or set VMCP_PROJECT to the default.project.json.",
+				);
+				return;
+			}
+			const scripts = ((msg.params as { scripts?: ScriptHash[] })?.scripts ?? []).filter(
+				(entry) => typeof entry?.path === "string" && typeof entry?.hash === "number",
+			);
+			try {
+				replyOk(socket, msg, { projectPath: map.projectPath, drift: map.compare(scripts) });
+			} catch (err) {
+				replyError(socket, msg, VmcpErrorCode.InternalError, (err as Error).message);
 			}
 			return;
 		}

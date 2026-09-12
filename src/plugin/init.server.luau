@@ -3,6 +3,7 @@
 local HttpService = game:GetService("HttpService")
 
 local Bridge = require(script.Bridge)
+local LogBuffer = require(script.Log.Buffer)
 local Panel = require(script.Panel)
 
 local DEFAULT_PORT = "8791"
@@ -35,6 +36,10 @@ local function getPlaceGuid(): string
 	end
 	return guid
 end
+
+-- Started before anything else can log: get_logs is only useful if it was already recording
+-- when the interesting error happened.
+LogBuffer.Start()
 
 Bridge.Init(script.Tools, { GetPlaceGuid = getPlaceGuid })
 
