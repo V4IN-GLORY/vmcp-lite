@@ -12,8 +12,10 @@
 -- The reconnect rule is not the one in docs/protocol.md. That table says to skip retrying on
 -- close codes 1008 and 4000, but WebStreamClient's Closed event carries no arguments at all, so
 -- the plugin never sees a code. What it can see is whether the handshake ever succeeded: 1008
--- (bad token, bad version, non-JSON) always closes before the hello reply, so a close with no
--- handshake behind it is a configuration problem and retrying it forever is pointless noise.
+-- (bad token, bad version, non-JSON) always closes before the hello reply, so a close that
+-- happened after the socket opened but before the reply is a configuration problem and retrying
+-- it forever is pointless noise. A close with no Opened behind it is just a server that isn't
+-- listening yet, which is exactly what a restart looks like, so that one keeps retrying.
 
 local HttpService = game:GetService("HttpService")
 
@@ -36,7 +38,9 @@ local state = {
 	sessionId = HttpService:GenerateGUID(false),
 	port = nil :: string?,
 	token = nil :: string?,
-	-- Set once the server answers session/hello. The whole reconnect decision hangs off it.
+	-- The reconnect decision hangs off this pair: opened means the socket reached the server at
+	-- all, handshakeOk means the server accepted the session.
+	opened = false,
 	handshakeOk = false,
 	helloId = 0,
 	nextId = 1,
@@ -99,6 +103,7 @@ local scheduleRetry: () -> ()
 
 local function openSocket()
 	closeSocket()
+	state.opened = false
 	state.handshakeOk = false
 
 	local port = state.port
@@ -132,6 +137,7 @@ local function openSocket()
 		if socket ~= state.socket then
 			return
 		end
+		state.opened = true
 
 		local folder = state.toolFolder
 		if not folder then
@@ -201,12 +207,19 @@ local function openSocket()
 			return
 		end
 
-		local wasLive = state.handshakeOk
+		local wasOpen, wasLive = state.opened, state.handshakeOk
 		state.socket = nil
+		state.opened = false
 		state.handshakeOk = false
 
 		if not state.wantConnected then
 			report("Idle", "not connected", "Disconnected.")
+			return
+		end
+		-- Never opened: nothing was listening. Common and temporary -- Node restarts constantly
+		-- during development -- so back off and keep trying.
+		if not wasOpen then
+			scheduleRetry()
 			return
 		end
 		if not wasLive then
