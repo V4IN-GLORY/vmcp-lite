@@ -23,6 +23,11 @@ export interface ToolTags {
 	idempotent?: boolean;
 	/** The tool reaches outside the place — HTTP, the Creator Store, the filesystem. */
 	external?: boolean;
+	/**
+	 * Plumbing: reachable through tool/invoke but never advertised to the MCP client. Used by the
+	 * pieces of a tool that run in a different DataModel from the one that was called.
+	 */
+	internal?: boolean;
 }
 
 export interface ToolDefinition {
@@ -38,11 +43,12 @@ export interface ToolDefinition {
 }
 
 /**
- * "plugin" is a Studio window's edit session and owns the tool list. "playtest-server" is the
- * harness running inside a live test DataModel: it registers nothing and exists only so calls
- * that need a running game have somewhere to go.
+ * The same plugin loads into every DataModel Studio has open, so one Studio window produces one
+ * "plugin" session for the edit DataModel plus, while a playtest runs, a "server" session and one
+ * "client" session per test client. Only the edit session owns the tool list; the others exist so
+ * a call that names a live context has a real DataModel to run in.
  */
-export type SessionRole = "plugin" | "playtest-server";
+export type SessionRole = "plugin" | "server" | "client";
 
 export interface HelloParams {
 	token: string;
@@ -56,7 +62,9 @@ export interface HelloParams {
 	revision?: number;
 	/** Defaults to "plugin". */
 	role?: SessionRole;
-	/** A peer sends the sessionId of the plugin that spawned it, which is what pairs the two. */
+	/** Play Solo is one DataModel that is both server and client, so it registers as both. */
+	alsoClient?: boolean;
+	/** A peer sends the edit session's sessionId, which is what pairs the two. */
 	linkId?: string;
 }
 
@@ -185,7 +193,7 @@ function normalizeSchema(value: unknown, label: string): Record<string, unknown>
 	return schema;
 }
 
-const TAG_FLAGS = ["readOnly", "destructive", "idempotent", "external"] as const;
+const TAG_FLAGS = ["readOnly", "destructive", "idempotent", "external", "internal"] as const;
 
 function validateTags(value: unknown, label: string): ToolTags | undefined {
 	if (value === undefined || isEmptyTable(value)) return undefined;

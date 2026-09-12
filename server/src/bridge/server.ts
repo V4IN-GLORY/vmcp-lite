@@ -17,6 +17,7 @@ import {
 	type ToolsChangedParams,
 } from "../protocol.js";
 import { rojoMap, type ScriptHash } from "../rojo.js";
+import { routeFor, ownerOf } from "./routing.js";
 import { Session } from "./session.js";
 import type { SessionRegistry } from "./registry.js";
 
@@ -96,10 +97,14 @@ function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegist
 			return;
 		}
 
-		// Anything addressed to the peer passes straight through. The plugin can't reach a test
-		// DataModel itself, so this is the only way it can tell its own playtest anything.
-		if (msg.method.startsWith("peer/")) {
-			if (session.peer?.isOpen) session.peer.forward(msg.method, msg.params);
+		if (msg.method.startsWith("ctx/")) {
+			handleContext(socket, msg, session, registry);
+			return;
+		}
+
+		if (msg.method === "tool/invoke") {
+			// A notification would have nowhere to put the answer, and the answer is the point.
+			if ("id" in msg) void invokeTool(socket, msg as JsonRpcRequest, session, registry);
 			return;
 		}
 
@@ -138,12 +143,15 @@ function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegist
 		clearTimeout(handshakeTimer);
 		if (!session) return;
 		session.dispose(reason);
-		if (session.role === "playtest-server") {
+		if (session.role !== "plugin") {
 			registry.detachPeer(session);
 			return;
 		}
-		// A plugin going away takes its peer with it -- the test DataModel dies with the window.
-		session.peer?.closeSocket(VmcpCloseCode.Superseded, "the Studio window closed");
+		// An edit session going away takes its playtest with it -- those DataModels die with the
+		// Studio window they belong to.
+		for (const peer of [session.peers.server, ...session.peers.clients]) {
+			peer?.closeSocket(VmcpCloseCode.Superseded, "the Studio window closed");
+		}
 		registry.remove(session);
 	};
 
@@ -209,23 +217,124 @@ function handleHello(
 		session.reportedRevision = params.revision;
 	}
 
-	if (params.role === "playtest-server") {
+	if (params.role === "server" || params.role === "client") {
+		session.alsoClient = params.alsoClient === true;
 		session.role = params.role;
 		session.linkId = params.linkId;
-		// A peer that can't find its plugin is an orphan from a Studio window that already closed,
-		// and nothing will ever call it.
-		if (!registry.attachPeer(session)) {
-			replyError(socket, msg, VmcpErrorCode.NoSession, `no plugin session "${params.linkId}" to attach to`);
+		// A peer that can't find its edit session is an orphan from a Studio window that already
+		// closed, and nothing will ever call it.
+		const index = registry.attachPeer(session);
+		if (index === undefined) {
+			replyError(socket, msg, VmcpErrorCode.NoSession, `no edit session "${params.linkId}" to attach to`);
 			reject(socket, "unattached playtest peer");
 			return undefined;
 		}
-		replyOk(socket, msg, { protocolVersion: PROTOCOL_VERSION });
+		// The index is how a client learns which player it is; nothing in a DataModel can tell it.
+		replyOk(socket, msg, { protocolVersion: PROTOCOL_VERSION, peerIndex: index });
 		return session;
 	}
 
 	registry.add(session);
 	replyOk(socket, msg, { protocolVersion: PROTOCOL_VERSION });
 	return session;
+}
+
+/**
+ * The timeline's shared context. Every DataModel in a playtest reaches it through here, because
+ * the socket is the only thing they have in common — see bridge/context.ts.
+ */
+function handleContext(
+	socket: WebSocket,
+	msg: IncomingMessage,
+	caller: Session,
+	registry: SessionRegistry,
+): void {
+	const owner = ownerOf(caller, (id) => registry.get(id));
+	if (!owner) {
+		replyError(socket, msg, VmcpErrorCode.NoSession, "no edit session holding a context");
+		return;
+	}
+
+	const params = ((msg as JsonRpcRequest).params ?? {}) as {
+		key?: string;
+		value?: unknown;
+		from?: string;
+		at?: number;
+		text?: string;
+	};
+	const context = owner.context;
+
+	switch ((msg as JsonRpcRequest).method) {
+		case "ctx/set":
+			if (typeof params.key !== "string") {
+				replyError(socket, msg, VmcpErrorCode.InvalidParams, "ctx/set needs a key");
+				return;
+			}
+			context.set(params.key, params.value, params.from ?? caller.role, params.at ?? 0);
+			replyOk(socket, msg);
+			return;
+		case "ctx/get":
+			replyOk(socket, msg, { value: typeof params.key === "string" ? context.get(params.key) : undefined });
+			return;
+		case "ctx/note":
+			if (typeof params.text === "string") context.note(params.text);
+			replyOk(socket, msg);
+			return;
+		case "ctx/clear":
+			context.clear();
+			replyOk(socket, msg);
+			return;
+		case "ctx/snapshot":
+			replyOk(socket, msg, context.snapshot());
+			return;
+		default:
+			replyError(socket, msg, VmcpErrorCode.MethodNotFound, `unknown context method "${(msg as JsonRpcRequest).method}"`);
+	}
+}
+
+/** How deep a tool calling a tool calling a tool is allowed to go before it's a loop. */
+const MAX_INVOKE_DEPTH = 4;
+
+/**
+ * A tool asking the server to run another tool. This is what makes a timeline able to do more than
+ * one thing: an event in a client DataModel can call get_tree, or run_luau against the server, and
+ * read the answer in the same snippet.
+ */
+async function invokeTool(
+	socket: WebSocket,
+	msg: JsonRpcRequest,
+	caller: Session,
+	registry: SessionRegistry,
+): Promise<void> {
+	const params = (msg.params ?? {}) as { name?: string; arguments?: unknown; depth?: number };
+	const depth = typeof params.depth === "number" ? params.depth : 0;
+	if (depth >= MAX_INVOKE_DEPTH) {
+		replyError(socket, msg, VmcpErrorCode.InvalidRequest, `tools are ${depth} deep — this is a loop`);
+		return;
+	}
+
+	const owner = ownerOf(caller, (id) => registry.get(id));
+	if (!owner) {
+		replyError(socket, msg, VmcpErrorCode.NoSession, "this session has no edit session to resolve tools against");
+		return;
+	}
+	if (typeof params.name !== "string" || !owner.getTool(params.name)) {
+		replyError(socket, msg, VmcpErrorCode.InvalidParams, `no tool named "${String(params.name)}"`);
+		return;
+	}
+
+	const args = (params.arguments ?? {}) as Record<string, unknown>;
+	const { target, problem } = routeFor(owner, args);
+	if (!target) {
+		replyError(socket, msg, VmcpErrorCode.NoSession, problem ?? "nowhere to run that");
+		return;
+	}
+
+	try {
+		replyOk(socket, msg, { result: await target.call(params.name, { ...args, __depth: depth + 1 }) });
+	} catch (err) {
+		replyError(socket, msg, VmcpErrorCode.InternalError, (err as Error).message);
+	}
 }
 
 function replyOk(socket: WebSocket, msg: IncomingMessage, extra: Record<string, unknown> = {}): void {

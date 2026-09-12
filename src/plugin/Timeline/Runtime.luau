@@ -1,14 +1,16 @@
 --!strict
 
--- Copied into the place as ReplicatedStorage.VMCPHarness.Runtime before a test starts, so both
--- harnesses can require it. The plugin never requires this file itself -- it reads the Source and
--- injects it -- but it lives here as a real module so luau-lsp still checks it.
+-- The two halves of running a timeline inside one DataModel: the shared context, and the clock.
 --
--- Three things: the context every event shares, the clock that fires events, and the input
--- helpers. Input is here rather than in the payload because every raw VirtualInput call can
--- throw, and a key pressed with no matching release stays down for the rest of the run.
+-- The context isn't held here. The edit DataModel, the test server and each test client are
+-- separate processes running separate copies of this plugin, so the socket back to VMCP is the
+-- only thing all of them can touch -- every read and write is a round trip. That's slower than a
+-- table and it's the only version that's actually correct, so treat `ctx.thing` as a network read
+-- and pull it into a local if you need it more than once.
 
 local UserInputService = game:GetService("UserInputService")
+
+local Bridge = require(script.Parent.Parent.Bridge)
 
 local Runtime = {}
 
@@ -16,55 +18,46 @@ export type Event = {
 	at: number,
 	blocking: boolean?,
 	label: string?,
-	run: (ctx: any, input: any) -> ...any,
+	run: (ctx: any, input: any, vmcp: any) -> ...any,
 }
 
-export type Write = { at: number, from: string, key: string }
+local DEFAULT_AWAIT = 5
+-- Await polls instead of waiting on a signal, because what it's waiting for may be set in another
+-- process entirely. Every tick is a round trip, so this is deliberately slower than a frame.
+local AWAIT_POLL = 0.05
 
-type Store = {
-	values: { [string]: any },
-	writes: { Write },
-	notes: { string },
-	origin: string,
-	publish: (key: string, value: any) -> (),
-	awaitTimeout: number,
-}
-
--- Reading a key another context set is the normal case, so `ctx.thing` has to mean "the shared
--- value" and not "a field on the proxy". Everything real hides behind rawget.
 local Methods = {}
 
-local function store(self: any): Store
-	return rawget(self, "__store") :: Store
+local function origin(self: any): string
+	return rawget(self, "__origin") :: string
 end
 
 -- Blocks until another context sets `key`. This is what turns a racy read into something the
--- payload declares rather than a coin flip. A miss is recorded, so an assertion that fails
--- because the value never arrived says so instead of quietly reading nil.
+-- payload declares rather than a coin flip, and a miss is recorded -- so an assertion that fails
+-- because the value never arrived says so, instead of quietly reading nil.
 function Methods.Await(self: any, key: string, timeout: number?): any
-	local state = store(self)
-	local limit = timeout or state.awaitTimeout
+	local limit = timeout or DEFAULT_AWAIT
 	local deadline = os.clock() + limit
 
 	repeat
-		local value = state.values[key]
+		local value = Bridge.CtxGet(key)
 		if value ~= nil then
 			return value
 		end
-		task.wait()
+		task.wait(AWAIT_POLL)
 	until os.clock() >= deadline
 
-	table.insert(state.notes, string.format('[%s] Await("%s") gave up after %ss', state.origin, key, tostring(limit)))
+	Bridge.CtxNote(`[{origin(self)}] Await("{key}") gave up after {limit}s`)
 	return nil
 end
 
 function Methods.Note(self: any, text: string)
-	local state = store(self)
-	table.insert(state.notes, `[{state.origin}] {text}`)
+	Bridge.CtxNote(`[{origin(self)}] {text}`)
 end
 
-function Methods.Snapshot(self: any): { [string]: any }
-	return table.clone(store(self).values)
+function Methods.Snapshot(_: any): { [string]: any }
+	local snapshot = Bridge.CtxSnapshot()
+	return if snapshot then snapshot.values else {}
 end
 
 local Proxy = {
@@ -73,42 +66,16 @@ local Proxy = {
 		if method then
 			return method
 		end
-		return store(self).values[key]
+		return Bridge.CtxGet(key)
 	end,
 	__newindex = function(self: any, key: string, value: any)
-		local state = store(self)
-		state.values[key] = value
-		-- Stamped at the origin, not on arrival, so the merged log still orders correctly when a
-		-- client's write reaches the server after a later server write.
-		table.insert(state.writes, { at = workspace:GetServerTimeNow(), from = state.origin, key = key })
-		state.publish(key, value)
+		Bridge.CtxSet(key, value, origin(self))
 	end,
 }
 
--- `origin` names this context in the log; `publish` sends a write out to everyone else.
-function Runtime.Context(origin: string, publish: (key: string, value: any) -> (), awaitTimeout: number?): any
-	local state: Store = {
-		values = {},
-		writes = {},
-		notes = {},
-		origin = origin,
-		publish = publish,
-		awaitTimeout = awaitTimeout or 5,
-	}
-	return setmetatable({ __store = state }, Proxy)
-end
-
--- Applies a write that arrived from another context, without echoing it straight back out.
-function Runtime.Receive(ctx: any, key: string, value: any)
-	store(ctx).values[key] = value
-end
-
-function Runtime.Notes(ctx: any): { string }
-	return store(ctx).notes
-end
-
-function Runtime.Writes(ctx: any): { Write }
-	return store(ctx).writes
+-- `where` names this context in the write log: "plugin", "server", "client 2".
+function Runtime.Context(where: string): any
+	return setmetatable({ __origin = where }, Proxy)
 end
 
 -- How late an event may fire before it's worth mentioning. A frame of slop is normal; a tenth of
@@ -118,14 +85,14 @@ local OVERRUN = 0.1
 -- Fires each event when its time comes, then holds until `duration` so trailing effects land. A
 -- yielding event never delays the next one unless it asked to with `blocking`, which is what a
 -- setup step wants. Running late is recorded rather than silently shifting everything after it.
-function Runtime.Run(events: { Event }, ctx: any, input: any, duration: number, note: (string) -> ())
+function Runtime.Run(events: { Event }, ctx: any, input: any, vmcp: any, duration: number, note: (string) -> ())
 	table.sort(events, function(a, b)
 		return a.at < b.at
 	end)
 
 	local started = os.clock()
 	local function fire(event: Event)
-		local ok, err = pcall(event.run, ctx, input)
+		local ok, err = pcall(event.run, ctx, input, vmcp)
 		if not ok then
 			local label = if event.label then ` ({event.label})` else ""
 			note(`event at {event.at}s{label} failed: {err}`)

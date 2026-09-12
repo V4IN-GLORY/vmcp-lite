@@ -1,13 +1,15 @@
 ---
 name: vmcp-timeline
-description: Writing run_timeline payloads for VMCP — scheduling events across server and client, sharing state with ctx, driving real input, and asserting the result. Use when testing game behaviour that needs a running server, a real player, or timing.
+description: Writing batched run_timeline payloads for VMCP — scheduling Luau across Studio, a live server and live clients on one clock, sharing state through ctx, calling other tools mid-run, driving real input, and asserting the result. Use when debugging or testing anything that needs a running game, timing, or more than one context.
 ---
 
-# Writing a timeline
+# Timelines
 
-`run_timeline` starts its own playtest, plays a list of snippets on one clock, and ends with an
-assertion. Every run costs a few seconds of startup, so put everything you want to learn into one
-timeline rather than running several.
+`run_timeline` takes one JSON payload and plays it across three kinds of context at once. It is the
+cheapest thing in VMCP per unit of information: one call starts a playtest, runs code in Studio and
+in the real game, collects everything into a shared table, and judges the result.
+
+Prefer one timeline with ten events over ten separate `run_luau` calls. That's the whole point.
 
 ## Shape
 
@@ -16,104 +18,148 @@ timeline rather than running several.
   "players": 1,
   "duration": 1,
   "events": [
-    { "at": 0,   "context": "server", "blocking": true, "code": "..." },
-    { "at": 0.5, "context": "client", "player": 1,      "code": "..." },
-    { "at": 1.2, "context": "server", "code": "..." }
+    { "at": 0,   "context": "plugin", "blocking": true, "code": "..." },
+    { "at": 0.2, "context": "server", "code": "..." },
+    { "at": 0.5, "context": "client", "player": 1, "code": "..." }
   ],
-  "assertion": "return ctx.hit == true"
+  "assertion": "return ctx.stunned == false"
 }
 ```
 
 `at` is seconds from the start. `duration` is extra time held **after** the last event, for effects
-that land late — it is added to the schedule, not a total.
+that land late — it's added to the schedule, not a total.
 
-Each `code` runs as a function body with `ctx` and `input` in scope. `return` works.
+Each `code` runs as a function body with `ctx`, `input` and `vmcp` in scope. `return` works.
 
-## ctx: the only way contexts talk
+## The three contexts
 
-Write anywhere, read anywhere:
+| context | where it runs | what it's for |
+|---|---|---|
+| `plugin` | Studio's edit DataModel | anything needing plugin permissions — reading Source, `Instance.new` into the place, `get_build` |
+| `server` | the live playtest server | player state, server modules, remote handlers, authority checks |
+| `client` | a live test client | input, UI, local effects, sending remotes the way a player would |
+
+`plugin`-only payloads don't start a playtest at all. Any `server` or `client` event makes one start
+if none is open, and it's stopped again afterwards unless you pass `"keepOpen": true` or a playtest
+was already running when you called.
+
+## ctx: how contexts talk
+
+These are separate processes. `ctx` is held by the VMCP server and every read and write is a round
+trip — correct across all three, and **not free**. Pull a value into a local if you'll use it twice.
 
 ```lua
-ctx.spawnedAt = workspace:GetServerTimeNow()
+ctx.startHealth = humanoid.Health          -- write from anywhere
+local before = ctx:Await("startHealth", 2) -- read from anywhere else
 ```
 
-Reading is the trap. `ctx.thing` reads a local mirror, so a context always sees its own writes
-instantly but another context's write only once it has arrived. If you're reading something set
-somewhere else, **wait for it explicitly**:
+Reading is where payloads go wrong. `ctx.thing` reads whatever is there *right now*, which may be
+nothing yet:
 
 ```lua
 -- wrong: races, and reads nil about half the time
 if ctx.ready then ... end
 
 -- right: declares the dependency, and a miss is recorded in the report
-local ready = ctx:Await("ready", 2)
-if ready == nil then return end
+if ctx:Await("ready", 2) == nil then return end
 ```
 
 `Await` returns nil on timeout and writes a line into the report's notes, so an assertion that
-fails for that reason says so instead of just looking wrong.
+fails for that reason says so rather than just looking wrong.
 
-Also on `ctx`: `ctx:Note("text")` adds a line to the report, `ctx:Snapshot()` copies the whole
-table. A key named `Await`, `Note` or `Snapshot` collides with the method — pick another name.
+Also: `ctx:Note("text")` adds a line to the report, `ctx:Snapshot()` copies the whole table. A key
+named `Await`, `Note` or `Snapshot` collides with the method — pick another name.
 
-Every write is stamped at its origin, so the report's write list is in real order even when a
-client's message reaches the server after a later server write.
+## The assertion
+
+Runs in Studio **after** every context has finished, with `ctx` and `vmcp` in scope. Return `true`
+to pass. It is deliberately outside the timeline: it judges the run rather than being part of it.
+
+```json
+"assertion": "return ctx.stunEndedAt ~= nil and ctx.stunEndedAt - ctx.stunStartedAt < 3"
+```
+
+With no assertion the run passes unless a context outright failed.
+
+## vmcp: the library, in every event
+
+`vmcp.Tool(name, arguments)` calls **any other VMCP tool, in any context**, and returns `ok, text`.
+This is what makes a payload able to do more than one thing:
+
+```lua
+local ok, tree = vmcp.Tool("get_tree", { root = "Workspace.Arena", depth = 2 })
+ctx.arena = tree
+```
+
+```lua
+-- from a client event, ask the server something and read the answer here
+local ok, health = vmcp.Tool("run_luau", {
+    context = "server",
+    code = "return game.Players:GetPlayers()[1].Character.Humanoid.Health",
+})
+```
+
+`vmcp.Game.Require(path)` is the one for module debugging — see the `vmcp-debugging` skill.
+`vmcp.Remotes`, `vmcp.Exploit` and `vmcp.Bench` live there too. `vmcp.Build`, `vmcp.Rig`,
+`vmcp.Anim`, `vmcp.Canvas`, `vmcp.Style` and `vmcp.Serialize` are all in scope as well.
 
 ## input: client events only
 
-`input` drives the real input path, so keybinds, ContextActionService and UI all see it exactly as
-they'd see a person. Calling a handler directly skips all of that, which is usually the bug.
+Drives the real input path, so keybinds, ContextActionService and UI see it exactly as they'd see a
+person. Calling a handler directly skips everything the input path does on the way, which is
+usually where the bug is.
 
 ```lua
 input:Tap("W", 0.4)              -- press and release, always released
 input:Hold("LeftShift")          -- released at teardown if you forget
-input:Release("LeftShift")
 input:Click(640, 400)            -- "left" | "right" | "middle"
 input:Drag(100, 100, 300, 200)
 input:Type("hello")
 input:Scroll(640, 400, -3)
 ```
 
-Every one of these can throw — a click that lands on the topbar, a core-bound key like `Escape`, a
-button that's already down. Failures are recorded in the report's "input problems" and the run
-carries on; nothing kills the timeline.
+Every one of these can throw — a click on the topbar, a core-bound key like `Escape`, a button
+already down. Failures land in the report's notes and the run carries on.
 
 ## blocking
 
-An event normally fires and the schedule moves on, so a yielding event never delays the next one.
-`"blocking": true` makes the schedule wait for it. Use it for setup at `at: 0`, not for ordinary
-steps — a blocking event that runs long pushes everything after it, and the report says so.
+An event normally fires and the schedule moves on, so a yielding event never delays the next.
+`"blocking": true` makes the schedule wait. Use it for setup at `at: 0`, not for ordinary steps: a
+blocking event that runs long pushes everything after it, and the report says so.
 
-## Worked example
+## Worked example — the stun bug
 
-Press a movement key and check the character actually moved, rather than trusting the handler:
+"After using this skill the player is permanently stunned; find out why." One call:
 
 ```json
 {
   "players": 1,
-  "duration": 1,
+  "duration": 4,
   "events": [
-    { "at": 0, "context": "server", "blocking": true,
-      "code": "local p = game.Players:GetPlayers()[1]\nrepeat task.wait() until p.Character and p.Character.PrimaryPart\nctx.startX = p.Character.PrimaryPart.Position.X" },
-    { "at": 0.2, "context": "client", "player": 1,
-      "code": "ctx:Await('startX', 3)\ninput:Tap('W', 0.6)" },
-    { "at": 1.2, "context": "server",
-      "code": "local p = game.Players:GetPlayers()[1]\nctx.endX = p.Character.PrimaryPart.Position.X" }
+    { "at": 0, "context": "server", "blocking": true, "code":
+      "local p = game.Players:GetPlayers()[1]\nrepeat task.wait() until p.Character\nctx.ready = true" },
+
+    { "at": 0.3, "context": "client", "code":
+      "ctx:Await('ready', 5)\ninput:Tap('Q')" },
+
+    { "at": 0.5, "context": "server", "code":
+      "local ok, state = vmcp.Game.Require('ServerScriptService.Combat.StateModule')\nctx.rightAfter = state" },
+
+    { "at": 3.5, "context": "server", "code":
+      "local ok, state = vmcp.Game.Require('ServerScriptService.Combat.StateModule')\nctx.later = state\nlocal p = game.Players:GetPlayers()[1]\nctx.walkSpeed = p.Character.Humanoid.WalkSpeed" }
   ],
-  "assertion": "return math.abs(ctx:Await('endX', 2) - ctx.startX) > 1"
+  "assertion": "return ctx.walkSpeed > 0"
 }
 ```
 
-## What you get back
+Both module snapshots and the final WalkSpeed come back in one result, and `vmcp.Game.Require`
+reads the module the *running server* holds, not a fresh copy of it.
 
-PASS or FAIL with the assertion's own words, then the context at the end, the writes in order,
-any notes (including Await misses and late events), input problems, and output from both sides.
+## Limits worth knowing
 
-## Limits worth knowing before you write
-
-- **Client code cannot be sent to a running game.** A client DataModel has no `loadstring` and its
-  scripts aren't writable from a plugin. Anything a client does has to be in the payload. This is
-  why `run_luau` has no client context.
-- One playtest per Studio window. `run_timeline` refuses while a `playtest` session is open.
-- The whole payload is compiled before the test starts, so a syntax error is reported straight
-  away rather than turning into a test that silently does nothing.
+- One playtest per Studio window.
+- `ctx` values cross as JSON: strings, numbers, booleans and plain tables. An Instance or a
+  function won't survive — render it first with `vmcp.Serialize.Render(value)`.
+- Events are all compiled before the clock starts, so a syntax error stops the run up front
+  instead of blowing a hole in the middle of it.
+- 200 events per payload.

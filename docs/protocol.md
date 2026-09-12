@@ -318,32 +318,68 @@ hot-reload path while you're iterating.
 
 Omit `id` if you don't want a reply.
 
-## 7. `role` and `linkId` — playtest peers
+## 7. `role` and `linkId` — one plugin, several DataModels
 
-A second kind of client connects to the same bridge: the harness VMCP injects into a live playtest
-server. It sends `"role": "playtest-server"` in `session/hello`, along with `"linkId"` set to the
-**plugin's** `sessionId`. That pairing is the whole point — it tells the server which Studio window
-the running game belongs to.
+The plugin doesn't only run in the edit DataModel. Studio loads it into a playtest's server and
+into each test client too, so one Studio window opens several sessions on this bridge — the same
+code, detecting its own role:
 
-A peer registers no tools and never appears in the tool list. What it gets instead is routing: when
-an MCP call carries `"context": "server"` and the plugin that owns it has a live peer, the server
-sends that `tool/call` to the peer rather than to the plugin. With no peer, it goes to the plugin as
-usual, which runs the code in a one-shot test of its own.
-
-A peer whose `linkId` matches nothing is refused with `-32003` and closed — it's an orphan from a
-window that already went away. A plugin disconnecting closes its peer with `4000`.
-
-## 8. `peer/*` — the plugin talking to its own playtest
-
-A plugin can't reach a test DataModel at all, not even the one it started. Anything it needs to say
-goes through the server: a notification whose method starts with `peer/` is forwarded verbatim to
-that session's peer, with no reply either way.
-
-```json
-{ "jsonrpc": "2.0", "method": "peer/stop" }
+```lua
+local role = if RunService:IsEdit() then "plugin" elseif RunService:IsServer() then "server" else "client"
 ```
 
-If there's no peer, the message is dropped silently — there was nothing to tell.
+A playtest session sends that as `role`, plus `linkId` set to the **edit** session's `sessionId`.
+That pairing is the whole point: it tells the server which Studio window the running game belongs
+to. The edit session leaves both out and defaults to `"plugin"`.
+
+Play Solo is one DataModel that is both server and client, so it sends `role: "server"` with
+`alsoClient: true` and stands in as client 1 as well.
+
+Only the edit session's tool list is advertised — a peer knows the same tools, and listing them
+again would offer everything twice. What a peer gets instead is routing: a `tool/call` whose
+arguments carry `"context": "server"` or `"client"` goes to that DataModel rather than to the edit
+session. `context: "plugin"`, or no context at all, stays with the edit session.
+
+The reply to a peer's `session/hello` carries `peerIndex`: `0` for the server, 1-based for each
+client. Nothing inside a client DataModel can work out which player it is on its own.
+
+A peer whose `linkId` matches nothing is refused with `-32003` and closed. An edit session
+disconnecting closes its peers with `4000` — those DataModels die with the window anyway.
+
+## 8. `tool/invoke` and `ctx/*` — tools calling tools, and shared state
+
+Both of these exist because a timeline's contexts are separate processes. This socket is the only
+thing they have in common.
+
+**`tool/invoke`** lets a running tool call another one, in any context:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 9,
+  "method": "tool/invoke",
+  "params": { "name": "get_tree", "arguments": { "root": "Workspace.Arena", "context": "plugin" }, "depth": 0 }
+}
+```
+
+The server resolves the name against the **edit** session's tools (peers resolve through their
+`linkId`), routes on `arguments.context` exactly as an MCP call would, and replies with
+`{ "ok": true, "result": <tool result> }`. `depth` counts how deep the chain is; past 4 it's
+refused as a loop. Internal tools — anything tagged `internal` — are reachable here and never
+advertised to the MCP client.
+
+**`ctx/*`** is the timeline's shared context, held per edit session:
+
+| method | params | result |
+|---|---|---|
+| `ctx/set` | `key`, `value`, `from` | `ok` |
+| `ctx/get` | `key` | `value` |
+| `ctx/note` | `text` | `ok` |
+| `ctx/clear` | — | `ok` |
+| `ctx/snapshot` | — | `values`, `writes`, `notes` |
+
+Every write blocks until the server has it, so arrival order is write order and the server is the
+one clock all three DataModels agree on. Values cross as JSON.
 
 ## 9. `source/drift` — the plugin asking the server
 

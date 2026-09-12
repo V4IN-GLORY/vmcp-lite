@@ -5,9 +5,15 @@
 -- messages to Dispatch.
 --
 -- Bridge.Init(toolFolder, settings)   settings: { GetPlaceGuid: () -> string }
--- Bridge.Connect(port, token)
+-- Bridge.Connect(port, token, as)     as: { role, linkId, alsoClient } -- the edit session omits it
 -- Bridge.Disconnect()                 deliberate; stops retrying
 -- Bridge.OnStatus(fn)                 fn(signal, word, line) -- drives the Panel
+-- Bridge.Invoke(name, arguments)      call another tool, in any context, through the server
+-- Bridge.Ctx*                         the timeline's shared context, which the server holds
+--
+-- One Studio window runs several of these. The plugin loads into the edit DataModel and, while a
+-- playtest is on, into the test server and every test client as well -- same code, different role
+-- in the handshake. That is how a call for a live context reaches a real running game.
 --
 -- The reconnect rule is not the one in docs/protocol.md. That table says to skip retrying on
 -- close codes 1008 and 4000, but WebStreamClient's Closed event carries no arguments at all, so
@@ -48,6 +54,11 @@ local state = {
 	backoff = BACKOFF_START,
 	connectedAt = 0,
 	flaps = 0,
+	role = "plugin",
+	linkId = nil :: string?,
+	alsoClient = false,
+	-- Assigned by the server: 0 for a test server, 1+ for each test client.
+	peerIndex = nil :: number?,
 	toolFolder = nil :: Instance?,
 	getPlaceGuid = nil :: (() -> string)?,
 	onStatus = nil :: ((signal: string, word: string, line: string) -> ())?,
@@ -164,6 +175,9 @@ local function openSocket()
 				placeId = placeId,
 				placeName = placeName,
 				tools = Registry.definitions,
+				role = state.role,
+				linkId = state.linkId,
+				alsoClient = state.alsoClient,
 			},
 		})
 	end)
@@ -200,6 +214,7 @@ local function openSocket()
 			state.handshakeOk = true
 			state.backoff = BACKOFF_START
 			state.flaps = 0
+			state.peerIndex = if message.result then message.result.peerIndex else nil
 			local count = #Registry.definitions
 			report("Live", "connected", `{count} tool{if count == 1 then "" else "s"} registered.`)
 			return
@@ -272,12 +287,6 @@ function scheduleRetry()
 	end)
 end
 
--- Fires a message at the server with no reply expected. Peer commands go this way: nothing comes
--- back, all that matters is that the running test hears about it.
-function Bridge.Notify(method: string, params: { [string]: any }): boolean
-	return (send({ jsonrpc = "2.0", method = method, params = params }))
-end
-
 -- Asks the server a question and waits for the answer. The server can reach the filesystem and
 -- the plugin can't, which is the only reason this direction exists.
 --
@@ -322,9 +331,15 @@ function Bridge.OnStatus(fn: (signal: string, word: string, line: string) -> ())
 	state.onStatus = fn
 end
 
-function Bridge.Connect(port: string, token: string)
+-- `as` is how a playtest DataModel says which one it is. The edit session leaves it out.
+function Bridge.Connect(port: string, token: string, as: { role: string, linkId: string, alsoClient: boolean? }?)
 	state.port = port
 	state.token = token
+	if as then
+		state.role = as.role
+		state.linkId = as.linkId
+		state.alsoClient = as.alsoClient == true
+	end
 	state.wantConnected = true
 	state.backoff = BACKOFF_START
 	state.flaps = 0
@@ -337,10 +352,55 @@ function Bridge.Disconnect()
 	report("Idle", "not connected", "Disconnected.")
 end
 
--- What a playtest harness needs baked into it to call home: the same port and token this socket
--- is using, and this session's id, which is what pairs the peer with this window.
-function Bridge.Connection(): { port: string?, token: string?, sessionId: string }
-	return { port = state.port, token = state.token, sessionId = state.sessionId }
+function Bridge.Connection(): { port: string?, token: string?, sessionId: string, role: string, peerIndex: number? }
+	return {
+		port = state.port,
+		token = state.token,
+		sessionId = state.sessionId,
+		role = state.role,
+		peerIndex = state.peerIndex,
+	}
+end
+
+-- Calls another tool, in whatever context `arguments.context` names, through the server. This is
+-- what lets a timeline event in a test client ask the edit session for a tree dump, or push work
+-- onto the server and read the answer in the same snippet.
+function Bridge.Invoke(name: string, arguments: { [string]: any }?, timeout: number?): (boolean, any)
+	local ok, payload = Bridge.Request("tool/invoke", {
+		name = name,
+		arguments = arguments or {},
+		depth = Dispatch.CurrentDepth(),
+	}, timeout)
+	if not ok then
+		return false, payload
+	end
+	return true, payload.result
+end
+
+-- The timeline's shared context. It lives on the server because the edit DataModel, the test
+-- server and each test client are separate processes -- this socket is the only thing they share.
+function Bridge.CtxSet(key: string, value: any, from: string): boolean
+	-- No timestamp: every write blocks until the server has it, so arrival order is write order
+	-- and the server is the only clock all three DataModels agree on.
+	return (Bridge.Request("ctx/set", { key = key, value = value, from = from }, 5))
+end
+
+function Bridge.CtxGet(key: string): any
+	local ok, payload = Bridge.Request("ctx/get", { key = key }, 5)
+	return if ok then payload.value else nil
+end
+
+function Bridge.CtxNote(text: string): boolean
+	return (Bridge.Request("ctx/note", { text = text }, 5))
+end
+
+function Bridge.CtxClear(): boolean
+	return (Bridge.Request("ctx/clear", {}, 5))
+end
+
+function Bridge.CtxSnapshot(): any
+	local ok, payload = Bridge.Request("ctx/snapshot", {}, 10)
+	return if ok then payload else nil
 end
 
 function Bridge.IsConnected(): boolean

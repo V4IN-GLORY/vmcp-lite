@@ -1,11 +1,14 @@
 --!strict
 --!optimize 2
 
--- Runs a chunk of Luau in the plugin's own context.
+-- Compiles and runs a chunk of Luau in the plugin's own context.
 --
--- `loadstring` isn't available here, so the chunk becomes a ModuleScript that gets required and
--- thrown away. Fresh every call is the whole trick: `require` caches by instance, so reusing one
--- would hand back the first run's result forever no matter what the source says now.
+-- `loadstring` isn't involved and doesn't need to be: a plugin has PluginSecurity in whatever
+-- DataModel it's loaded into, so it can write a ModuleScript's Source and require it. That works
+-- in the edit DataModel and in a playtest alike, with LoadStringEnabled off.
+--
+-- Fresh every call is the whole trick: `require` caches by instance, so reusing one would hand
+-- back the first run's result forever no matter what the source says now.
 --
 -- The scratch folder lives in CoreGui, not the place. CoreGui isn't saved, so a crash mid-run
 -- leaves nothing behind to commit and nothing for Rojo to fight with.
@@ -43,7 +46,8 @@ end
 local INJECTION_DENIED = "Studio won't let VMCP create scripts, so run_luau can't work. Open the "
 	.. "Plugins ribbon, click Plugin Management, and allow script injection for VMCP."
 
-local function build(source: string): (ModuleScript?, string?)
+-- Returns a ModuleScript holding `source`, parented into the scratch folder.
+function Inject.Module(source: string): (ModuleScript?, string?)
 	counter += 1
 	local ok, created = pcall(function()
 		local module = Instance.new("ModuleScript")
@@ -54,68 +58,65 @@ local function build(source: string): (ModuleScript?, string?)
 	if not ok then
 		return nil, `{INJECTION_DENIED} ({created})`
 	end
-	return created, nil
+
+	local module = created :: ModuleScript
+	module.Parent = folder()
+	return module, nil
 end
 
 -- Wrapping in a function is what lets a snippet with no `return` work at all -- a ModuleScript
 -- body that returns nothing is a hard require error. The wrapper stays on line 1 so a syntax
 -- error still reports the snippet's own line numbers.
-local function wrap(source: string): string
-	return `return function(vmcp) {source}\nend`
+local function wrap(source: string, parameters: string): string
+	return `return function({parameters}) {source}\nend`
 end
 
--- Compiles source without running anything past its top level. The timeline payload is nothing
--- but closures, so requiring it is a syntax check and nothing more -- which is the difference
--- between catching the model's typo here and watching a test start with a dead harness in it.
-function Inject.Check(source: string): (boolean, string?)
-	local module, refusal = build(source)
+-- Compiles without running past the top level, and hands back the callable. Separating this from
+-- running is what lets a timeline check its whole payload before the playtest starts, and compile
+-- each event once instead of once per firing.
+function Inject.Compile(source: string, parameters: string?): (((...any) -> ...any)?, string?)
+	local module, refusal = Inject.Module(wrap(source, parameters or "vmcp"))
 	if not module then
-		return false, refusal
+		return nil, refusal
 	end
-	module.Parent = folder()
 
-	local ok, failure = pcall(require, module)
+	local ok, chunk = pcall(require, module)
 	pcall(function()
 		module:Destroy()
 	end)
-	return ok, if ok then nil else tostring(failure)
+	if not ok then
+		return nil, tostring(chunk)
+	end
+	return chunk :: any, nil
 end
 
 -- Returns ok plus either the snippet's return value or the failure text. `env` is handed to the
 -- snippet as its `vmcp` argument.
 function Inject.Run(source: string, env: { [string]: any }?, timeout: number?): (boolean, any)
-	local module, refusal = build(wrap(source))
-	if not module then
+	local chunk, refusal = Inject.Compile(source)
+	if not chunk then
 		return false, refusal
 	end
-	module.Parent = folder()
 
 	local ok, produced = false, nil :: any
 	local done = false
 	local thread = task.spawn(function()
-		local loaded, chunk = pcall(require, module)
-		if loaded then
-			ok, produced = pcall(chunk, env or {})
-		else
-			produced = chunk
-		end
+		ok, produced = pcall(chunk, env or {})
 		done = true
 	end)
 
 	-- A snippet that yields forever would otherwise wedge the plugin until Studio restarts. A
 	-- tight loop with no yield still hangs everything, and nothing in Luau can preempt that.
-	local deadline = os.clock() + (timeout or DEFAULT_TIMEOUT)
+	local limit = timeout or DEFAULT_TIMEOUT
+	local deadline = os.clock() + limit
 	while not done and os.clock() < deadline do
 		task.wait()
 	end
 	if not done then
 		pcall(task.cancel, thread)
-		ok, produced = false, `the snippet was still running after {timeout or DEFAULT_TIMEOUT}s and was cancelled`
+		return false, `the snippet was still running after {limit}s and was cancelled`
 	end
 
-	pcall(function()
-		module:Destroy()
-	end)
 	return ok, produced
 end
 

@@ -1,5 +1,6 @@
 import type { WebSocket } from "ws";
 import { config, log } from "../config.js";
+import { SharedContext } from "./context.js";
 import {
 	VmcpCloseCode,
 	VmcpErrorCode,
@@ -45,10 +46,14 @@ export class Session {
 	reportedRevision?: number;
 
 	role: SessionRole = "plugin";
-	/** Set on a peer: the sessionId of the plugin whose playtest it belongs to. */
+	/** Set on a peer: the sessionId of the edit session whose playtest it belongs to. */
 	linkId?: string;
-	/** Set on a plugin: its live playtest peer, while one is running. */
-	peer?: Session;
+	/** Play Solo is one DataModel wearing both hats, so it answers to server and client alike. */
+	alsoClient = false;
+	/** Set on an edit session: the live playtest DataModels, while a playtest is running. */
+	readonly peers: { server?: Session; clients: Session[] } = { clients: [] };
+	/** Only the edit session's copy is ever used — peers reach it through their linkId. */
+	readonly context = new SharedContext();
 
 	constructor(
 		private readonly socket: WebSocket,
@@ -86,12 +91,6 @@ export class Session {
 			this.pending.set(id, call);
 			this.socket.send(JSON.stringify({ jsonrpc: "2.0", id, method: "tool/call", params: { name, arguments: args } }));
 		});
-	}
-
-	/** One-way, no reply: how a plugin's peer commands reach the test DataModel it spawned. */
-	forward(method: string, params: unknown): void {
-		if (this.closed) return;
-		this.socket.send(JSON.stringify({ jsonrpc: "2.0", method, params }));
 	}
 
 	private startTimer(id: number, name: string, timeoutMs: number): NodeJS.Timeout {

@@ -12,6 +12,7 @@ import { RETRY_KEY, type ToolDefinition, type ToolResult } from "./protocol.js";
 import { runPostProcess } from "./postprocess.js";
 import { RetryCache } from "./retry-cache.js";
 import type { ExposedTool, SessionRegistry } from "./bridge/registry.js";
+import { routeFor } from "./bridge/routing.js";
 import type { ProgressUpdate, Session } from "./bridge/session.js";
 
 const OFFLINE_NOTE = "[place not open in Studio] ";
@@ -46,10 +47,8 @@ export async function startMcp(registry: SessionRegistry): Promise<Server> {
 		}
 
 		const args = (request.params.arguments ?? {}) as Record<string, unknown>;
-		// A call that names a live game context belongs to the playtest peer, not the plugin --
-		// the plugin can't reach a test DataModel at all. With no peer open it stays with the
-		// plugin, which spins up a one-shot session itself.
-		const target = wantsLiveGame(args) && session.peer?.isOpen ? session.peer : session;
+		const { target, problem } = routeFor(session, args);
+		if (!target) return errorResult(problem ?? "nowhere to run that");
 		const cacheKey = retryKeyFor(exposed, args);
 		if (cacheKey) {
 			const cached = retries.get(cacheKey);
@@ -122,10 +121,6 @@ function finish(result: ToolResult): ToolResult {
 	return { ...rest, content: [...rest.content, { type: "text", text: outcome }] };
 }
 
-function wantsLiveGame(args: Record<string, unknown>): boolean {
-	return args.context === "server" || args.context === "client";
-}
-
 function advertise(exposed: ExposedTool): Tool {
 	const { tool } = exposed;
 	const advertised: Tool = {
@@ -170,6 +165,7 @@ function toAnnotations(tags: ToolDefinition["tags"]): ToolAnnotations | undefine
 	if (tags.destructive !== undefined) annotations.destructiveHint = tags.destructive;
 	if (tags.idempotent !== undefined) annotations.idempotentHint = tags.idempotent;
 	if (tags.external !== undefined) annotations.openWorldHint = tags.external;
+	// `internal` is ours; MCP has no equivalent and these tools are never advertised anyway.
 	return Object.keys(annotations).length > 0 ? annotations : undefined;
 }
 

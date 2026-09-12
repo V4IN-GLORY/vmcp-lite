@@ -50,21 +50,39 @@ export class SessionRegistry extends EventEmitter {
 	}
 
 	/**
-	 * A peer hangs off the plugin session that spawned it rather than joining the registry: it
-	 * registers no tools, so listing it would only ever produce an empty contributor.
+	 * A playtest DataModel hangs off the edit session rather than joining the registry. It runs the
+	 * same plugin and knows the same tools, but listing it would advertise every tool a second
+	 * time — what it's actually for is being somewhere a call can be sent.
+	 *
+	 * Returns the client index, 1-based, or 0 for the server peer.
 	 */
-	attachPeer(peer: Session): boolean {
+	attachPeer(peer: Session): number | undefined {
 		const plugin = peer.linkId ? this.sessions.get(peer.linkId) : undefined;
-		if (!plugin) return false;
+		if (!plugin) return undefined;
 
-		plugin.peer = peer;
-		log(`playtest peer attached to ${plugin.placeName}`);
-		return true;
+		if (peer.role === "server") {
+			plugin.peers.server = peer;
+			// Play Solo is a single DataModel that is both, so it stands in as client 1 too.
+			if (peer.alsoClient) plugin.peers.clients.push(peer);
+			log(`playtest server attached to ${plugin.placeName}`);
+			return 0;
+		}
+
+		plugin.peers.clients.push(peer);
+		const index = plugin.peers.clients.length;
+		log(`playtest client ${index} attached to ${plugin.placeName}`);
+		return index;
 	}
 
 	detachPeer(peer: Session): void {
 		const plugin = peer.linkId ? this.sessions.get(peer.linkId) : undefined;
-		if (plugin?.peer === peer) plugin.peer = undefined;
+		if (!plugin) return;
+
+		if (plugin.peers.server === peer) plugin.peers.server = undefined;
+		// Spliced rather than blanked, so client 2 becomes client 1 when the first one leaves and
+		// a payload aimed at "the only client" still lands.
+		const index = plugin.peers.clients.indexOf(peer);
+		if (index >= 0) plugin.peers.clients.splice(index, 1);
 	}
 
 	add(session: Session): void {
@@ -137,6 +155,8 @@ export class SessionRegistry extends EventEmitter {
 		for (const [index, contributor] of contributors.entries()) {
 			const prefix = prefixes[index];
 			for (const tool of contributor.tools) {
+				// Internal tools are still callable through tool/invoke; they just aren't offered.
+				if (tool.tags?.internal) continue;
 				const exposedName = prefix ? `${prefix}__${tool.name}` : tool.name;
 				const exposed: ExposedTool = {
 					exposedName,

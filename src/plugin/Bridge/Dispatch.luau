@@ -21,7 +21,19 @@ local function textResult(text: string, isError: boolean?): { [string]: any }
 	return result
 end
 
+-- How deep the tool on this thread already is. A tool calling another tool passes the count on so
+-- the server can tell a chain from a loop. Weak keys so a finished call isn't held alive.
+local depthByThread: { [thread]: number } = setmetatable({}, { __mode = "k" }) :: any
+
+function Dispatch.CurrentDepth(): number
+	return depthByThread[coroutine.running()] or 0
+end
+
 local function runTool(send: Send, id: any, name: string, arguments: any)
+	depthByThread[coroutine.running()] = if type(arguments) == "table" and type(arguments.__depth) == "number"
+		then arguments.__depth
+		else 0
+
 	local tool = Registry.byName[name]
 	if not tool then
 		send({ jsonrpc = "2.0", id = id, result = textResult(`no tool named "{name}"`, true) })
