@@ -79,7 +79,8 @@ function Methods.Content(self: any): Content
 	return Content.fromObject(self.image)
 end
 
--- Hand this back from a run_luau snippet as `postProcess` and the VMCP server replays it to a PNG.
+-- What vmcp.Render sends to the VMCP server, which replays it to a PNG. Returning it from a
+-- run_luau snippet as `postProcess` does the same thing on the way out.
 function Methods.Recording(self: any): { [string]: any }
 	return { kind = "png", width = self.width, height = self.height, ops = self.ops }
 end

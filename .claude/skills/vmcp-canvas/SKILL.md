@@ -25,7 +25,7 @@ label.ImageContent = canvas:Content()
 label.Parent = game:GetService("StarterGui"):FindFirstChildOfClass("ScreenGui")
 
 -- And write it to disk
-return { postProcess = canvas:Recording() }
+vmcp.Render(canvas, "health-bar")
 ```
 
 Every method chains and takes an optional trailing alpha (0-1, default 1). `Line` takes a
@@ -33,14 +33,20 @@ thickness instead.
 
 ## Getting a file out
 
-Returning `{ postProcess = canvas:Recording() }` from a `run_luau` snippet is the whole mechanism.
-The server rasterizes the recording and writes a PNG under `~/.vmcp/images/`, then appends the
-path to the tool's output. Add a name to control the filename:
+`vmcp.Render(canvas, name)` sends the recording to the VMCP server, which rasterizes it, writes a
+PNG under `~/.vmcp/images/` and hands back the path. It works from **any context and from inside a
+timeline event**, which is the reason to prefer it.
 
 ```lua
-local recording = canvas:Recording()
-recording.name = "health-bar"
-return { postProcess = recording }
+local ok, where = vmcp.Render(canvas, "health-bar")
+ctx.icon = where
+```
+
+The other way is to return the directive from a `run_luau` snippet, which does the same thing on
+the way out:
+
+```lua
+return { postProcess = canvas:Recording() }
 ```
 
 Names are letters, digits, underscore and hyphen only — anything else gets a timestamp instead.

@@ -379,6 +379,16 @@ end
 
 -- The timeline's shared context. It lives on the server because the edit DataModel, the test
 -- server and each test client are separate processes -- this socket is the only thing they share.
+-- Asks the VMCP server to finish something this side can't: writing a Canvas recording out as a
+-- PNG. A tool result can carry the same directive back, but a timeline event isn't a tool result.
+function Bridge.Post(directive: { [string]: any }): (boolean, string)
+	local ok, payload = Bridge.Request("post/process", directive, 30)
+	if not ok then
+		return false, tostring(payload)
+	end
+	return true, tostring(if type(payload) == "table" then payload.outcome else payload)
+end
+
 function Bridge.CtxSet(key: string, value: any, from: string): boolean
 	-- No timestamp: every write blocks until the server has it, so arrival order is write order
 	-- and the server is the only clock all three DataModels agree on.

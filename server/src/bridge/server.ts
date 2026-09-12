@@ -16,6 +16,7 @@ import {
 	type RevisionParams,
 	type ToolsChangedParams,
 } from "../protocol.js";
+import { runPostProcess, settle } from "../postprocess.js";
 import { rojoMap, type ScriptHash } from "../rojo.js";
 import { routeFor, ownerOf } from "./routing.js";
 import { Session } from "./session.js";
@@ -99,6 +100,19 @@ function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegist
 
 		if (msg.method.startsWith("ctx/")) {
 			handleContext(socket, msg, session, registry);
+			return;
+		}
+
+		if (msg.method === "post/process") {
+			// A snippet asking this server to finish something it can't do itself -- writing a
+			// Canvas recording out as a PNG. A tool result can carry the same directive, but a
+			// timeline event isn't a tool result, so it asks directly.
+			const directive = (msg as JsonRpcRequest).params as Record<string, unknown> | undefined;
+			if (!directive || typeof directive !== "object") {
+				replyError(socket, msg, VmcpErrorCode.InvalidParams, "post/process needs a directive");
+				return;
+			}
+			replyOk(socket, msg, { outcome: runPostProcess(directive) ?? "nothing to do" });
 			return;
 		}
 
@@ -331,7 +345,10 @@ async function invokeTool(
 	}
 
 	try {
-		replyOk(socket, msg, { result: await target.call(params.name, { ...args, __depth: depth + 1 }) });
+		// Through the same finishing pass as a direct MCP call, so a snippet that draws a Canvas
+		// gets the PNG written whichever side asked for the tool.
+		const result = settle(await target.call(params.name, { ...args, __depth: depth + 1 }));
+		replyOk(socket, msg, { result });
 	} catch (err) {
 		replyError(socket, msg, VmcpErrorCode.InternalError, (err as Error).message);
 	}

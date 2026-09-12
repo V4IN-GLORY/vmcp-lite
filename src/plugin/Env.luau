@@ -24,6 +24,18 @@ local Env = {
 -- the payload having to be split into three separate calls first.
 --
 -- Returns ok plus the text; a tool that reported an error comes back as false with its own words.
+-- Writes a Canvas out as a PNG on the VMCP server, which is the only side with a filesystem.
+-- Works from any context and from inside a timeline event, where returning a directive isn't an
+-- option. `name` becomes the file name; leave it out and it gets a timestamped one.
+function Env.Render(canvas: any, name: string?): (boolean, string)
+	local recording = if type(canvas) == "table" and canvas.Recording then canvas:Recording() else canvas
+	if type(recording) ~= "table" then
+		return false, "Render wants a Canvas, or the table its Recording() gave you"
+	end
+	recording.name = name
+	return Bridge.Post(recording)
+end
+
 function Env.Tool(name: string, arguments: { [string]: any }?): (boolean, string)
 	local reached, result = Bridge.Invoke(name, arguments, 120)
 	if not reached then

@@ -440,7 +440,23 @@ genuinely can't do, which so far means writing a file:
 
 The server carries it out, appends a line of text saying what happened, and strips the directive —
 the MCP client never sees it. An unrecognised `kind` says so in that line rather than failing the
-call. Deliberately narrow: this is the only place the relay acts on a result instead of passing it
+call. This happens on every path a result takes out of the plugin, including a result travelling
+back through `tool/invoke`, so a snippet gets its file whichever side asked for the tool.
+
+### `post/process` — the same thing, without a result to ride on
+
+A timeline event isn't a tool call, so it has nowhere to put a directive. Plugin to server:
+
+```json
+{ "jsonrpc": "2.0", "id": 7, "method": "post/process",
+  "params": { "kind": "png", "name": "health-bar", "width": 256, "height": 256, "ops": [] } }
+```
+
+The reply is `{ "outcome": "[wrote the image to ...]" }` — the same line that would have been
+appended to a tool result. Any session may call it, so an image drawn on a test client is written
+by the same server that wrote one drawn in Studio.
+
+Deliberately narrow: these two are the only places the relay acts on content instead of passing it
 through.
 
 ## Luau gotchas

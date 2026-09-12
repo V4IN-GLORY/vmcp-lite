@@ -503,6 +503,16 @@ end
 
 -- The timeline's shared context. It lives on the server because the edit DataModel, the test
 -- server and each test client are separate processes -- this socket is the only thing they share.
+-- Asks the VMCP server to finish something this side can't: writing a Canvas recording out as a
+-- PNG. A tool result can carry the same directive back, but a timeline event isn't a tool result.
+function Bridge.Post(directive: { [string]: any }): (boolean, string)
+	local ok, payload = Bridge.Request("post/process", directive, 30)
+	if not ok then
+		return false, tostring(payload)
+	end
+	return true, tostring(if type(payload) == "table" then payload.outcome else payload)
+end
+
 function Bridge.CtxSet(key: string, value: any, from: string): boolean
 	-- No timestamp: every write blocks until the server has it, so arrival order is write order
 	-- and the server is the only clock all three DataModels agree on.
@@ -741,6 +751,18 @@ local Env = {
 -- the payload having to be split into three separate calls first.
 --
 -- Returns ok plus the text; a tool that reported an error comes back as false with its own words.
+-- Writes a Canvas out as a PNG on the VMCP server, which is the only side with a filesystem.
+-- Works from any context and from inside a timeline event, where returning a directive isn't an
+-- option. `name` becomes the file name; leave it out and it gets a timestamped one.
+function Env.Render(canvas: any, name: string?): (boolean, string)
+	local recording = if type(canvas) == "table" and canvas.Recording then canvas:Recording() else canvas
+	if type(recording) ~= "table" then
+		return false, "Render wants a Canvas, or the table its Recording() gave you"
+	end
+	recording.name = name
+	return Bridge.Post(recording)
+end
+
 function Env.Tool(name: string, arguments: { [string]: any }?): (boolean, string)
 	local reached, result = Bridge.Invoke(name, arguments, 120)
 	if not reached then
@@ -2169,7 +2191,8 @@ function Methods.Content(self: any): Content
 	return Content.fromObject(self.image)
 end
 
--- Hand this back from a run_luau snippet as `postProcess` and the VMCP server replays it to a PNG.
+-- What vmcp.Render sends to the VMCP server, which replays it to a PNG. Returning it from a
+-- run_luau snippet as `postProcess` does the same thing on the way out.
 function Methods.Recording(self: any): { [string]: any }
 	return { kind = "png", width = self.width, height = self.height, ops = self.ops }
 end

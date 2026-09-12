@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { config, log } from "./config.js";
+import type { ToolResult } from "./protocol.js";
 import { encodePng, rasterize, type Recording } from "./image.js";
 
 /**
@@ -44,4 +45,18 @@ export function runPostProcess(directive: Directive): string | undefined {
 	} catch (err) {
 		return `[couldn't write the image: ${(err as Error).message}]`;
 	}
+}
+
+/**
+ * Every path a tool result can take back out of the plugin goes through here, so a Canvas
+ * recording gets written whether the MCP client called the tool or another context did through
+ * `tool/invoke`. The directive itself never travels on — it was addressed to this server.
+ */
+export function settle(result: ToolResult): ToolResult {
+	const { postProcess, ...rest } = result;
+	if (!postProcess) return result;
+
+	const outcome = runPostProcess(postProcess);
+	if (!outcome) return rest;
+	return { ...rest, content: [...rest.content, { type: "text", text: outcome }] };
 }

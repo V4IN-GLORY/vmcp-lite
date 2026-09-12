@@ -9,7 +9,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { log } from "./config.js";
 import { RETRY_KEY, type ToolDefinition, type ToolResult } from "./protocol.js";
-import { runPostProcess } from "./postprocess.js";
+import { settle } from "./postprocess.js";
 import { RetryCache } from "./retry-cache.js";
 import type { ExposedTool, SessionRegistry } from "./bridge/registry.js";
 import { routeFor } from "./bridge/routing.js";
@@ -69,7 +69,7 @@ export async function startMcp(registry: SessionRegistry): Promise<Server> {
 					};
 
 		try {
-			const result = withRevisionNotice(finish(await target.call(exposed.tool.name, args, onProgress)), session);
+			const result = withRevisionNotice(settle(await target.call(exposed.tool.name, args, onProgress)), session);
 			// Only a real reply is cached — a timeout is exactly what's worth retrying.
 			if (cacheKey) retries.set(cacheKey, result);
 			return result;
@@ -108,18 +108,6 @@ function withRevisionNotice(result: ToolResult, session: Session): ToolResult {
 	};
 }
 
-/**
- * Carries out a postProcess directive and folds the outcome into the text the caller sees. The
- * directive itself never goes on to the MCP client — it was addressed to this server.
- */
-function finish(result: ToolResult): ToolResult {
-	const { postProcess, ...rest } = result;
-	if (!postProcess) return result;
-
-	const outcome = runPostProcess(postProcess);
-	if (!outcome) return rest;
-	return { ...rest, content: [...rest.content, { type: "text", text: outcome }] };
-}
 
 function advertise(exposed: ExposedTool): Tool {
 	const { tool } = exposed;
