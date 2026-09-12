@@ -9,7 +9,7 @@ local FONT_UI = "rbxasset://fonts/families/BuilderSans.json"
 local FONT_MONO = "rbxasset://fonts/families/RobotoMono.json"
 
 -- Theme-independent tokens, copied onto both theme sheets so no derive chain is needed.
-local SHARED = {
+local SHARED: { [string]: any } = {
 	Rad = UDim.new(0, 6),
 	RadBtn = UDim.new(0, 5),
 	FontUI = Font.new(FONT_UI, Enum.FontWeight.Medium),

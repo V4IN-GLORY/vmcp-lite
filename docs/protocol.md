@@ -382,8 +382,28 @@ failure into an `isError` result.
 
 ## Reconnecting
 
-Yours to handle — the server never dials out. Retry on `Closed` and `Error` with backoff,
-skipping `1008` and `4000` per the table above.
+Yours to handle — the server never dials out.
+
+**You can't read any of those close codes.** `WebStreamClient.Closed` fires with no arguments at
+all, so the table above describes what the server sent, not what your plugin can see. Only
+`Error(statusCode, message)` carries anything, and that's for failures while connecting.
+
+What you *can* see is whether the handshake ever succeeded, and that happens to split the table
+the right way:
+
+- **Closed before the `session/hello` reply** — every `1008` lands here, because a bad token,
+  bad version or non-JSON is refused during the handshake. Treat it as a configuration problem:
+  stop, say why, and make the user act. Retrying won't start working.
+- **Closed after a successful handshake** — the server stopped or the connection blipped. Retry
+  with backoff.
+
+`4000` is the one case that crosses the line: a supersede also arrives after a good handshake,
+so two Studio windows sharing a `sessionId` would retry each other forever. Cap it by counting
+closes that happen within a few seconds of connecting, and give up after a handful. That ends the
+fight without needing the code.
+
+Generate the `sessionId` per window and never persist it and this stays theoretical — it's only
+reachable when two windows genuinely share one.
 
 While you're disconnected your tools disappear from Claude's list. The server still caches
 your last registered list to `%USERPROFILE%\.vmcp\tools.json`, and setting
