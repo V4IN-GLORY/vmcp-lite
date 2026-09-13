@@ -628,4 +628,5 @@ property not on it is silently absent from `get_build` — first thing to check 
 comes back wrong.
 
 Limits: `get_build` `depth` 12, `maxNodes` 800; `apply_build` / `render_build` measure up to
-1500 parts. Prefer a narrow `root` over a bigger cap.
+1500 parts. Always pass `root` — the default is the whole Workspace, which hits the cap on any
+real place and measures everything that isn't the build. Prefer a narrow `root` over a bigger cap.

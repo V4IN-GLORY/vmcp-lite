@@ -165,12 +165,16 @@ local function wedge(parent, name, size, cf, role)  -- roofs and ramps only
 	return p
 end
 
+local function at(v) return typeof(v) == "CFrame" and v.Position or v end
+
 local function beamBetween(parent, name, a, b, w, h, role)  -- box with Z along a -> b
+	a, b = at(a), at(b)
 	local mid, len = (a + b) / 2, (b - a).Magnitude
 	return box(parent, name, Vector3.new(w, h or w, len), CFrame.lookAt(mid, b), role)
 end
 
 local function rodBetween(parent, name, a, b, r, role)  -- cylinder with X along a -> b
+	a, b = at(a), at(b)
 	local mid, len = (a + b) / 2, (b - a).Magnitude
 	return cyl(parent, name, r, len, CFrame.lookAt(mid, b) * CFrame.Angles(0, math.pi / 2, 0), role)
 end
@@ -393,8 +397,10 @@ local function steps(parent, name, cx, cz, width, tread, count, role)
 	for i = 1, count do
 		local top = PLINTH_TOP - (count - i)
 		local z0 = cz - tread * (count - i + 1)
-		box(parent, string.format("%s%d", name, i), Vector3.new(width, top, tread + 0.1),
-			CFrame.new(cx, top / 2, z0 + (tread + 0.1) / 2), role)
+		-- each step is a finger narrower and set a hair lower than the last, so no two faces line up
+		local h = top + i * 0.07
+		box(parent, string.format("%s%d", name, i), Vector3.new(width - i * 0.06, h, tread + 0.1),
+			CFrame.new(cx, top - h / 2, z0 + (tread + 0.1) / 2), role)
 	end
 end
 
@@ -878,16 +884,29 @@ local function tree(parent, name, x, z, scale, kind, lean)
 				tilt * CFrame.new(0, h * 0.55 + i * 2.2 * scale, 0) * CFrame.Angles(jit(0.08), jit(0.5), jit(0.08)), leaf)
 		end
 	else
-		for i = 1, 6 do
-			local w = (7.5 + jitAbs(4)) * scale
-			box(parent, string.format("%sCrown%d", name, i), Vector3.new(w, 2.6 * scale, w),
-				tilt * CFrame.new(jit(2.2), h * 0.95 + jitAbs(3.5) * scale, jit(2.2)) * CFrame.Angles(jit(0.25), jit(3.1), jit(0.25)), leaf)
+		for i = 1, 4 do   -- boughs first, so the crown has something to sit on
+			local a = i * 1.57 + jit(0.3)
+			box(parent, string.format("%sBough%d", name, i), Vector3.new(0.5 * scale, 0.5 * scale, 4.2 * scale),
+				tilt * CFrame.new(math.cos(a), h * 0.85, math.sin(a)) * CFrame.Angles(0.5, -a, 0), bark)
+		end
+		for i = 1, 5 do
+			local w = (8.0 + jitAbs(4.5)) * scale
+			box(parent, string.format("%sCrown%d", name, i), Vector3.new(w, (3.2 + jitAbs(1.6)) * scale, w * (0.75 + jitAbs(0.4))),
+				tilt * CFrame.new(jit(2.4), h * 0.92 + jitAbs(4.5) * scale, jit(2.4)) * CFrame.Angles(jit(0.25), jit(3.1), jit(0.25)), leaf)
 		end
 	end
 end
 
 phase(function(root)
 	local ground = model(root, "Ground")
+	-- the map floor: one slab, and a wider low skirt so the 150 stud edge reads as ground going on
+	box(ground, "Slab", Vector3.new(MAP, 3, MAP), CFrame.new(0, -1.5, 0), P.ground)
+	box(ground, "Skirt", Vector3.new(MAP + 40, 2, MAP + 40), CFrame.new(0, -3.4, 0), P.dirt)
+	for i = 1, 10 do
+		local w = 8 + jitAbs(14)
+		box(ground, string.format("Mound%d", i), Vector3.new(w, 1.1 + jitAbs(1.4), w * 0.8),
+			CFrame.new(jit(70), 0.4, jit(70)) * CFrame.Angles(0.03, jit(3.1), 0.03), P.ground)
+	end
 	-- worn paths: slabs laid a finger proud of the grass so they read as trodden ground
 	local function path(name, x, z, w, d, rot)
 		box(ground, name, Vector3.new(w, 0.14, d), CFrame.new(x, 0.07, z) * CFrame.Angles(0, math.rad(rot or 0), 0), P.dirt)
@@ -909,13 +928,17 @@ phase(function(root)
 	-- moss and leaf litter where the canopy is thick, and along the north wall
 	for i = 1, 10 do
 		local s = 2.5 + jitAbs(4)
-		box(ground, string.format("MossPatch%d", i), Vector3.new(s, 0.12, s * (0.6 + jitAbs(0.6))),
-			CFrame.new(jit(64) * (if i % 2 == 0 then 1 else -1), 0.06, -46 + jitAbs(90)) * CFrame.Angles(0, jit(3.1), 0), P.moss)
+		box(ground, string.format("MossPatch%d", i), Vector3.new(s, 0.16, s * (0.6 + jitAbs(0.6))),
+			CFrame.new(18 + jitAbs(16) * (if i % 2 == 0 then 1 else -1), 0.07, -30 + jitAbs(50)) * CFrame.Angles(0, jit(3.1), 0), P.moss)
 	end
 
 	-- ---- cemetery: irregular rows, varied stones, several of them down ------------------
 	local cem = model(root, "Cemetery")
-	box(cem, "Field", Vector3.new(66, 0.16, 32), CFrame.new(1, 0.08, 51), P.dirt)
+	for i = 1, 7 do   -- grave earth, patchy, so the burying ground is not one flat board
+		local w = 16 + jitAbs(14)
+		box(cem, string.format("Earth%d", i), Vector3.new(w, 0.14, 10 + jitAbs(8)),
+			CFrame.new(-24 + (i - 1) * 8 + jit(3), 0.07, 42 + (i % 3) * 9 + jit(3)) * CFrame.Angles(0, jit(0.5), 0), P.dirt)
+	end
 	local graves = {
 		{ -24, 39, "slab", -8 }, { -18, 44, "cross", 12 }, { -11, 38, "stub", 4 },
 		{ -4, 45, "slab", -14 }, { 4, 39, "fallen", 20 }, { 11, 46, "cross", -6 },
@@ -1102,10 +1125,11 @@ phase(function(root)
 	local function arm(name, shoulder, elbow, hand, r)
 		rodBetween(props, name .. "Upper", shoulder, elbow, r, bone)
 		rodBetween(props, name .. "Fore", elbow, hand, r * 0.85, bone)
-		box(props, name .. "Hand", Vector3.new(0.3, 0.22, 0.5), CFrame.lookAt(hand, hand + (hand - elbow)), bone)
+		local hPos, ePos = hand.Position, elbow.Position
+		box(props, name .. "Hand", Vector3.new(0.3, 0.22, 0.5), CFrame.lookAt(hPos, hPos + (hPos - ePos)), bone)
 		for i = 1, 3 do
 			box(props, string.format("%sFinger%d", name, i), Vector3.new(0.14, 0.14, 0.38),
-				CFrame.lookAt(hand + (hand - elbow).Unit * 0.3, hand + (hand - elbow)) * CFrame.new((i - 2) * 0.16, 0, 0), bone)
+				CFrame.lookAt(hPos + (hPos - ePos).Unit * 0.3, hPos + (hPos - ePos)) * CFrame.new((i - 2) * 0.16, 0, 0), bone)
 		end
 	end
 	local shR = chest * CFrame.new(-0.15, 0.75, -0.85)
@@ -1124,7 +1148,7 @@ phase(function(root)
 	local footL = hip * CFrame.new(0.5, 0.1, 2.1)
 	rodBetween(props, "ThighL", hip * CFrame.new(-0.4, 0.1, 0.4), kneeL, 0.24, bone)
 	rodBetween(props, "ShinL", kneeL, footL, 0.2, bone)
-	box(props, "GreaveL", Vector3.new(0.56, 0.56, 1.1), CFrame.lookAt((kneeL.Position + footL.Position) / 2, footL.Position), iron)
+	box(props, "GreaveL", Vector3.new(0.56, 0.56, 1.1), CFrame.lookAt((kneeL.Position + footL.Position) / 2, footL.Position), iron) -- guarded: both are CFrames here
 	box(props, "BootL", Vector3.new(0.6, 0.5, 1.4), CFrame.new(footL.Position + Vector3.new(0.4, -0.04, 0.5)) * CFrame.Angles(0, math.rad(35), 0), leather)
 	-- his helm came off and rolled: it lies a couple of studs away, dented
 	box(props, "Helm", Vector3.new(1.1, 0.95, 1.2), CFrame.new(6.4, ground + 0.5, -27.2) * CFrame.Angles(0.2, math.rad(28), 1.5), iron)
@@ -1219,7 +1243,7 @@ phase(function(root)
 		local beam = ensure(fx, string.format("Shaft%d", i), "Beam")
 		beam.Attachment0, beam.Attachment1 = a0, a1
 		beam.Width0, beam.Width1 = s[3], s[4]
-		beam.Color = s[5]
+		beam.Color = ColorSequence.new(s[5])
 		beam.LightEmission = 1
 		beam.FaceCamera = false
 		beam.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.82), NumberSequenceKeypoint.new(0.45, 0.9), NumberSequenceKeypoint.new(1, 1) })
@@ -1243,7 +1267,7 @@ phase(function(root)
 		dust.RotSpeed, dust.Rotation = NumberRange.new(-14, 14), NumberRange.new(0, 360)
 	end
 	-- ---- ground fog and candle smoke, restrained -----------------------------------------
-	local fogs = { { 0, 1.1, -6, 44, 30 }, { 0, 1.1, 26, 34, 24 }, { 0, 1.1, -44, 40, 26 }, { 0, 1.1, 52, 46, 30 } }
+	local fogs = { { -42, 1.3, -18, 34, 30 }, { 44, 1.3, 12, 32, 28 }, { 2, 1.3, -50, 40, 24 }, { 4, 1.3, 46, 40, 26 }, { 30, 1.3, 60, 34, 24 } }
 	for i, f in ipairs(fogs) do
 		local c = ensure(fx, string.format("FogCarrier%d", i), "Part")
 		c.Size, c.Anchored, c.CanCollide = Vector3.new(f[4], 1, f[5]), true, false

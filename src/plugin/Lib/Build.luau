@@ -374,7 +374,9 @@ function Build.Geometry(root: Instance, maxParts: number?): (Geometry, { BasePar
 		take(root)
 	end
 	for _, descendant in root:GetDescendants() do
-		if descendant:IsA("BasePart") then
+		-- Terrain is a BasePart the size of the world; on a Workspace root it would swallow the
+		-- bounds and the picture.
+		if descendant:IsA("BasePart") and not descendant:IsA("Terrain") then
 			take(descendant)
 		end
 	end
