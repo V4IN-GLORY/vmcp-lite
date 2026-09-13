@@ -113,6 +113,27 @@ What makes that source good, and what to hold yourself to:
   studs, not 2–40. Skip this only where sameness is the point: the crosses in a churchyard, the
   balusters on a rail, the columns down a nave. What varies and how far follows the prompt — a
   ruin gets damage, a kept garden doesn't.
+- **A material palette, not one material.** A whole building in Slate is a grey lump no matter
+  how well it's modelled — the eye needs the trim to read differently from the wall, the wall
+  from the base, the roof from both. Decide a palette up front, as a table the helpers pull from,
+  with a distinct material *and* colour per role:
+
+  ```lua
+  local P = {
+  	wall    = { Enum.Material.Limestone,   Color3.fromRGB(118, 112, 102) },
+  	plinth  = { Enum.Material.Cobblestone, Color3.fromRGB(78, 76, 70) },
+  	trim    = { Enum.Material.Sandstone,   Color3.fromRGB(150, 142, 128) },
+  	roof    = { Enum.Material.Slate,       Color3.fromRGB(58, 60, 66) },
+  	beam    = { Enum.Material.Wood,        Color3.fromRGB(62, 46, 32) },
+  	floor   = { Enum.Material.Marble,      Color3.fromRGB(96, 94, 90) },
+  }
+  ```
+
+  Rules of thumb: large flat surfaces get a low-contrast material (Limestone, Concrete, Brick,
+  Plaster) and only accents get the loud ones (Slate, Cobblestone, Rock); no single material on
+  more than about half the parts; two touching parts that are the same role can share a material,
+  two touching parts that are different roles shouldn't. Colour does half the work — the same
+  material at two shades reads as two things.
 - **Damage and variation as data.** A ruined wall is `tops = {26, 26, 20, 15, 24}` per bay fed to
   one helper, a roof is `{ {true, true}, {true, "half"}, {false, false} }` per segment. Same helper,
   a state table — not a second code path per broken thing.
