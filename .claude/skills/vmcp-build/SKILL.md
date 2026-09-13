@@ -124,15 +124,27 @@ Each pass, exactly:
    pulls a role from `P`.
 2. `apply_build`. Read the report. Every new problem line is either fixed or written down as
    intentional with the reason (rubble sits 20–30% in the ground on purpose).
-3. `render_build` narrowed to that group, with the view that answers the question:
-   `front` for a facade, `top` for a layout, `{ view = "front", at = <opening>, radius = 8,
-   clip = true }` for a doorway or window. Narrow `root` is the main lever — 40 parts with
-   badges tells you more than 1500 without.
+3. `render_build` narrowed to that group — one call, several panels, never a single view.
+   Pick the 2–4 spots in the group that matter (each opening, each join to a neighbour, the
+   top edge, the far side) and give each spot at least two angles that don't share an axis:
+   ```
+   render_build { root = "Workspace.Chapel.Shell", views = [
+     "front",                                                                  -- the whole group, proportions
+     { yaw = 135, pitch = 30, name = "back-iso" },                             -- the side you'd otherwise never see
+     { view = "front", at = "…Shell.Door", radius = 8, clip = true, name = "door-f" },
+     { yaw = 60, pitch = 20, at = "…Shell.Door", radius = 8, clip = true, name = "door-q" },
+     { view = "top",   at = "…Shell.Roof", radius = 14, name = "roof-top" },
+     { yaw = 200, pitch = 10, at = "…Shell.Roof", radius = 14, name = "roof-low" },
+   ] }
+   ```
+   A facade from `front` only can't show a slab floating off the wall top; the same spot from a
+   quarter angle and a low angle can. Narrow `root` is the main lever — 40 parts with badges
+   tells you more than 1500 without.
 4. Write down what the picture shows that's wrong, in words: "door leaf is half the opening
    width", "gap between roof slab 2 and 3", "stairs stop 2 studs short of the ledge".
 5. For each, find the derivation that produced it — nearly always a typed number that should
    have been computed, or a wedge/rotation facing the wrong way. Edit it.
-6. Re-apply, re-render the same spot from a *different* angle. Same angle twice tells you
+6. Re-apply, re-render the same spots from angles you have not used yet. Same angle twice tells you
    nothing new. When the report names a part (`37 sunk into 12`), render
    `{ at = <that part>, radius = 6, clip = true }` from two angles, not the whole build again.
 7. Repeat 4–6 until the group's problem lines are empty or all intentional, and the close-up
