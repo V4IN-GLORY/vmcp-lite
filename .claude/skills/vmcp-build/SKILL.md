@@ -1,45 +1,154 @@
 ---
 name: vmcp-build
-description: Building and editing areas of a Roblox place as Luau with VMCP — the whole build lives in one source you write and re-apply, apply_build runs it and hands back the geometry as numbers plus one blockout picture, get_build reads an existing region back as that same kind of source. Use when making, moving, retexturing or restructuring part of a build.
+description: Building and editing areas of a Roblox place as Luau with VMCP — the whole build lives in one source you write and re-apply, apply_build runs it and hands back the geometry as numbers plus a blockout picture, render_build draws any region from any angle without applying, get_build reads an existing region back as source. Use when making, moving, retexturing or restructuring part of a build.
 ---
 
 # Builds as code
 
 A build is a Luau source that makes it, and the source is the only thing you edit. Never place
-parts one call at a time, and never decide where something goes from a picture.
+parts one call at a time, and never decide where something goes from a picture. Code holds every
+part at once, so "is this wall where that pillar is" is two lines and a subtraction; a picture is
+one angle of one moment, and it's for *seeing* whether the numbers made the thing you meant.
 
-Why: a picture is one angle of one moment. Two of them don't add up to a 3D model in your head —
-you end up fixing the second one against the first and drifting. Code holds every part at once, so
-"is this wall in the same place as that pillar" is a question you answer by reading two lines and
-subtracting, not by squinting. The tools here exist to keep you in that mode.
+**HARD RULE: DO NOT TOUCH `game.Lighting`.** No properties, no new children (Sky, Atmosphere,
+Bloom, ColorCorrection, SunRays, DepthOfField, Clouds...), no deleting what's there — not from
+build source, not from `run_luau`, not "to make the picture better". The renderer ignores
+Lighting anyway. Only exception: the user names Lighting and asks. Lights, beams and emitters
+*inside* the build root are fine.
 
-**HARD RULE: DO NOT TOUCH `game.Lighting`.** No property changes (ClockTime, Ambient, Brightness,
-Technology, any of it), no new instances under it (Sky, Atmosphere, Bloom, ColorCorrection,
-SunRays, DepthOfField, anything), no deleting what's there. Not in the build source, not in a
-`run_luau` snippet, not "just to make the picture look better". The only exception is the user
-naming Lighting and asking for it. See "Leave `game.Lighting` alone" below.
-
-The loop, one tool call per pass:
+## The pipeline
 
 ```
-write the whole build as one source
-apply_build { code, root }       -> runs it, measures it, lists what's wrong, draws it
-read the numbers, then LOOK at the picture and say what's off in words
-render_build { root = <the group in question>, views = [...] }  -> a closer look when the whole-build iso can't answer it
-edit the source from the numbers and what you saw
-apply_build again                 -> only what changed moves
+1. DESIGN      think on paper: shape, structure, palette — before any code
+2. BLOCKOUT    whole build, rough sizes, no detail  -> apply_build -> numbers clean, iso reads
+3. DETAIL      one group per pass                   -> apply_build -> render_build aimed at that group
+               look, say what's off in words, edit the derivation, re-apply. Repeat until it reads.
+4. INSPECT     multi-view sweep of the finished build for occlusion, scale, and orientation bugs
 ```
 
-The picture is not optional and not decorative. It comes from VMCP's own renderer (see "The
-renderer" below), it is the only way you will ever see what you built, and a pass where you didn't
-open it and write down what you saw is a pass you did blind. Before every edit, state in one or
-two lines what the picture showed — "roof slabs sit above the wall tops but the gable is open at
-the apex", "trees are identical copies" — and let that drive the edit alongside the problem list.
+Every apply and render ends the same way: read the report, look at the picture, write one or two
+lines of what you saw ("roof slabs sit on the wall tops but the gable is open at the apex",
+"trees are identical copies"). A pass where you didn't open the picture and say what it showed
+was done blind. The picture and the numbers drive the next edit together; never read a
+coordinate off the picture — the legend has it.
+
+### 1. Design — think before the first line
+
+Spend real effort here; it's the cheapest place to be wrong. Write the answers down as the comment
+block at the top of the source, then build to them.
+
+**Shape.** What's the silhouette from 30 studs away? Name the three or four masses that make it
+(nave + tower + porch; hull + deck + mast) and their rough proportions to each other. What
+reads from the front, what from above? A build that's one box with things stuck on reads as a
+box with things stuck on.
+
+**Structure.** How does it stand up? Walls carry a roof, piers carry an arch, a beam spans an
+opening. Decide the load path and let it dictate sizes: a lintel is deeper than the wall is
+thick, a buttress is at the wall it braces, posts are under the thing they hold. Then decide the
+one set of numbers everything derives from (`W, D, H, T`, bay count, pitch) — every other
+dimension is arithmetic on those.
+
+**Material — and specifically where it goes.** A palette is a set of *roles*, and the design
+question is which surfaces get which role. Walk the build surface by surface:
+
+- Large flat areas (walls, floors, roof planes) get a low-contrast material — Limestone,
+  Concrete, Brick, Plaster, WoodPlanks. They're the background the eye rests on.
+- Loud, high-detail materials (Slate, Cobblestone, Rock, Metal, Marble) are for accents and
+  edges: plinths, trim, quoins, sills, a doorstep, the roof. Never on the whole wall.
+- A change of material marks a change of *thing*. Trim reads as trim because it isn't the wall's
+  material; a base course reads as a base because it isn't either. Two touching parts with
+  different roles don't share a material; two with the same role do.
+- Colour does half the work: the same material at two shades reads as two things. Pick a
+  distinct colour per role, not just a material.
+- Cap it: no single material on more than about half the parts. If one does, a role is missing.
+
+```lua
+local P = {
+	wall   = { Enum.Material.Limestone,   Color3.fromRGB(118, 112, 102) }, -- the big planes
+	plinth = { Enum.Material.Cobblestone, Color3.fromRGB(78, 76, 70) },    -- lowest 2 studs of every wall
+	trim   = { Enum.Material.Sandstone,   Color3.fromRGB(150, 142, 128) }, -- sills, quoins, string courses, 0.2 proud
+	roof   = { Enum.Material.Slate,       Color3.fromRGB(58, 60, 66) },
+	beam   = { Enum.Material.Wood,        Color3.fromRGB(62, 46, 32) },    -- lintels, rafters, door frame
+	floor  = { Enum.Material.Marble,      Color3.fromRGB(96, 94, 90) },
+}
+```
+
+The comment on each role is the placement decision. Helpers take a role, not a material.
+
+**Variety.** Which repeated things want variants (trees, stones, rubble — hand-shaped variants
+with numbers in a normal range, a tree is 8–14 studs not 2–40) and which want sameness
+(balusters, columns, churchyard crosses). A ruin gets damage as data (`tops = {26, 26, 20, 15}`
+per bay), a kept garden doesn't.
+
+### 2. Blockout
+
+Every group, rough masses, right palette on the big planes, no openings, no props. Apply it.
+Bounds and groups must match the design numbers and the problem list must be empty before you
+add anything — a shell that's wrong makes every detail wrong. Look at the iso: does the
+silhouette match what you wrote in the design block? If not, fix the masses now.
+
+### 3. Detail — iterate with the renderer
+
+One group per pass: shell → openings and roof → interior → props → effects. A real build runs
+to 800+ lines and won't fit one reply, so keep the source in a file and apply from there.
+
+After each apply, `render_build` narrowed to the group you just touched, with the view that
+answers the question — `front` for a facade, `top` for a layout, `{ yaw, pitch, at, radius,
+clip = true }` aimed at a doorway. Narrow `root` is the main lever: 40 parts with badges on
+tells you more than 1500 without. Then:
+
+- say in words what's off
+- find the derivation that produced it (it's nearly always a typed number that should have been
+  computed, or a wedge/rotation facing the wrong way)
+- edit, re-apply, render the same spot from a *different* angle — the same angle twice tells you
+  nothing new
+
+When the report says part 37 is sunk into part 12, the next render is
+`{ at = <that part>, radius = 6, clip = true }` from two angles, not the whole-build iso again.
+
+Stop a group when its problem lines are empty or every remaining one is meant (rubble sits 20–30%
+in the ground on purpose) and the close-up reads. Don't chase pixels: if it looks off but the
+numbers say it's where you put it, the question is whether you put it in the right place.
+
+### 4. Inspect — the photo sweep
+
+When every group is done, take a deliberate set of pictures of the whole build and hunt for the
+bugs that survive per-group passes because each pass only looked at its own group:
+
+```
+render_build { root = <whole build>, size = 768, views = [
+  "iso", { yaw = 225, pitch = 30, name = "iso-back" },   -- both diagonals
+  "front", "back", "left", "right",                       -- every elevation
+  "top",                                                  -- footprint
+] }
+```
+
+Then targeted panels at every place two groups meet — roof on wall, porch on facade, stairs on
+ledge, props against walls — with `clip = true` so the thing in front doesn't hide the join.
+
+What you're looking for, and it's a checklist, so go through it:
+
+- **Covered up.** A window the porch roof now hides, a door behind a buttress, a prop inside a
+  wall, a feature only visible from an angle nobody stands at. Compare elevations against the
+  design block: everything you named should be findable in at least one panel.
+- **Scale.** Doors 7–8 studs tall, steps ~1 rise, a chair seat ~2, a person is 5. Put a
+  reference next to anything that looks off. Check group against group — a porch that's a third
+  the height of the door it shelters, a tree taller than the tower when it shouldn't be.
+- **Orientation.** Wedges sloping the wrong way, a roof pitch that reads inverted from the back,
+  a spandrel rotated into the wall. The renderer models wedges as Roblox does, so a wedge that
+  looks backwards is backwards.
+- **Silhouette.** Does the back read as well as the front? Blank faces the design didn't intend?
+- **Material placement.** Does the trim read as trim from 30 studs? Is any one material a grey
+  lump across most of a panel? Did the plinth end up at the wrong height on one wall?
+- **Seams.** Flickering coplanar faces where a quoin sits flush instead of 0.3 proud; four
+  full-length walls crossing at corners instead of two long and two short.
+
+Fix in the source, re-apply, re-render only the panels that showed the problem. The sweep is
+done when every panel reads and every checklist item has a written "checked, fine" or a fix.
 
 ## The source
 
 `apply_build` runs the shape `get_build` produces: a chunk ending in `return function(root)`.
-Everything inside is yours. Write it like build code, not like a dump:
 
 ```lua
 local function ensure(parent, name, class)
@@ -53,120 +162,74 @@ local function ensure(parent, name, class)
 	return found
 end
 
-local function box(parent, name, size, cframe, props)
+local function box(parent, name, size, cframe, role)
 	local part = ensure(parent, name, "Part")
-	part.Size = size
-	part.CFrame = cframe
-	part.Anchored = true
-	for key, value in props or {} do part[key] = value end
+	part.Size, part.CFrame, part.Anchored = size, cframe, true
+	if role then part.Material, part.Color = role[1], role[2] end
 	return part
 end
 
 return function(root)
-	-- One set of numbers the rest derives from. Change the room here, not in twelve places.
-	local W, D, H, T = 40, 30, 12, 1       -- width, depth, height, wall thickness
+	local W, D, H, T = 40, 30, 12, 1       -- one set of numbers the rest derives from
 	local floorTop = 0
 
 	local shell = ensure(root, "Shell", "Model")
-	box(shell, "Floor", Vector3.new(W, T, D), CFrame.new(0, floorTop - T / 2, 0), { Material = Enum.Material.Concrete })
+	box(shell, "Floor", Vector3.new(W, T, D), CFrame.new(0, floorTop - T / 2, 0), P.floor)
 
-	-- Walls sit on the floor and meet at the corners by construction: their edges are computed
-	-- from W, D and T, so they can't overlap or leave a gap unless the arithmetic is wrong.
+	-- Walls meet at the corners by construction: edges come from W, D, T, so they can't
+	-- overlap or gap unless the arithmetic is wrong.
 	local wallY = floorTop + H / 2
-	box(shell, "North", Vector3.new(W, H, T), CFrame.new(0, wallY, -D / 2 + T / 2))
-	box(shell, "South", Vector3.new(W, H, T), CFrame.new(0, wallY,  D / 2 - T / 2))
-	box(shell, "West",  Vector3.new(T, H, D - 2 * T), CFrame.new(-W / 2 + T / 2, wallY, 0))
-	box(shell, "East",  Vector3.new(T, H, D - 2 * T), CFrame.new( W / 2 - T / 2, wallY, 0))
+	box(shell, "North", Vector3.new(W, H, T), CFrame.new(0, wallY, -D / 2 + T / 2), P.wall)
+	box(shell, "South", Vector3.new(W, H, T), CFrame.new(0, wallY,  D / 2 - T / 2), P.wall)
+	box(shell, "West",  Vector3.new(T, H, D - 2 * T), CFrame.new(-W / 2 + T / 2, wallY, 0), P.wall)
+	box(shell, "East",  Vector3.new(T, H, D - 2 * T), CFrame.new( W / 2 - T / 2, wallY, 0), P.wall)
 
 	local props = ensure(root, "Props", "Model")
 	for i = 1, 4 do
-		box(props, `Crate{i}`, Vector3.new(4, 4, 4), CFrame.new(-12 + i * 6, floorTop + 2, 8), { Material = Enum.Material.WoodPlanks })
+		box(props, `Crate{i}`, Vector3.new(4, 4, 4), CFrame.new(-12 + i * 6, floorTop + 2, 8), P.beam)
 	end
 	return root
 end
 ```
 
-What makes that source good, and what to hold yourself to:
+Hold yourself to:
 
-- **Derive positions, don't type them.** A part's position is `floorTop + size.Y / 2`, a wall's
-  edge is `W / 2 - T / 2`. Every literal you type is a place two parts can disagree. When the
-  problem list says something is floating or sunk in, the fix is nearly always a derivation that
-  was typed as a number.
-- **Size things by what they fit into.** A door leaf is `openingWidth / leaves` by
-  `springHeight`, a glass panel is the window bay minus the mullion, a lid is the crate top. A
-  prop with its own typed size next to an opening with derived numbers ends up the wrong
-  proportion every time, and the picture shows it before the report does.
-- **Name everything, and keep the names.** `ensure` updates by name, so re-applying moves only the
-  lines you changed. Rename a part and the old one stays behind — pass `clear = true` on that pass.
-- **Group into Models by what they are** — `Shell`, `Props`, `Stairs` — because the report
-  measures each top-level group and you want those measurements to mean something.
-- **Loops for repetition.** Four crates is a `for`, not four blocks. Fence posts, pillars,
-  stair steps: compute the step from the count and the span, and the last one lands exactly on the
-  far edge.
-- **Helpers at the top, geometry at the bottom.** `box`, `wedge`, `cylinder` — a few lines each.
-  The `return function(root)` body should read like a description of the place.
-- **Local frames for anything that isn't axis-aligned.** A helper takes a `frame` CFrame and
-  places every piece as `frame * CFrame.new(x, y, z)`. One `windowWall(frame, length, ...)` then
-  does the north wall, the east wall, the four 45° faces of an apse and every side of a tower. The
-  moment something rotates, this is the only way to keep deriving instead of doing trig by hand.
-- **Two-point helpers for "from here to there".** Fallen beams, chains, limbs, tree roots:
+- **Derive, don't type.** Position is `floorTop + size.Y / 2`, a wall edge is `W / 2 - T / 2`.
+  Every literal is a place two parts can disagree. "Floating" and "sunk" in the report are
+  almost always a typed number.
+- **Size by what it fits into.** A door leaf is `openingWidth / leaves`, a pane is the bay minus
+  the mullion, a lid is the crate top.
+- **Name everything, keep the names.** `ensure` updates by name, so re-applying moves only what
+  changed. Renamed a part? Pass `clear = true` that pass. A class change destroys and remakes.
+- **Group into Models by what they are** — the report measures each top-level group.
+- **Loops for repetition**; compute the step from count and span so the last one lands on the edge.
+- **Helpers at the top, geometry at the bottom.** The `return function(root)` body reads like a
+  description of the place.
+- **Local frames for anything rotated.** Helpers take a `frame` and place pieces as
+  `frame * CFrame.new(x, y, z)`; one `windowWall(frame, ...)` does every wall and every tower face.
+- **Two-point helpers** for beams, chains, roots:
   ```lua
   local function beamBetween(a, b, w) -- box with Z along a->b
   	return box(Vector3.new(w, w, (b - a).Magnitude), CFrame.lookAt((a + b) / 2, b))
   end
-  local function boneBetween(a, b, r) -- cylinder; its axis is X, so turn it onto Z
+  local function boneBetween(a, b, r) -- cylinders lie along X, so turn it onto Z
   	return cylinder(r, (b - a).Magnitude, CFrame.lookAt((a + b) / 2, b) * CFrame.Angles(0, math.pi / 2, 0))
   end
   ```
-- **Repeated things get real variety, not a seed on the same shape.** Twenty trees from one
-  helper with `jit()` on the rotation still read as twenty copies — same trunk, same three
-  branches, same canopy blob. A helper for a commonly placed item takes a *variant*, not just a
-  position: branch count and where they fork, a lean, a split trunk, a dead one, a stump; for
-  stone, moss patches, a crack, a chipped corner, ivy, a missing top. Pick from a small set of
-  hand-shaped variants and vary the numbers within a normal range for that thing — a tree is 8–14
-  studs, not 2–40. Skip this only where sameness is the point: the crosses in a churchyard, the
-  balusters on a rail, the columns down a nave. What varies and how far follows the prompt — a
-  ruin gets damage, a kept garden doesn't.
-- **A material palette, not one material.** A whole building in Slate is a grey lump no matter
-  how well it's modelled — the eye needs the trim to read differently from the wall, the wall
-  from the base, the roof from both. Decide a palette up front, as a table the helpers pull from,
-  with a distinct material *and* colour per role:
+- **Seed randomness** — `Random.new(1906)` plus small `jit()` helpers — so reruns are identical
+  and the report's numbers stay comparable between passes.
+- **Wedges**: `WedgePart` is full height at -Z, nothing at +Z; rotate about Y in multiples of
+  `math.pi / 2`. Cylinders lie along X.
+- Only set what differs from a fresh instance; `Anchored = true` always.
 
-  ```lua
-  local P = {
-  	wall    = { Enum.Material.Limestone,   Color3.fromRGB(118, 112, 102) },
-  	plinth  = { Enum.Material.Cobblestone, Color3.fromRGB(78, 76, 70) },
-  	trim    = { Enum.Material.Sandstone,   Color3.fromRGB(150, 142, 128) },
-  	roof    = { Enum.Material.Slate,       Color3.fromRGB(58, 60, 66) },
-  	beam    = { Enum.Material.Wood,        Color3.fromRGB(62, 46, 32) },
-  	floor   = { Enum.Material.Marble,      Color3.fromRGB(96, 94, 90) },
-  }
-  ```
+### Openings, arches, layered surfaces
 
-  Rules of thumb: large flat surfaces get a low-contrast material (Limestone, Concrete, Brick,
-  Plaster) and only accents get the loud ones (Slate, Cobblestone, Rock); no single material on
-  more than about half the parts; two touching parts that are the same role can share a material,
-  two touching parts that are different roles shouldn't. Colour does half the work — the same
-  material at two shades reads as two things.
-- **Damage and variation as data.** A ruined wall is `tops = {26, 26, 20, 15, 24}` per bay fed to
-  one helper, a roof is `{ {true, true}, {true, "half"}, {false, false} }` per segment. Same helper,
-  a state table — not a second code path per broken thing.
-- **Seed the randomness.** `local rng = Random.new(1906)` and small `jit(a)` / colour-jitter
-  helpers on top of it. Reruns are identical, so the report's numbers stay comparable between
-  passes, which is what the loop depends on.
-- **Wedges**: `WedgePart` is full height at its -Z face and slopes to nothing at +Z. Rotate with
-  `CFrame.Angles` about Y in multiples of `math.pi / 2` to point it. Cylinders lie along X.
-- **`ensure` a class change destroys and remakes** — that one is not an update.
+There is no hole tool. An opening is the wall built as pieces around the gap — plinth, band
+below the sill, a pier each side, the arch, spandrel wedges, a block to the wall top. Write it
+once as a helper.
 
-## Openings, arches, layered surfaces
-
-There is no hole tool. A window or doorway is the wall built as pieces around the gap — plinth,
-band below the sill, a pier each side, the arch, wedges filling the corners above it, a block
-from the arch top to the wall top. Write that once as a helper and every opening is a call.
-
-A pointed arch is two angled blocks plus a keystone. Offset the blocks *into* the opening, not
-outward, so the spandrel wedges above sit on the arch line with no overlap; the keystone is
-bigger than the blocks and hides where they cross at the apex:
+A pointed arch is two angled blocks plus a keystone, offset *into* the opening so the spandrels
+sit on the arch line with no overlap; the keystone is bigger and hides the crossing:
 
 ```lua
 -- frame: centre of the springing line, X along the span, Y up, Z through the wall
@@ -181,33 +244,19 @@ local function arch(parent, name, frame, span, rise, depth, thick)
 end
 ```
 
-Wedge recipes that come up constantly (a wedge's right angle is at the bottom of its -Z face):
+Wedge recipes (right angle is at the bottom of the -Z face):
 
-- spandrel — right angle at the top outer corner, hypotenuse on the arch line, `s = -1` left,
-  `1` right: `frame * CFrame.new(s * span / 4, rise / 2, 0) * CFrame.Angles(0, s * π/2, 0) * CFrame.Angles(π, 0, 0)`,
-  size `(depth, rise, span / 2)`
-- gable half — right angle at the bottom centre: size `(thick, rise, halfWidth)`, centre at
-  `x = s * halfWidth / 2`, `CFrame.Angles(0, s * π/2, 0)`
-- a sloped cap on a buttress or sill with the wall on the cap's -Z side: no rotation, the tall
-  face is already against the wall
+- spandrel — `frame * CFrame.new(s * span / 4, rise / 2, 0) * CFrame.Angles(0, s * π/2, 0) * CFrame.Angles(π, 0, 0)`,
+  size `(depth, rise, span / 2)`, `s = -1` left, `1` right
+- gable half — size `(thick, rise, halfWidth)`, centre `x = s * halfWidth / 2`, `CFrame.Angles(0, s * π/2, 0)`
+- sloped cap with the wall on the -Z side — no rotation
 
-Overlap rules the problem list can't tell you:
+Overlap rules the report can't tell you: a part hidden inside a solid is fine; two coplanar faces
+pointing the same way flicker, so quoins and trim sit 0.1–0.3 proud, a cap cylinder is 0.02
+thinner than its slab, four walls are two long and two short. Flush faces of *adjacent* parts
+are a join, not a bug.
 
-- A part hidden inside another solid is fine. Two overlapping volumes whose faces lie on the same
-  plane *and face the same way* flicker. So: a quoin or pilaster wrapping a corner goes 0.3 proud
-  on top, not flush; trim sits 0.1–0.3 proud of the wall; a rounded cap cylinder on a headstone is
-  0.02 thinner than the slab; a ring of four walls is two full-length and two short ones butting
-  between them, never four full-length ones crossing at the corners.
-- Flush faces of *adjacent* parts (pier next to pier, step on step) are fine — that's a join.
-- Rubble, roots, fallen drums and leaning stones sit 20–30% into the ground on purpose. Their
-  overlapping / floating lines are ones you meant.
-
-Only properties that differ from a fresh instance need setting; `Anchored = true` on every part
-because the default is false.
-
-## Reading the result
-
-`apply_build` answers in this order, and you should read it in this order:
+## Reading the report
 
 ```
 applied: 14 instance(s) under Workspace.Arena, 12 of them parts
@@ -215,74 +264,46 @@ bounds: 40x13x30 spanning x -20..20, y -1..12, z -15..15
 groups (direct children of the root):
   Shell  5 parts, 40x13x30 spanning x -20..20, y -1..12, z -15..15
   Props  4 parts, 22x4x4 spanning x -8..14, y 0..4, z 6..10
-
 2 thing(s) worth a look:
   Props.Crate3 -- overlapping: sunk about 2.00 studs into Workspace.Arena.Props.Crate2 along X
   Shell.East -- floating: 0.50 studs above Workspace.Arena.Shell.Floor
-
-legend (the number in the picture):
-  #1 Shell.Floor  40x1x30 at (0, -0.5, 0)
-  ...
-[wrote the image to .../images/arena.png]
+legend: #1 Shell.Floor 40x1x30 at (0, -0.5, 0) ...
 <the picture>
 ```
 
-**Bounds and groups** are the 3D identity of the build. Check them against what you meant: a
-`Props` group spanning `y 0..4` on a floor whose top is 0 is right; one spanning `y 2..6` is two
-studs high and you can see it without the picture. A group wider than the shell is poking through
-a wall.
+**Bounds and groups** are the build's 3D identity — a `Props` group at `y 2..6` on a floor whose
+top is 0 is two studs high, no picture needed. **Problems** carry the number to fix with:
 
-**Problems** are the fix list, and each one carries the number to fix with:
+| kind | the fix |
+|---|---|
+| overlapping, sunk `d` on axis A | move or shrink by `d` — usually a typed position |
+| floating `g` above X | lower by `g`, or it hangs on purpose |
+| off axis (< 5°) | degrees where radians were meant, or a near-miss rotation |
+| duplicate | loop ran twice, or two `ensure` share a name |
+| paper thin (< 0.1) | a size subtracted to nothing |
+| stranded (250+ studs) | a `*` that should be `+` |
 
-| kind | what it means | the fix |
-|---|---|---|
-| overlapping | sunk `d` studs into X along axis A | move or shrink by `d` on A — usually a typed position that should have been derived |
-| floating | `g` studs above X, or nothing under it | lower by `g`, or it's meant to hang and that's fine |
-| off axis | rotated under 5 degrees off square | a rotation computed from a near-miss, or a `CFrame.Angles` in degrees instead of radians |
-| duplicate | same name, size, position twice | the loop ran twice or two `ensure` calls share a name under different parents |
-| paper thin | a dimension under 0.1 | a size computed to nothing — check the subtraction |
-| stranded | 250+ studs from the rest | a coordinate off by a factor, or a `*` that should be `+` |
-
-Flush contact is not an overlap: parts sharing a face are fine. Only parts touching nothing at all
-get the floating check, so walls against walls don't cry wolf.
-
-Fog volumes and light-shaft emitters are `Transparency = 1` boxes that overlap everything; skip
-them when reading the overlap lines (and skip them yourself if you write your own check).
-
-**The picture** is for what numbers can't say: does the layout read, are the proportions right,
-is that shape what you pictured. Always look at it — every `apply_build` draws one, and
-`render_build` draws one without applying. Never substitute a Studio screenshot or a guess from
-reading the source back; the picture is the check, and a pass without looking at it isn't a pass.
+Flush contact isn't an overlap. Only parts touching nothing get the floating check. Fog volumes
+and light-shaft emitters are `Transparency = 1` boxes; skip their overlap lines.
 
 ## The renderer
 
-The picture comes from VMCP's own renderer (`server/src/scene.ts`), not from Studio. The plugin
-collects every part's CFrame, size, shape, colour and transparency; the server rasterizes them
-itself — no camera, no playtest, no screenshot, and it works with Studio minimised. What it draws:
+VMCP's own rasterizer (`server/src/scene.ts`), not Studio — works with Studio minimised.
 
-- **Orthographic, one scale across every panel.** A part is the same size wherever it sits, so two
-  panels compare directly and "is the door as tall as the frame" is answered by looking.
-- **Flat shading with a dark line on every part edge.** "Is that one part or three" is the question
-  being asked most of the time, so edges are drawn even where faces are flush. Lit from the camera,
-  so no view is the unlit side.
-- **Real shapes** for box, ball, cylinder and wedge — the wedge is modelled as Roblox's (tall face
-  at -Z), so a wedge that looks backwards in the picture *is* backwards. Meshes and unions draw as
-  their bounding box. Transparency draws as alpha. Lights, decals, beams and particles don't draw.
-- **Roblox's real material colormaps**, tinted by the part colour like the engine does, so brick
-  reads as brick and planks as planks. Fetched once per material from the MaximumADHD/Roblox-Materials
-  mirror into `~/.vmcp/materials/`; a material it doesn't have (Cardboard, Neon, ForceField...)
-  draws flat in the part colour. Plastic is always flat.
-- **A badge number on each part** matching the legend line the tool printed, so anything you can
-  see you can grep for by name. Badges go off above 40 parts unless forced with `badges = true`.
-- **Views**: `iso` (default), `corner`, `front`, `back`, `left`, `right`, `top`, `bottom`, or
-  `{ yaw, pitch, name }` in degrees for anything else. Up to 9, tiled into one sheet, each panel
-  labelled. `size` is pixels per panel, 128–1024, default 512; the sheet caps at 3072 wide so
-  many panels means smaller ones.
-- **Targeted views**: add `at` and `radius` to a view object to centre and scale that panel on
-  one spot instead of the whole build. `at` is `{x, y, z}` or a dotted path to a part or model
-  (its pivot is used); `radius` is studs from `at` to the panel edge. `clip = true` drops parts
-  whose centre is further than `radius` from `at`, so a wall between the camera and the spot
-  doesn't hide it. `view = "front"` picks a preset angle in place of `yaw`/`pitch`:
+- **Orthographic, one scale across panels**, so panels compare directly.
+- **Flat shading, dark line on every edge**, lit from the camera. "Is that one part or three" is
+  visible even where faces are flush.
+- **Real box / ball / cylinder / wedge**; meshes and unions as bounding boxes; transparency as
+  alpha. Lights, decals, beams, particles don't draw.
+- **Real material colormaps** tinted by part colour; materials it lacks (Cardboard, Neon,
+  ForceField) draw flat. Plastic is always flat.
+- **Badges** match the legend; off above 40 parts unless `badges = true`.
+- **Views**: `iso`, `corner`, `front`, `back`, `left`, `right`, `top`, `bottom`, or
+  `{ yaw, pitch, name }` in degrees. Up to 9 tiled into one sheet; `size` 128–1024 per panel,
+  default 512, sheet caps at 3072 wide.
+- **Targeted**: `at` (`{x, y, z}` or a dotted path, pivot used) + `radius` centres and scales
+  that panel; `clip = true` drops parts further than `radius` from `at`; `view = "front"` picks a
+  preset angle in place of yaw/pitch. Targeted panels have their own scale.
   ```
   render_build { root = "Workspace.Chapel", views = [
     "iso",
@@ -290,122 +311,25 @@ itself — no camera, no playtest, no screenshot, and it works with Studio minim
     { yaw = 30, pitch = 15, at = {12, 4, -20}, radius = 6, name = "sill" },
   ] }
   ```
-  A targeted panel has its own scale, so it doesn't compare 1:1 with the whole-build panels
-  next to it — that's the trade for being able to see the thing at all.
-- The PNG lands in the server's `images/` state directory under `name` (or a timestamp) and is
-  inlined in the reply when small enough; the tool prints the path either way.
+- PNG lands in the server's `images/` dir under `name`; inlined when small, path printed always.
 
-Use it on purpose, not just because it arrived:
+`front` / `left` for proportions, `top` for footprint, `iso` for whether it reads. Wedges and
+rotated parts are where the picture earns its keep — the report can't see a backwards spandrel.
 
-- **Custom angles for the thing in question.** A doorway on the south face wants
-  `{ yaw = 0, pitch = 10, name = "door" }` with `root` narrowed to that facade, not the whole map
-  at iso. Narrow `root` is the main lever: 40 parts with badges tells you more than 1500 without.
-- **Aim at the problem, don't re-render the whole thing.** When the report says part 37 is sunk
-  into part 12, or the last picture showed a gap you can't place, the next render is
-  `{ at = <that part's path>, radius = <a few studs>, clip = true }` from two angles — not the
-  same iso again hoping it reads better this time. Same angle twice tells you nothing new.
-- **`front` / `left` for proportions, `top` for footprint, `iso` for whether it reads.** Add a
-  second view when a specific question needs it; don't ask for six by habit — more panels is more
-  to reconcile, and the numbers already agree with themselves.
-- **`render_build` before touching a region that exists**, and again after a pass that changed
-  something you can't measure (a silhouette, a prop's proportions) without re-applying.
-- **Wedges and rotated parts are exactly where the picture earns its keep** — the problem list
-  can't tell you a spandrel is rotated into the wall or a roof slab slopes the wrong way; the
-  picture can, in one glance.
+## Existing regions
 
-Look at it, note what's off in words ("the door leaf is half the width of the opening", "the
-stairs don't reach the ledge"), then go back to the source and change the derivation. Don't read a
-coordinate off the picture — you have the legend for that.
+`get_build { root, depth }` returns the region as this same kind of source — a dump, one line per
+non-default property, not derived. Small edit: change lines, apply back. Restructure: read it for
+sizes and positions, write a derived source, apply with `clear = true`. `render_build` first,
+before touching anything that exists.
 
-## Passes
+Applying the same source to another root copies it; a missing last segment is created as a Model.
+`vmcp.Build.Problems(root)` / `vmcp.Build.Report(...)` are the same checks from `run_luau`.
 
-First pass: the whole build, blocked out — every group, rough sizes, no detail. Get the bounds and
-the problem list clean before adding anything. A shell that's right is cheap to detail and a shell
-that's wrong makes every detail wrong.
+Covers parts, meshes, decals, textures, attachments, lights, emitters, beams, surface
+appearances, GUI objects, attributes and tags. The dump's property list is curated, so a class
+property not on it is silently absent from `get_build` — first thing to check if a round-trip
+comes back wrong.
 
-Later passes: edit the source, re-apply. Because `ensure` updates by name, a pass that changes one
-group's numbers moves only that group. Keep the full source in your working memory across passes;
-it's the build.
-
-Every pass ends the same way: read the report, look at the picture, write what you saw. When a
-pass detailed one group (the facade, the interior, the trees), follow it with a `render_build`
-narrowed to that group with a view chosen for the question — `front` for a facade, `top` for a
-cemetery layout, `{ yaw, pitch }` aimed at a doorway — so the badges are on and the thing fills
-the panel. The whole-map iso is for composition; it can't tell you a door leaf is half the width
-of its frame or a spandrel is rotated into the wall, and those are the bugs that survive.
-
-A detailed build is big — a 150-stud map with a real building on it runs to 800+ lines, and that
-does not fit in one reply. Don't try. Do it as passes that each fit: shell → openings and roof →
-interior → props → effects. Keep the source in a file and apply from there rather than re-emitting
-the whole thing every pass.
-
-Stop when the problem list is empty or every remaining line is something you meant, and the
-picture reads. Don't chase the picture pixel by pixel — if a thing looks off but the numbers say
-it's where you put it, the question is whether you put it in the right place, and that's a source
-edit.
-
-## Reading a build that already exists
-
-`get_build` returns a region as this same kind of source:
-
-```
-get_build { root = "Workspace.Arena", depth = 4 }
-```
-
-It's a dump, one line per non-default property, `n1`, `n2` locals — readable but not derived.
-For a small edit, change the lines and `apply_build` it back. For a real restructure, read it for
-the sizes and positions, then write a derived source of your own and apply that with
-`clear = true`.
-
-`render_build` draws and measures a region without applying anything — same report, same picture,
-for looking at what's there before you touch it:
-
-```
-render_build { root = "Workspace.Arena", views = ["iso", "top"] }
-```
-
-`vmcp.Build.Problems(root)` and `vmcp.Build.Report(root, parts, badges, problems)` are the same
-checks from a `run_luau` snippet.
-
-## Copying a region
-
-The source is `function(root)`, so applying it elsewhere copies it:
-
-```
-apply_build { code = <the same source>, root = "Workspace.Arena2" }
-```
-
-A missing last segment is created as a Model.
-
-## Leave `game.Lighting` alone
-
-You are NOT meant to adjust anything in `game.Lighting`, and you are NOT meant to create new
-instances for it. Concretely, unless the user asks for it by name:
-
-- don't set any property on `game.Lighting` — ClockTime, TimeOfDay, Ambient, OutdoorAmbient,
-  Brightness, ColorShift, EnvironmentDiffuseScale, ShadowSoftness, Technology, FogEnd, any of it
-- don't `Instance.new` anything parented to it — Sky, Atmosphere, Bloom, ColorCorrection,
-  SunRays, DepthOfField, Clouds, BlurEffect
-- don't edit or destroy what's already under it
-- don't do it from `apply_build` source, `run_luau`, a timeline, or anywhere else
-
-A build is geometry under its root, full stop. The renderer doesn't use Lighting anyway, so
-changing it never improves the picture. Lights, beams and particle emitters *inside* the build are
-fine; they live under the root and get cleaned up with it. Lighting is place-wide state the user
-owns.
-
-## What it covers
-
-Parts and their geometry, material and appearance; meshes; decals and textures; attachments;
-lights; particle emitters and beams; surface appearances; GUI objects, text and image labels, and
-the common UI modifiers. Attributes and tags on everything.
-
-The dump's property list is curated — there's no way to enumerate properties from Luau — so a
-class property not on it is silently absent from `get_build`. If a region round-trips wrong,
-that's the first thing to check. Your own source has no such limit; set whatever you like.
-
-## Limits
-
-`get_build`: `depth` defaults to 12, `maxNodes` to 800. `apply_build` / `render_build` measure up
-to 1500 parts and say so if they stop early. Badges go off above 40 parts unless forced with
-`badges`. Prefer a narrow `root` over a big cap.
+Limits: `get_build` `depth` 12, `maxNodes` 800; `apply_build` / `render_build` measure up to
+1500 parts. Prefer a narrow `root` over a bigger cap.
