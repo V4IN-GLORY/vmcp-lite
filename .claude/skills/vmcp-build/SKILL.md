@@ -87,9 +87,73 @@ What makes that source good, and what to hold yourself to:
   far edge.
 - **Helpers at the top, geometry at the bottom.** `box`, `wedge`, `cylinder` — a few lines each.
   The `return function(root)` body should read like a description of the place.
+- **Local frames for anything that isn't axis-aligned.** A helper takes a `frame` CFrame and
+  places every piece as `frame * CFrame.new(x, y, z)`. One `windowWall(frame, length, ...)` then
+  does the north wall, the east wall, the four 45° faces of an apse and every side of a tower. The
+  moment something rotates, this is the only way to keep deriving instead of doing trig by hand.
+- **Two-point helpers for "from here to there".** Fallen beams, chains, limbs, tree roots:
+  ```lua
+  local function beamBetween(a, b, w) -- box with Z along a->b
+  	return box(Vector3.new(w, w, (b - a).Magnitude), CFrame.lookAt((a + b) / 2, b))
+  end
+  local function boneBetween(a, b, r) -- cylinder; its axis is X, so turn it onto Z
+  	return cylinder(r, (b - a).Magnitude, CFrame.lookAt((a + b) / 2, b) * CFrame.Angles(0, math.pi / 2, 0))
+  end
+  ```
+- **Damage and variation as data.** A ruined wall is `tops = {26, 26, 20, 15, 24}` per bay fed to
+  one helper, a roof is `{ {true, true}, {true, "half"}, {false, false} }` per segment. Same helper,
+  a state table — not a second code path per broken thing.
+- **Seed the randomness.** `local rng = Random.new(1906)` and small `jit(a)` / colour-jitter
+  helpers on top of it. Reruns are identical, so the report's numbers stay comparable between
+  passes, which is what the loop depends on.
 - **Wedges**: `WedgePart` is full height at its -Z face and slopes to nothing at +Z. Rotate with
   `CFrame.Angles` about Y in multiples of `math.pi / 2` to point it. Cylinders lie along X.
 - **`ensure` a class change destroys and remakes** — that one is not an update.
+
+## Openings, arches, layered surfaces
+
+There is no hole tool. A window or doorway is the wall built as pieces around the gap — plinth,
+band below the sill, a pier each side, the arch, wedges filling the corners above it, a block
+from the arch top to the wall top. Write that once as a helper and every opening is a call.
+
+A pointed arch is two angled blocks plus a keystone. Offset the blocks *into* the opening, not
+outward, so the spandrel wedges above sit on the arch line with no overlap; the keystone is
+bigger than the blocks and hides where they cross at the apex:
+
+```lua
+-- frame: centre of the springing line, X along the span, Y up, Z through the wall
+local function arch(parent, name, frame, span, rise, depth, thick)
+	local half = span / 2
+	local len, a = math.sqrt(half * half + rise * rise), math.atan2(rise, half)
+	for s = -1, 1, 2 do
+		box(parent, `{name}{s}`, Vector3.new(len, thick, depth),
+			frame * CFrame.new(s * half / 2, rise / 2, 0) * CFrame.Angles(0, 0, -s * a) * CFrame.new(0, -thick / 2, 0))
+	end
+	box(parent, `{name}Key`, Vector3.new(thick * 1.3, thick * 1.5, depth + 0.3), frame * CFrame.new(0, rise - thick * 0.2, 0))
+end
+```
+
+Wedge recipes that come up constantly (these assume the tall face is at +Z; if a `render_build`
+of one wedge shows the slope the other way, negate the Y rotations):
+
+- spandrel — right angle at the top outer corner, hypotenuse on the arch line:
+  `frame * CFrame.new(s * span / 4, rise / 2, 0) * CFrame.Angles(0, -s * π/2, 0) * CFrame.Angles(π, 0, 0)`,
+  size `(depth, rise, span / 2)`
+- gable half — right angle at the bottom centre: size `(thick, rise, halfWidth)`, centre at
+  `x = ±halfWidth / 2`, `CFrame.Angles(0, ∓π/2, 0)`
+- a sloped cap on a buttress or sill, back against the wall: `CFrame.Angles(0, π, 0)` when the
+  wall is on the cap's -Z side
+
+Overlap rules the problem list can't tell you:
+
+- A part hidden inside another solid is fine. Two overlapping volumes whose faces lie on the same
+  plane *and face the same way* flicker. So: a quoin or pilaster wrapping a corner goes 0.3 proud
+  on top, not flush; trim sits 0.1–0.3 proud of the wall; a rounded cap cylinder on a headstone is
+  0.02 thinner than the slab; a ring of four walls is two full-length and two short ones butting
+  between them, never four full-length ones crossing at the corners.
+- Flush faces of *adjacent* parts (pier next to pier, step on step) are fine — that's a join.
+- Rubble, roots, fallen drums and leaning stones sit 20–30% into the ground on purpose. Their
+  overlapping / floating lines are ones you meant.
 
 Only properties that differ from a fresh instance need setting; `Anchored = true` on every part
 because the default is false.
@@ -135,6 +199,9 @@ a wall.
 Flush contact is not an overlap: parts sharing a face are fine. Only parts touching nothing at all
 get the floating check, so walls against walls don't cry wolf.
 
+Fog volumes and light-shaft emitters are `Transparency = 1` boxes that overlap everything; skip
+them when reading the overlap lines (and skip them yourself if you write your own check).
+
 **The picture** is for what numbers can't say: does the layout read, are the proportions right,
 is that shape what you pictured. It's an orthographic blockout at one scale across every panel —
 flat shading, a dark line on every edge, a badge number on each part matching the legend. Meshes
@@ -157,6 +224,11 @@ that's wrong makes every detail wrong.
 Later passes: edit the source, re-apply. Because `ensure` updates by name, a pass that changes one
 group's numbers moves only that group. Keep the full source in your working memory across passes;
 it's the build.
+
+A detailed build is big — a 150-stud map with a real building on it runs to 800+ lines, and that
+does not fit in one reply. Don't try. Do it as passes that each fit: shell → openings and roof →
+interior → props → effects. Keep the source in a file and apply from there rather than re-emitting
+the whole thing every pass.
 
 Stop when the problem list is empty or every remaining line is something you meant, and the
 picture reads. Don't chase the picture pixel by pixel — if a thing looks off but the numbers say
