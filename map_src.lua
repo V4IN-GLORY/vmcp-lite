@@ -98,6 +98,7 @@ local P = {
 	moss   = { Enum.Material.Grass,       Color3.fromRGB( 78,  96,  54) },
 	leaf   = { Enum.Material.Grass,       Color3.fromRGB( 46,  74,  44) },
 	bark   = { Enum.Material.Wood,        Color3.fromRGB( 62,  48,  34) },
+	beam   = { Enum.Material.Wood,        Color3.fromRGB( 74,  56,  40) },
 }
 
 local function ensure(parent, name, class)
@@ -901,11 +902,23 @@ phase(function(root)
 	local ground = model(root, "Ground")
 	-- the map floor: one slab, and a wider low skirt so the 150 stud edge reads as ground going on
 	box(ground, "Slab", Vector3.new(MAP, 3, MAP), CFrame.new(0, -1.5, 0), P.ground)
-	box(ground, "Skirt", Vector3.new(MAP + 40, 2, MAP + 40), CFrame.new(0, -3.4, 0), P.dirt)
-	for i = 1, 10 do
-		local w = 8 + jitAbs(14)
-		box(ground, string.format("Mound%d", i), Vector3.new(w, 1.1 + jitAbs(1.4), w * 0.8),
-			CFrame.new(jit(70), 0.4, jit(70)) * CFrame.Angles(0.03, jit(3.1), 0.03), P.ground)
+	box(ground, "Skirt", Vector3.new(MAP + 24, 2.2, MAP + 24), CFrame.new(0, -3.5, 0), P.ground)
+	-- low swells: six out in the open, twelve heaped round the rim so the edge reads as land
+	-- going on rather than a cut board
+	for i = 1, 18 do
+		local w = 9 + jitAbs(15)
+		local ang = jitAbs(6.28)
+		local rad = if i <= 6 then 40 + jitAbs(16) else 56 + jitAbs(22)
+		box(ground, string.format("Mound%d", i), Vector3.new(w, 1.2 + jitAbs(1.8), w * 0.8),
+			CFrame.new(math.cos(ang) * rad, 0.4, math.sin(ang) * rad) * CFrame.Angles(0.02, jit(3.1), 0.02), P.ground)
+	end
+	-- leaf litter under the canopy, a finger proud of the grass like the moss
+	for i = 1, 12 do
+		local s = 3.4 + jitAbs(5)
+		local ang = jitAbs(6.28)
+		local rad = 26 + jitAbs(40)
+		box(ground, string.format("Litter%d", i), Vector3.new(s, 0.16, s * (0.6 + jitAbs(0.5))),
+			CFrame.new(math.cos(ang) * rad, 0.07, math.sin(ang) * rad) * CFrame.Angles(0, jit(3.1), 0), P.leaf)
 	end
 	-- worn paths: slabs laid a finger proud of the grass so they read as trodden ground
 	local function path(name, x, z, w, d, rot)
@@ -930,6 +943,30 @@ phase(function(root)
 		local s = 2.5 + jitAbs(4)
 		box(ground, string.format("MossPatch%d", i), Vector3.new(s, 0.16, s * (0.6 + jitAbs(0.6))),
 			CFrame.new(18 + jitAbs(16) * (if i % 2 == 0 then 1 else -1), 0.07, -30 + jitAbs(50)) * CFrame.Angles(0, jit(3.1), 0), P.moss)
+	end
+
+	-- ---- ruins: what came off the cathedral, lying where it fell -------------------------
+	local ruins = model(root, "Ruins")
+	local fallen = {
+		{ 27, -13, "wall" }, { -27, -6, "drum" }, { 31, 15, "wall" }, { -29, 19, "arch" },
+		{ 34, -27, "wall" }, { -31, -25, "drum" }, { 25, 25, "wall" }, { -36, 7, "arch" },
+		{ 37, 3, "wall" }, { -21, 27, "drum" },
+	}
+	for i, r in ipairs(fallen) do
+		local cf = CFrame.new(r[1], 0, r[2]) * CFrame.Angles(0, jit(3.1), 0)
+		local name = string.format("Ruin%d", i)
+		if r[3] == "wall" then
+			local h = 1.8 + jitAbs(2.4)
+			box(ruins, name .. "Foot", Vector3.new(5.4, 1.0, 1.8), cf * CFrame.new(0, 0.5, 0), P.plinth)
+			box(ruins, name, Vector3.new(4.6, h, 1.3), cf * CFrame.Angles(0, 0, jit(0.05)) * CFrame.new(0, 1.0 + h / 2, 0), P.wall)
+		elseif r[3] == "drum" then
+			box(ruins, name .. "Bed", Vector3.new(2.6, 0.5, 2.6), cf * CFrame.new(0, 0.25, 0), P.plinth)
+			col(ruins, name, 0.85, 2.4 + jitAbs(1.2), cf * CFrame.new(0, 1.45, 0), P.trim)
+		else
+			box(ruins, name .. "Pier", Vector3.new(1.5, 3.4, 1.5), cf * CFrame.new(-1.6, 1.7, 0), P.wall)
+			box(ruins, name .. "Head", Vector3.new(1.5, 1.6, 1.5), cf * CFrame.new(1.6, 2.6, 0), P.wall)
+			box(ruins, name .. "Span", Vector3.new(3.6, 1.2, 1.4), cf * CFrame.new(0, 3.4, 0), P.trim)
+		end
 	end
 
 	-- ---- cemetery: irregular rows, varied stones, several of them down ------------------
@@ -1015,9 +1052,9 @@ phase(function(root)
 	end
 	local kinds = { "oak", "oak", "oak", "pine", "pine", "dead" }
 	local made = 0
-	for attempt = 1, 900 do
-		if made >= 24 then break end
-		local ring = 44 + jitAbs(26)
+	for attempt = 1, 1200 do
+		if made >= 28 then break end
+		local ring = 36 + jitAbs(34)
 		local ang = jitAbs(6.28)
 		local x, z = math.cos(ang) * ring, math.sin(ang) * ring
 		local r = 4.5
@@ -1029,7 +1066,7 @@ phase(function(root)
 		end
 	end
 	-- undergrowth: rocks, bushes, ferns, a couple of logs, mushrooms
-	for i = 1, 16 do
+	for i = 1, 18 do
 		local x, z = jit(66), jit(66)
 		if math.abs(x) > 26 or math.abs(z) > 30 then
 			local s = 1.6 + jitAbs(2.4)
@@ -1037,7 +1074,7 @@ phase(function(root)
 				CFrame.new(x, s * 0.22, z) * CFrame.Angles(0.16 + jit(0.3), jit(3.1), 0.12 + jit(0.3)), P.plinth)
 		end
 	end
-	for i = 1, 14 do
+	for i = 1, 17 do
 		local x, z = jit(68), jit(68)
 		if math.abs(x) > 24 or math.abs(z) > 28 then
 			local s = 2.2 + jitAbs(1.6)
@@ -1046,7 +1083,7 @@ phase(function(root)
 				CFrame.new(x + jit(0.8), s * 0.9, z + jit(0.8)) * CFrame.Angles(jit(0.4), jit(3.1), jit(0.4)), P.moss)
 		end
 	end
-	for i = 1, 10 do
+	for i = 1, 12 do
 		local x, z = jit(70), jit(70)
 		if math.abs(x) > 22 or math.abs(z) > 26 then
 			for k = 1, 3 do
@@ -1307,16 +1344,33 @@ local function night()
 	local Lighting = game:GetService("Lighting")
 	Lighting.ClockTime = 0
 	Lighting.GeographicLatitude = 12
-	Lighting.Brightness = 1.5
-	Lighting.Ambient = Color3.fromRGB(20, 22, 32)
-	Lighting.OutdoorAmbient = Color3.fromRGB(30, 34, 50)
-	Lighting.FogColor = Color3.fromRGB(17, 20, 30)
-	Lighting.FogStart, Lighting.FogEnd = 40, 190
+	Lighting.Brightness = 2.6
+	Lighting.Ambient = Color3.fromRGB(42, 47, 66)
+	Lighting.OutdoorAmbient = Color3.fromRGB(62, 71, 98)
+	Lighting.FogColor = Color3.fromRGB(20, 24, 36)
+	Lighting.FogStart, Lighting.FogEnd = 55, 230
 	Lighting.GlobalShadows = true
-	Lighting.ShadowSoftness = 0.35
-	Lighting.EnvironmentDiffuseScale = 0.25
-	Lighting.EnvironmentSpecularScale = 0.2
-	Lighting.ExposureCompensation = -0.1
+	Lighting.ShadowSoftness = 0.3
+	Lighting.EnvironmentDiffuseScale = 0.5
+	Lighting.EnvironmentSpecularScale = 0.25
+	Lighting.ExposureCompensation = 0.25
+	-- the moon itself. DirectionalLight cannot be created by a script, so the moonlight is one
+	-- very wide spot on an invisible rig high over the north west corner, aimed at the crossing
+	local mapRoot = game.Workspace:FindFirstChild("RuinedCathedralMap")
+	local holder = (mapRoot and mapRoot:FindFirstChild("Effects")) or game.Workspace
+	local rig = holder:FindFirstChild("MoonRig")
+	if not rig then
+		rig = Instance.new("Part")
+		rig.Name, rig.Anchored, rig.Transparency = "MoonRig", true, 1
+		rig.CanCollide, rig.CanQuery, rig.CanTouch = false, false, false
+		rig.Size = Vector3.new(2, 2, 2)
+		rig.Parent = holder
+	end
+	rig.CFrame = CFrame.lookAt(Vector3.new(-78, 132, -104), Vector3.new(0, 8, 8))
+	local moon = rig:FindFirstChild("RuinedCathedralMoon") or Instance.new("SpotLight")
+	moon.Name, moon.Parent = "RuinedCathedralMoon", rig
+	moon.Face, moon.Brightness, moon.Range, moon.Angle = Enum.NormalId.Front, 3.4, 460, 115
+	moon.Color, moon.Shadows = Color3.fromRGB(176, 196, 255), true
 	local bloom = Lighting:FindFirstChild("RuinedCathedralBloom") or Instance.new("BloomEffect")
 	bloom.Name, bloom.Parent = "RuinedCathedralBloom", Lighting
 	bloom.Intensity, bloom.Size, bloom.Threshold = 0.55, 26, 1.5
@@ -1416,4 +1470,21 @@ local function BUILD(root)
 	return root
 end
 
-return BUILD
+--=====================================================================================
+-- COMMAND BAR ENTRY. Paste the whole file into the Studio command bar and run it: any
+-- earlier copy of the map goes, this one is built in its place, and it says what it made.
+--=====================================================================================
+local ws = game:GetService("Workspace")
+local previous = ws:FindFirstChild("RuinedCathedralMap")
+if previous then previous:Destroy() end
+local root = Instance.new("Model")
+root.Name = "RuinedCathedralMap"
+root.Parent = ws
+BUILD(root)
+local parts, lights = 0, 0
+for _, d in ipairs(root:GetDescendants()) do
+	if d:IsA("BasePart") then parts += 1 end
+	if d:IsA("Light") then lights += 1 end
+end
+print(string.format("[RuinedCathedral] built %d parts, %d lights under %s -- %s, Atmosphere untouched",
+	parts, lights, root:GetFullName(), if NIGHT then "night lighting applied" else "lighting left as found"))
