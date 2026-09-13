@@ -71,19 +71,6 @@ Tool.Definition = {
 	timeoutMs = 60000,
 }
 
-local function shorten(part: Instance, root: Instance): string
-	local full = part:GetFullName()
-	local prefix = `{root:GetFullName()}.`
-	if string.sub(full, 1, #prefix) == prefix then
-		return string.sub(full, #prefix + 1)
-	end
-	return full
-end
-
-local function round(value: number): string
-	return string.format(if value % 1 == 0 then "%d" else "%.1f", value)
-end
-
 function Tool.Run(arguments: {
 	root: string?,
 	views: { any }?,
@@ -116,32 +103,11 @@ function Tool.Run(arguments: {
 	local views = arguments.views or { "iso" }
 	local badges = if arguments.badges ~= nil then arguments.badges else count <= BADGE_LIMIT
 	local note = if capped then `, stopped at {count} -- there are more` else ""
+	local problems = if arguments.problems ~= false then Build.Problems(root, arguments.maxParts, instances) else nil
 
-	local lines = { `{count} part(s) under {root:GetFullName()}, {#views} view(s){note}`, "" }
-
-	table.insert(lines, if badges then "legend (the number in the picture):" else "parts:")
-	for index, part in instances do
-		local size = part.Size
-		local at = part.Position
-		table.insert(
-			lines,
-			`  #{index} {shorten(part, root)}  {round(size.X)}x{round(size.Y)}x{round(size.Z)}`
-				.. ` at ({round(at.X)}, {round(at.Y)}, {round(at.Z)})`
-		)
-	end
-
-	if arguments.problems ~= false then
-		local found = Build.Problems(root, arguments.maxParts, instances)
-		table.insert(lines, "")
-		if #found == 0 then
-			table.insert(lines, "nothing looks wrong with the geometry")
-		else
-			table.insert(lines, `{#found} thing(s) worth a look:`)
-			for _, problem in found do
-				table.insert(lines, `  {shorten(problem.part, root)} -- {problem.kind}: {problem.detail}`)
-			end
-		end
-	end
+	local text = `{count} part(s) under {root:GetFullName()}, {#views} view(s){note}
+`
+		.. Build.Report(root, instances, badges, problems)
 
 	return {
 		content = { { type = "text", text = table.concat(lines, "\n") } },
