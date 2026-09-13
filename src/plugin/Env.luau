@@ -7,6 +7,7 @@ local Bridge = require(script.Parent.Bridge)
 
 local Env = {
 	Anim = require(script.Parent.Lib.Anim),
+	Audit = require(script.Parent.Lib.Audit),
 	Bench = require(script.Parent.Lib.Bench),
 	Build = require(script.Parent.Lib.Build),
 	Canvas = require(script.Parent.Lib.Canvas),

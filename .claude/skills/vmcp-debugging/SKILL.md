@@ -66,7 +66,73 @@ see what the server pushes out.
 A remote handler is only as safe as its worst caller, and the worst caller doesn't use your UI.
 These run from a **client** event, through the real network path.
 
-### Tailored to the game — do this one first
+### Read the code, rank the leads, abuse them — do this one first
+
+`vmcp.Audit` reads the game's own handler source (it can, on the server/plugin side — it's Studio)
+and ranks the remotes worth attacking, so the client pass aims at the harsh bugs instead of fuzzing
+everything evenly. It flags the ones that matter: currency written from a client number, an Instance
+destroyed with no ownership check, `loadstring`, a DataStore write steered by the client, no rate
+limit. It's a text scanner, not a compiler — a finding means "aim here", the client pass proves it.
+
+Three events: scan on the server, watch a moment of real traffic for the arguments, abuse the ranked
+leads on the client.
+
+```lua
+-- server, at 0: read the code and pick the harsh remotes, watch for real args
+local findings = vmcp.Audit.Scan()
+ctx.audit = vmcp.Audit.Report(findings)
+local harsh = vmcp.Audit.Harsh(findings) -- high-severity remote paths
+vmcp.Remotes.WatchAll(game.ReplicatedStorage.Remotes)
+```
+
+```lua
+-- server, a few seconds later: pair each harsh remote with a real captured call
+local shapes = {}
+for _, shape in vmcp.Remotes.Shapes() do
+    shapes[shape.remote] = shape
+end
+local targets = {}
+for _, path in vmcp.Audit.Harsh(findings) do
+    local shape = shapes[path]
+    table.insert(targets, { remote = path, args = shape and shape.sample, severity = "high" })
+end
+ctx.targets = targets
+```
+
+```lua
+-- client, last: abuse each, worst first
+ctx.attack = vmcp.Exploit.AbuseAll(ctx:Await("targets", 10))
+```
+
+`AbuseAll` ranks by what actually broke: **served** (a RemoteFunction handed back a value for a call
+it should have refused — proven from the client alone) beats **accepted** (a RemoteEvent took it with
+no complaint — a lead, since nothing comes back) beats **held up** (every suspicious variant was
+rejected — it validates). Audit's severity breaks ties.
+
+`accepted` needs a server read to become proof. Once a variant is known to go through, `Exploit.Repeat`
+hammers that exact payload so you can measure the damage:
+
+```lua
+-- server, before: read the thing that shouldn't move
+ctx.cashBefore = game.Players:GetPlayers()[1].leaderstats.Cash.Value
+```
+
+```lua
+-- client: fire the abusive call 500 times
+local grant = game.ReplicatedStorage.Remotes.GiveCash
+vmcp.Exploit.Repeat(grant, { math.huge }, 1, 500)
+```
+
+```lua
+-- server, after
+ctx.cashAfter = game.Players:GetPlayers()[1].leaderstats.Cash.Value
+```
+
+```json
+"assertion": "return ctx.cashAfter == ctx.cashBefore"
+```
+
+### Tailored to the game — the traffic-only version
 
 Blind junk stops at the first argument the handler checks. What actually finds bugs is the game's
 own traffic, replayed and broken one argument at a time. Two events and a `ctx` hop:
