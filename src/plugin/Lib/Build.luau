@@ -394,8 +394,6 @@ local OUTLIER_STUDS = 250
 -- report every wall against its floor.
 local FLUSH = 0.05
 
-local AXES = { "X", "Y", "Z" }
-
 -- World-space box around a part, rotation and all. Rotated parts get a box bigger than they are,
 -- which makes the depth below an estimate -- still a number you can subtract from a position.
 local function aabb(part: BasePart): (Vector3, Vector3)
@@ -414,13 +412,9 @@ end
 local function penetration(a: BasePart, b: BasePart): (number, string)
 	local aMin, aMax = aabb(a)
 	local bMin, bMax = aabb(b)
-	local depth, axis = math.huge, "Y"
-	for _, name in AXES do
-		local overlap = math.min(aMax[name], bMax[name]) - math.max(aMin[name], bMin[name])
-		if overlap < depth then
-			depth, axis = overlap, name
-		end
-	end
+	local overlap = aMax:Min(bMax) - aMin:Max(bMin)
+	local depth = math.min(overlap.X, overlap.Y, overlap.Z)
+	local axis = if depth == overlap.X then "X" elseif depth == overlap.Y then "Y" else "Z"
 	return depth, axis
 end
 
@@ -629,8 +623,7 @@ function Build.Report(root: Instance, parts: { BasePart }, badges: boolean, prob
 		table.insert(lines, `  #{index} {shorten(part, root)}  {fmt(size.X)}x{fmt(size.Y)}x{fmt(size.Z)} at {v3(part.Position)}`)
 	end
 
-	return table.concat(lines, "
-")
+	return table.concat(lines, "\n")
 end
 
 return Build

@@ -286,9 +286,9 @@ export function coerceToolResult(value: unknown): ToolResult {
 				: undefined;
 
 		if (Array.isArray(candidate.content)) {
-			const content = candidate.content
+			const content = (candidate.content as { text?: unknown }[])
 				.filter((item) => typeof item?.text === "string")
-				.map((item) => ({ type: "text" as const, text: item.text }));
+				.map((item) => ({ type: "text" as const, text: item.text as string }));
 
 			if (content.length > 0) {
 				const result: ToolResult = { content };

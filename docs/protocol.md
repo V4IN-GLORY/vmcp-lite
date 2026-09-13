@@ -440,7 +440,9 @@ replays a Canvas recording, `scene` renders collected part geometry as a blockou
 ```
 
 The server carries it out, appends a line of text saying what happened, and strips the directive —
-the MCP client never sees it. An unrecognised `kind` says so in that line rather than failing the
+the MCP client never sees it. When the job produced an image it's also appended as an MCP
+`{ "type": "image", "data": <base64>, "mimeType": "image/png" }` block (skipped past 1.5 MB), so
+the caller sees the picture in the same reply as the text without opening the file. An unrecognised `kind` says so in that line rather than failing the
 call. This happens on every path a result takes out of the plugin, including a result travelling
 back through `tool/invoke`, so a snippet gets its file whichever side asked for the tool.
 

@@ -1,132 +1,200 @@
 ---
 name: vmcp-build
-description: Reading, editing and looking at areas of a Roblox place with VMCP — get_build returns a region as code that rebuilds it, and render_build draws it as a picture so you can see what the code made. Use when moving, retexturing or restructuring part of a build.
+description: Building and editing areas of a Roblox place as Luau with VMCP — the whole build lives in one source you write and re-apply, apply_build runs it and hands back the geometry as numbers plus one blockout picture, get_build reads an existing region back as that same kind of source. Use when making, moving, retexturing or restructuring part of a build.
 ---
 
 # Builds as code
 
-`get_build` returns a region of the place as Luau that recreates it. `get_tree` tells you what's
-there; this gives you something you can edit.
+A build is a Luau source that makes it, and the source is the only thing you edit. Never place
+parts one call at a time, and never decide where something goes from a picture.
+
+Why: a picture is one angle of one moment. Two of them don't add up to a 3D model in your head —
+you end up fixing the second one against the first and drifting. Code holds every part at once, so
+"is this wall in the same place as that pillar" is a question you answer by reading two lines and
+subtracting, not by squinting. The tools here exist to keep you in that mode.
+
+The loop, one tool call per pass:
+
+```
+write the whole build as one source
+apply_build { code, root }       -> runs it, measures it, lists what's wrong, draws it
+edit the source from the numbers
+apply_build again                 -> only what changed moves
+```
+
+## The source
+
+`apply_build` runs the shape `get_build` produces: a chunk ending in `return function(root)`.
+Everything inside is yours. Write it like build code, not like a dump:
+
+```lua
+local function ensure(parent, name, class)
+	local found = parent:FindFirstChild(name)
+	if found and found.ClassName ~= class then found:Destroy() found = nil end
+	if not found then
+		found = Instance.new(class)
+		found.Name = name
+		found.Parent = parent
+	end
+	return found
+end
+
+local function box(parent, name, size, cframe, props)
+	local part = ensure(parent, name, "Part")
+	part.Size = size
+	part.CFrame = cframe
+	part.Anchored = true
+	for key, value in props or {} do part[key] = value end
+	return part
+end
+
+return function(root)
+	-- One set of numbers the rest derives from. Change the room here, not in twelve places.
+	local W, D, H, T = 40, 30, 12, 1       -- width, depth, height, wall thickness
+	local floorTop = 0
+
+	local shell = ensure(root, "Shell", "Model")
+	box(shell, "Floor", Vector3.new(W, T, D), CFrame.new(0, floorTop - T / 2, 0), { Material = Enum.Material.Concrete })
+
+	-- Walls sit on the floor and meet at the corners by construction: their edges are computed
+	-- from W, D and T, so they can't overlap or leave a gap unless the arithmetic is wrong.
+	local wallY = floorTop + H / 2
+	box(shell, "North", Vector3.new(W, H, T), CFrame.new(0, wallY, -D / 2 + T / 2))
+	box(shell, "South", Vector3.new(W, H, T), CFrame.new(0, wallY,  D / 2 - T / 2))
+	box(shell, "West",  Vector3.new(T, H, D - 2 * T), CFrame.new(-W / 2 + T / 2, wallY, 0))
+	box(shell, "East",  Vector3.new(T, H, D - 2 * T), CFrame.new( W / 2 - T / 2, wallY, 0))
+
+	local props = ensure(root, "Props", "Model")
+	for i = 1, 4 do
+		box(props, `Crate{i}`, Vector3.new(4, 4, 4), CFrame.new(-12 + i * 6, floorTop + 2, 8), { Material = Enum.Material.WoodPlanks })
+	end
+	return root
+end
+```
+
+What makes that source good, and what to hold yourself to:
+
+- **Derive positions, don't type them.** A part's position is `floorTop + size.Y / 2`, a wall's
+  edge is `W / 2 - T / 2`. Every literal you type is a place two parts can disagree. When the
+  problem list says something is floating or sunk in, the fix is nearly always a derivation that
+  was typed as a number.
+- **Name everything, and keep the names.** `ensure` updates by name, so re-applying moves only the
+  lines you changed. Rename a part and the old one stays behind — pass `clear = true` on that pass.
+- **Group into Models by what they are** — `Shell`, `Props`, `Stairs` — because the report
+  measures each top-level group and you want those measurements to mean something.
+- **Loops for repetition.** Four crates is a `for`, not four blocks. Fence posts, pillars,
+  stair steps: compute the step from the count and the span, and the last one lands exactly on the
+  far edge.
+- **Helpers at the top, geometry at the bottom.** `box`, `wedge`, `cylinder` — a few lines each.
+  The `return function(root)` body should read like a description of the place.
+- **Wedges**: `WedgePart` is full height at its -Z face and slopes to nothing at +Z. Rotate with
+  `CFrame.Angles` about Y in multiples of `math.pi / 2` to point it. Cylinders lie along X.
+- **`ensure` a class change destroys and remakes** — that one is not an update.
+
+Only properties that differ from a fresh instance need setting; `Anchored = true` on every part
+because the default is false.
+
+## Reading the result
+
+`apply_build` answers in this order, and you should read it in this order:
+
+```
+applied: 14 instance(s) under Workspace.Arena, 12 of them parts
+bounds: 40x13x30 spanning x -20..20, y -1..12, z -15..15
+groups (direct children of the root):
+  Shell  5 parts, 40x13x30 spanning x -20..20, y -1..12, z -15..15
+  Props  4 parts, 22x4x4 spanning x -8..14, y 0..4, z 6..10
+
+2 thing(s) worth a look:
+  Props.Crate3 -- overlapping: sunk about 2.00 studs into Workspace.Arena.Props.Crate2 along X
+  Shell.East -- floating: 0.50 studs above Workspace.Arena.Shell.Floor
+
+legend (the number in the picture):
+  #1 Shell.Floor  40x1x30 at (0, -0.5, 0)
+  ...
+[wrote the image to .../images/arena.png]
+<the picture>
+```
+
+**Bounds and groups** are the 3D identity of the build. Check them against what you meant: a
+`Props` group spanning `y 0..4` on a floor whose top is 0 is right; one spanning `y 2..6` is two
+studs high and you can see it without the picture. A group wider than the shell is poking through
+a wall.
+
+**Problems** are the fix list, and each one carries the number to fix with:
+
+| kind | what it means | the fix |
+|---|---|---|
+| overlapping | sunk `d` studs into X along axis A | move or shrink by `d` on A — usually a typed position that should have been derived |
+| floating | `g` studs above X, or nothing under it | lower by `g`, or it's meant to hang and that's fine |
+| off axis | rotated under 5 degrees off square | a rotation computed from a near-miss, or a `CFrame.Angles` in degrees instead of radians |
+| duplicate | same name, size, position twice | the loop ran twice or two `ensure` calls share a name under different parents |
+| paper thin | a dimension under 0.1 | a size computed to nothing — check the subtraction |
+| stranded | 250+ studs from the rest | a coordinate off by a factor, or a `*` that should be `+` |
+
+Flush contact is not an overlap: parts sharing a face are fine. Only parts touching nothing at all
+get the floating check, so walls against walls don't cry wolf.
+
+**The picture** is for what numbers can't say: does the layout read, are the proportions right,
+is that shape what you pictured. It's an orthographic blockout at one scale across every panel —
+flat shading, a dark line on every edge, a badge number on each part matching the legend. Meshes
+and unions draw as their bounding box. Lights, decals and particles don't draw at all.
+
+Look at it, note what's off in words ("the crates are too small for the room", "the stairs don't
+reach the ledge"), then go back to the source and change the derivation. Don't read a coordinate
+off the picture — you have the legend for that.
+
+Default is one `iso` view. Add `"top"` when the question is footprint, `"front"` when it's height.
+Don't ask for many views by habit; more panels is more to reconcile, and the numbers already agree
+with themselves.
+
+## Passes
+
+First pass: the whole build, blocked out — every group, rough sizes, no detail. Get the bounds and
+the problem list clean before adding anything. A shell that's right is cheap to detail and a shell
+that's wrong makes every detail wrong.
+
+Later passes: edit the source, re-apply. Because `ensure` updates by name, a pass that changes one
+group's numbers moves only that group. Keep the full source in your working memory across passes;
+it's the build.
+
+Stop when the problem list is empty or every remaining line is something you meant, and the
+picture reads. Don't chase the picture pixel by pixel — if a thing looks off but the numbers say
+it's where you put it, the question is whether you put it in the right place, and that's a source
+edit.
+
+## Reading a build that already exists
+
+`get_build` returns a region as this same kind of source:
 
 ```
 get_build { root = "Workspace.Arena", depth = 4 }
 ```
 
-```lua
--- Generated by VMCP. Edit freely and run it again: `ensure` updates what's already there rather
--- than making a second copy, so only what you changed moves.
+It's a dump, one line per non-default property, `n1`, `n2` locals — readable but not derived.
+For a small edit, change the lines and `apply_build` it back. For a real restructure, read it for
+the sizes and positions, then write a derived source of your own and apply that with
+`clear = true`.
 
-local function ensure(parent, name, class) ... end
-
-return function(root)
-	local n1 = ensure(root, "Floor", "Part")
-	n1.Size = Vector3.new(64, 1, 64)
-	n1.CFrame = CFrame.new(0, 0, 0)
-	n1.Anchored = true
-	n1.Material = Enum.Material.Concrete
-	local n2 = ensure(n1, "Grime", "Decal")
-	n2.Texture = "rbxassetid://123456"
-	n2.Face = Enum.NormalId.Top
-	return root
-end
-```
-
-Only properties that differ from a fresh instance of that class are written, plus attributes and
-CollectionService tags. That's what keeps a large region readable.
-
-## Editing and applying
-
-Change the lines you care about and run the whole thing back:
+`render_build` draws and measures a region without applying anything — same report, same picture,
+for looking at what's there before you touch it:
 
 ```
-run_luau { code = "local build = [==[ ...the edited source... ]==]\nreturn vmcp.Build.Apply(build, workspace.Arena)" }
+render_build { root = "Workspace.Arena", views = ["iso", "top"] }
 ```
 
-`ensure` looks a child up by name before creating one, so re-applying **updates** rather than
-duplicating. A part whose lines you didn't touch doesn't move. That's what makes this safe without
-a diffing pass, and it's why you should keep the names.
-
-Changing a node's class destroys and recreates it — that one is not an update.
-
-## Looking at it
-
-Reading the code back is the same guess twice. `render_build` draws the region and writes a PNG:
-
-```
-render_build { root = "Workspace.Arena", views = ["iso", "front", "top"] }
-```
-
-Studio sends the geometry — about forty bytes a part — and the VMCP **server** renders it. No
-camera, no playtest, no screenshot, and it works on a place that was never saved.
-
-It's an orthographic blockout, not a render: flat shading, a dark outline on every part, and **all
-views at one scale**, so a part is the same size in the top panel as in the front panel. Views tile
-into one image and are labelled.
-
-Named views are `iso`, `corner`, `front`, `back`, `left`, `right`, `top`, `bottom`; or pass
-`{ "yaw": 20, "pitch": 60, "name": "over" }` in degrees. `size` is pixels per view, 512 by default.
-
-The loop this is for:
-
-```
-get_build  -> read the region as code
-   edit the lines you care about
-run_luau   -> vmcp.Build.Apply(source, root)
-render_build -> look at what you actually made
-   edit again
-```
-
-### Finding the part you're looking at
-
-Every part gets a number in the picture and a line in the tool's text output:
-
-```
-legend (the number in the picture):
-  #1 Floor            64x1x64 at (0, 0, 0)
-  #2 Walls.North      64x12x1 at (0, 6, -32)
-  #4 Props.Crate      4x4x4 at (10, 4, 8)
-```
-
-So a thing you can see is a name you can grep for in the `get_build` source — the numbers are not
-the `n1`, `n2` locals in that source, which are a different walk, but the **names** match. Badges
-are on up to 40 parts and off above that; force either way with `badges`.
-
-### What's wrong, without eyeballing it
-
-The same call checks the geometry and says so in words, which beats squinting at a picture:
-
-```
-3 thing(s) worth a look:
-  Walls.North -- off axis: rotated 0.40 degrees off square -- meant to be flat?
-  Props.Crate -- floating: 3.20 studs above Floor
-  Props.Barrel -- duplicate: same name, size and position as Props.Barrel -- build code run twice?
-```
-
-It looks for parts sunk into each other, parts floating with a gap under them, rotations that are
-a fraction off square (under 5 degrees — anything more reads as deliberate), parts thinner than
-0.1 studs, exact duplicates stacked on each other, and parts stranded hundreds of studs from
-everything else. `vmcp.Build.Problems(root)` is the same check from a snippet.
-
-A part welded flush against its neighbour isn't reported as floating — only parts touching nothing
-at all get the support check, or every wall in the build would be a false alarm.
-
-Use the picture for the things a check can't name: proportions, whether a layout reads, whether a
-shape is what you pictured. `top` catches footprint mistakes; `front` catches height ones.
-
-What it draws: boxes, spheres, cylinders and wedges, with colour and transparency. **Meshes and
-unions come through as their bounding box** — right for a blockout, and honest about what it knows.
-Decals, textures, lights and particles aren't drawn at all.
+`vmcp.Build.Problems(root)` and `vmcp.Build.Report(root, parts, badges, problems)` are the same
+checks from a `run_luau` snippet.
 
 ## Copying a region
 
-The source returns `function(root)`, so applying it somewhere else copies the region:
+The source is `function(root)`, so applying it elsewhere copies it:
 
-```lua
-local arena2 = Instance.new("Model")
-arena2.Name = "Arena2"
-arena2.Parent = workspace
-return vmcp.Build.Apply(build, arena2)
 ```
+apply_build { code = <the same source>, root = "Workspace.Arena2" }
+```
+
+A missing last segment is created as a Model.
 
 ## What it covers
 
@@ -134,12 +202,12 @@ Parts and their geometry, material and appearance; meshes; decals and textures; 
 lights; particle emitters and beams; surface appearances; GUI objects, text and image labels, and
 the common UI modifiers. Attributes and tags on everything.
 
-There's no way to enumerate an instance's properties from Luau, so the property list is curated.
-Anything not on it is **silently absent from the dump** — a custom property-like value living in an
-attribute will come through, one living in a class property this list doesn't name will not. If a
-region round-trips wrong, that's the first thing to check.
+The dump's property list is curated — there's no way to enumerate properties from Luau — so a
+class property not on it is silently absent from `get_build`. If a region round-trips wrong,
+that's the first thing to check. Your own source has no such limit; set whatever you like.
 
 ## Limits
 
-`depth` defaults to 12 and `maxNodes` to 800; a dump that hits the cap says so at the bottom.
-Prefer a narrow `root` over a big cap — the point is to read only the area that matters.
+`get_build`: `depth` defaults to 12, `maxNodes` to 800. `apply_build` / `render_build` measure up
+to 1500 parts and say so if they stop early. Badges go off above 40 parts unless forced with
+`badges`. Prefer a narrow `root` over a big cap.

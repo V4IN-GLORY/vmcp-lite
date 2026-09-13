@@ -112,7 +112,7 @@ function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegist
 				replyError(socket, msg, VmcpErrorCode.InvalidParams, "post/process needs a directive");
 				return;
 			}
-			replyOk(socket, msg, { outcome: runPostProcess(directive) ?? "nothing to do" });
+			replyOk(socket, msg, { outcome: runPostProcess(directive) });
 			return;
 		}
 
