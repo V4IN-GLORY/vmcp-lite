@@ -104,6 +104,15 @@ What makes that source good, and what to hold yourself to:
   	return cylinder(r, (b - a).Magnitude, CFrame.lookAt((a + b) / 2, b) * CFrame.Angles(0, math.pi / 2, 0))
   end
   ```
+- **Repeated things get real variety, not a seed on the same shape.** Twenty trees from one
+  helper with `jit()` on the rotation still read as twenty copies — same trunk, same three
+  branches, same canopy blob. A helper for a commonly placed item takes a *variant*, not just a
+  position: branch count and where they fork, a lean, a split trunk, a dead one, a stump; for
+  stone, moss patches, a crack, a chipped corner, ivy, a missing top. Pick from a small set of
+  hand-shaped variants and vary the numbers within a normal range for that thing — a tree is 8–14
+  studs, not 2–40. Skip this only where sameness is the point: the crosses in a churchyard, the
+  balusters on a rail, the columns down a nave. What varies and how far follows the prompt — a
+  ruin gets damage, a kept garden doesn't.
 - **Damage and variation as data.** A ruined wall is `tops = {26, 26, 20, 15, 24}` per bay fed to
   one helper, a roof is `{ {true, true}, {true, "half"}, {false, false} }` per segment. Same helper,
   a state table — not a second code path per broken thing.
