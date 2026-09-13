@@ -33,6 +33,13 @@ Every `apply_build` / `render_build` ends the same way: read the numbers, look a
 write one or two lines of what it showed. A pass without that line was done blind. Never read a
 coordinate off the picture — the legend has it.
 
+**Rendering is mandatory, every time, whether or not the user asked.** The user's first prompt
+gets the full pipeline including phase 4 — not a single apply and "here it is". A build handed
+back after one `apply_build` and one iso is a build handed back with the roof gaps, the wedge
+branches and the door behind the buttress still in it. Minimum per build, no matter how small:
+one `apply_build`, at least two `render_build` calls at different locations/angles, and the
+phase-4 checklist written out. Bigger builds scale that up, never down.
+
 **Accessibility is a requirement, not a nicety.** Unless the user says a space is sealed (a
 crypt, a decorative tower, a ruin with a collapsed stair), every interior space a player could
 see must be reachable on foot from outside and from every other interior space: a door or
@@ -55,17 +62,23 @@ drifts from it, either fix the build or update the block, never leave them disag
    opening: which wall, width, height. Rules of thumb — doorway 4–6 wide and 7–8 tall, corridor
    ≥ 4 wide, stair rise ≤ 1 per step with ≥ 1.5 tread, ramps ≤ 30°, headroom ≥ 7 everywhere a
    player walks. If a space is *meant* to be sealed, say so here with why.
-4. **Palette and placement.** A table of roles, each with a material, a colour, and a comment
-   saying exactly which surfaces get it:
+4. **Palette and placement.** A table of 5–8 roles, each with a material, a colour, and a
+   comment saying exactly which surfaces get it. Broad enough that the build isn't one texture,
+   narrow enough that it still looks like one place:
    - big flat planes (walls, floors, roof planes) → low-contrast: Limestone, Concrete, Brick,
-     Plaster, WoodPlanks. This is what the eye rests on.
-   - loud / high-detail (Slate, Cobblestone, Rock, Metal, Marble) → accents and edges only:
-     plinth, trim, quoins, sills, doorstep, roof. Never the whole wall.
+     Plaster, WoodPlanks, Sandstone, Slate for roofs. This is what the eye rests on.
+   - loud / high-detail (Cobblestone, Rock, Basalt, CrackedLava, Metal, DiamondPlate, Marble)
+     → accents and edges only: plinth, trim, quoins, sills, doorstep. Never the whole wall.
    - a material change marks a *thing* change — trim isn't the wall's material, the plinth
      isn't either. Same role touching same role can share; different roles don't.
    - a distinct colour per role, not just a material; the same material at two shades is two
-     things.
-   - no one material on more than about half the parts. If one is, a role is missing.
+     things. Keep the whole palette in one temperature (all warm greys or all cool) unless the
+     prompt wants contrast.
+   - no one material on more than about half the parts; no role on fewer than 3 parts (then it
+     isn't a role, it's noise). Two roles that read the same from 30 studs are one role.
+   - don't: Marble on a whole building, Slate on walls, Neon or Glass as a wall material,
+     Plastic anywhere it'll be seen, Grass / Sand / Snow on anything but ground, Fabric on
+     anything but cloth. Pick from what the thing would be made of.
 
    ```lua
    local P = {
@@ -78,10 +91,11 @@ drifts from it, either fix the build or update the block, never leave them disag
    }
    ```
    Helpers take a role (`P.wall`), never a raw material.
-5. **Variety.** Which repeated things get hand-shaped variants (trees, stones, rubble — numbers
-   in a normal range, a tree is 8–14 studs not 2–40) and which are meant to be identical
-   (balusters, columns, churchyard crosses). Damage is data (`tops = {26, 26, 20, 15}` per bay),
-   not a second code path.
+5. **Variety, lightly.** Repeated things can share one helper; a little size and rotation
+   jitter in a normal range (a tree is 8–14 studs, not 2–40) is enough. Don't spend passes on
+   hand-shaped variants unless the prompt is about them (a ruin, a forest). Identical is fine
+   for balusters, columns, crosses, fence posts. Damage is data (`tops = {26, 26, 20, 15}` per
+   bay), not a second code path.
 
 ### 2. Blockout
 
@@ -115,7 +129,7 @@ Each pass, exactly:
    clip = true }` for a doorway or window. Narrow `root` is the main lever — 40 parts with
    badges tells you more than 1500 without.
 4. Write down what the picture shows that's wrong, in words: "door leaf is half the opening
-   width", "spandrel is rotated into the wall", "stairs stop 2 studs short of the ledge".
+   width", "gap between roof slab 2 and 3", "stairs stop 2 studs short of the ledge".
 5. For each, find the derivation that produced it — nearly always a typed number that should
    have been computed, or a wedge/rotation facing the wrong way. Edit it.
 6. Re-apply, re-render the same spot from a *different* angle. Same angle twice tells you
@@ -161,13 +175,20 @@ optional, not "looked fine":
   buttress, a stair landing? Does every stair reach both floors it connects, top step at the
   upper floor's height, headroom ≥ 7 over every step? A space with no way in is a bug unless the
   design block said it's sealed.
+- **Gaps.** Sky visible through any roof or wall in any elevation or the cutaway? Slits between
+  roof slabs, between wall pieces around an opening, at a corner? Each one is on the access
+  list or it's a bug — fix the overlap, not the picture.
+- **Primitives.** Any wedge, cylinder or ball that isn't a roof plane, ramp, column, trunk,
+  barrel, globe or boulder? Rebuild it from boxes.
+- **Lighting.** Every light source is a Light instance; no glass slabs or tinted boxes standing
+  in for rays or glow. Nothing under `game.Lighting` changed.
 - **Covered up.** Every named feature is findable in at least one panel. A window the porch roof
   now hides, a door behind a buttress, a prop inside a wall, a feature only visible from an
   angle nobody stands at.
 - **Scale.** Doors 7–8 tall, steps ~1 rise, chair seat ~2, table ~3, a player is 5. Group against
   group — a porch a third the height of the door it shelters, a tree taller than the tower.
 - **Orientation.** Wedges sloping the wrong way, a roof pitch that reads inverted from the back,
-  a spandrel rotated into the wall. The renderer models wedges as Roblox does — a wedge that
+  a rotated roof box sloping into the wall. The renderer models wedges as Roblox does — a wedge that
   looks backwards is backwards.
 - **Silhouette.** The back reads as well as the front; no blank face the design didn't intend.
 - **Material placement.** Trim reads as trim from 30 studs; no one material is a grey lump
@@ -251,43 +272,84 @@ Hold yourself to:
   ```
 - **Seed randomness** — `Random.new(1906)` plus small `jit()` helpers — so reruns are identical
   and the report's numbers stay comparable between passes.
-- **Wedges**: `WedgePart` is full height at -Z, nothing at +Z; rotate about Y in multiples of
-  `math.pi / 2`. Cylinders lie along X.
+- **Boxes by default** — see Geometry rules. Cylinders lie along X. If you do use a wedge, it's
+  full height at -Z, nothing at +Z; rotate about Y in multiples of `math.pi / 2`.
 - Only set what differs from a fresh instance; `Anchored = true` always.
 
-### Openings, arches, layered surfaces
+### Geometry rules
 
-There is no hole tool. An opening is the wall built as pieces around the gap — plinth, band
-below the sill, a pier each side, the arch, spandrel wedges, a block to the wall top. Write it
-once as a helper.
+These are not style preferences. Every one of them comes from a real bad build.
 
-A pointed arch is two angled blocks plus a keystone, offset *into* the opening so the spandrels
-sit on the arch line with no overlap; the keystone is bigger and hides the crossing:
+**Boxes, almost always.** The default primitive is a `Part` with `Shape = Block`. Wedges,
+cylinders, balls and rotated slivers are where the weird geometry comes from — a wedge branch
+sticking out of a tree, a wedge sign on a post, a lantern that's a glass box with a wedge lid.
+Allowed non-box uses, and only these:
 
-```lua
--- frame: centre of the springing line, X along the span, Y up, Z through the wall
-local function arch(parent, name, frame, span, rise, depth, thick)
-	local half = span / 2
-	local len, a = math.sqrt(half * half + rise * rise), math.atan2(rise, half)
-	for s = -1, 1, 2 do
-		box(parent, `{name}{s}`, Vector3.new(len, thick, depth),
-			frame * CFrame.new(s * half / 2, rise / 2, 0) * CFrame.Angles(0, 0, -s * a) * CFrame.new(0, -thick / 2, 0))
-	end
-	box(parent, `{name}Key`, Vector3.new(thick * 1.3, thick * 1.5, depth + 0.3), frame * CFrame.new(0, rise - thick * 0.2, 0))
-end
-```
+- `Cylinder` for a column, tree trunk, barrel, pipe, rope — things that are round in life.
+- `Ball` for a finial, a boulder, a lamp globe.
+- `WedgePart` only for a pitched roof plane or a ramp the player walks on, and only when a
+  stepped or slabbed version reads worse. Never for branches, decoration, spandrels, caps,
+  signs or anything on a prop.
 
-Wedge recipes (right angle is at the bottom of the -Z face):
+Everything else — arches, gables, canopies, tree crowns, stairs, buttress caps, roof edges — is
+boxes. A pointed arch is stacked boxes stepping inward; a gable is a wall stack with shorter
+courses toward the top; a tree crown is 3–6 overlapping boxes at slightly different sizes and
+rotations, never a wedge cluster; a roof is two thin boxes rotated to the pitch (`CFrame.Angles`
+about the ridge axis), meeting at a ridge box that covers the seam.
 
-- spandrel — `frame * CFrame.new(s * span / 4, rise / 2, 0) * CFrame.Angles(0, s * π/2, 0) * CFrame.Angles(π, 0, 0)`,
-  size `(depth, rise, span / 2)`, `s = -1` left, `1` right
-- gable half — size `(thick, rise, halfWidth)`, centre `x = s * halfWidth / 2`, `CFrame.Angles(0, s * π/2, 0)`
-- sloped cap with the wall on the -Z side — no rotation
+**No gaps.** A wall is continuous from floor to roof and from corner to corner. A roof closes.
+The rule that makes this true by construction:
 
-Overlap rules the report can't tell you: a part hidden inside a solid is fine; two coplanar faces
-pointing the same way flicker, so quoins and trim sit 0.1–0.3 proud, a cap cylinder is 0.02
-thinner than its slab, four walls are two long and two short. Flush faces of *adjacent* parts
-are a join, not a bug.
+- Pieces that meet **overlap by 0.05–0.1**, they don't butt end-to-end at a computed edge. A
+  computed edge is exact until you change one number, and then it's a slit you see sky through.
+  `len + 0.1`, not `len`.
+- A wall built from pieces around an opening (pier, lintel, band, block-to-top) is a *fill*: the
+  sum of pieces equals the wall, every piece's edge derives from the opening's edge, and each
+  piece extends 0.05 into its neighbour.
+- Roof planes overhang the wall by `T` and extend past the ridge by `T` so the ridge box hides
+  the join. Between roof planes on a hip or valley, add a box along the seam.
+- The only holes in a shell are on the access list. After each shell pass, look at the render
+  and name every gap you see; each one is either on the access list or a bug.
+
+**No Z-fighting.** Two faces on the same plane pointing the same way flicker in-engine even when
+the renderer draws them fine. So:
+
+- Anything layered on a surface — trim, quoins, plinth, sill, a sign on a wall, a rug on a floor,
+  a cap on a wall — sits **0.1–0.3 proud**, never flush. Pick `PROUD = 0.2` once and use it.
+- A part fully inside another is fine. A part sharing a face plane with another and *extending
+  past it* on that plane is not — shrink or grow one by 0.05.
+- Four walls are two long and two short butting between them, never four full-length crossing at
+  corners.
+- Stacked slabs (step on step, course on course) are fine when the top of one is exactly the
+  bottom of the next — that's a join. It's when two *tops* coincide that it flickers.
+- A cap cylinder on a slab is 0.02 thinner than the slab.
+
+**Openings.** There is no hole tool. An opening is the wall built as fill pieces around the gap:
+pier each side (full height), lintel box across the top (deeper than `T` by `PROUD` on the
+outside), and a block from the lintel to the wall top. Write it once as `openingWall(frame,
+length, openings)` and every wall with holes is one call. Opening sizes come from the access
+list. A window is the same with a sill band below.
+
+**Rubble and the ground.** Rocks, roots, fallen beams and leaning stones sit 20–30% into the
+ground on purpose; those overlap/floating lines are meant, say so.
+
+### Lighting inside the build
+
+Light is made with light instances, not with geometry pretending to be light:
+
+- `PointLight` in a lantern or fire, `SpotLight` from a window or doorway inward, `SurfaceLight`
+  on a glowing panel. `Brightness` 1–3, `Range` 8–30, a warm `Color` for flame.
+- A visible light *source* is a small Neon part (a candle flame 0.3 studs, a lamp globe) with a
+  `PointLight` inside it.
+- Godrays / light shafts are a `Beam` between two attachments (Transparency sequence fading to
+  1, `LightEmission = 1`, `Width0` at the window, wider at the floor) or a `ParticleEmitter`
+  with a soft texture — never a tilted glass or transparent box.
+- Fog, dust, smoke, embers: `ParticleEmitter` on an invisible carrier part (`Transparency = 1`,
+  `CanCollide = false`). The carrier is a mount, not the effect; it never has a colour, a
+  material or Glass.
+- `Glass` is for windows and bottles, `ForceField` for force fields. Neither is a lighting tool.
+
+Never `game.Lighting` — see the hard rule at the top.
 
 ## Reading the report
 
@@ -316,8 +378,9 @@ top is 0 is two studs high, no picture needed. **Problems** carry the number to 
 | paper thin (< 0.1) | a size subtracted to nothing |
 | stranded (250+ studs) | a `*` that should be `+` |
 
-Flush contact isn't an overlap. Only parts touching nothing get the floating check. Fog volumes
-and light-shaft emitters are `Transparency = 1` boxes; skip their overlap lines.
+Flush contact isn't an overlap. Only parts touching nothing get the floating check. Particle
+carrier parts (`Transparency = 1`, holding an emitter) overlap everything by design; skip their
+overlap lines.
 
 ## The renderer
 
@@ -347,7 +410,7 @@ VMCP's own rasterizer (`server/src/scene.ts`), not Studio — works with Studio 
 - PNG lands in the server's `images/` dir under `name`; inlined when small, path printed always.
 
 `front` / `left` for proportions, `top` for footprint, `iso` for whether it reads. Wedges and
-rotated parts are where the picture earns its keep — the report can't see a backwards spandrel.
+rotated parts are where the picture earns its keep — the report can't see a backwards roof slope or a slit between two slabs.
 
 ## Existing regions
 
