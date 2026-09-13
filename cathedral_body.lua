@@ -1,6 +1,23 @@
 --------------------------------------------------------------------
--- RuinedCathedralMap — builder body v3 (runs inside function(root))
+-- RuinedCathedralMap — vmcp-build pipeline (design/blockout/detail/inspect)
 --------------------------------------------------------------------
+-- DESIGN
+-- MASSES: nave 27x20x24 + tower 17x28x15 + arm E/W 12.5x15x13 + choir 17x15x8
+--   + apse 13x16x7; front reads facade+rose+door, above reads a Latin cross.
+-- STRUCTURE: WT=2 walls carry aisle roofs; piers carry arches at y=8.9;
+--   clerestory carries nave roof to ridge; every size derives from GT=0.125,
+--   FL=1.025, WT=2, ZF=14, ZN=-7.1; buttresses brace each bay.
+-- ACCESS (all floor-level): front door 3.8w -> nave; nave<->aisles via open
+--   first arcade bay + 2.7w breaches both side walls; nave<->crossing 9w
+--   tower passage; crossing<->arms 5w passages; arms<->outside 4w ends
+--   (sill 0.6); crossing<->choir open; choir<->apse 3.4w (sill 0.5).
+-- PALETTE: wall=Limestone, wall2=tower/piers, plinth=Cobblestone, trim=
+--   Sandstone (0.2 proud sills/caps), roof=Slate, timber/plank=Wood,
+--   floor/marble=paving, rock=rubble/graves, bone=skeleton, iron/bronze=
+--   armour+lantern, leaf=canopy, flame=Neon candles.
+-- VARIETY: rng 1906; graves 6 kinds + jitter; trees 4 kinds 0.9-1.15 scale;
+--   per-bay ruin state tables, one code path.
+local INSPECT = false -- phase-4 cutaway: true fades roofs + west nave wall
 local rng = Random.new(1906)
 local function jit(a) return (rng:NextNumber() * 2 - 1) * a end
 local function rr(lo, hi) return lo + rng:NextNumber() * (hi - lo) end
@@ -68,13 +85,6 @@ local function box(parent, name, size, cf, m, props)
 	return finish(p, m, props)
 end
 
-local function wedge(parent, name, size, cf, m, props)
-	local p = ensure(parent, name, "WedgePart")
-	p.Size = size
-	p.CFrame = cf
-	return finish(p, m, props)
-end
-
 local function cyl(parent, name, dia, len, cf, m, props)
 	local p = ensure(parent, name, "Part")
 	p.Shape = Enum.PartType.Cylinder
@@ -121,27 +131,15 @@ local Vines = ensure(root, "Vines", "Model")
 local Atmos = ensure(root, "Atmos", "Model")
 
 -- ============ masonry helpers ============
-local function archParts(parent, name, frame, span, rise, depth, thick, m)
-	local half = span / 2
-	local len, ang = math.sqrt(half * half + rise * rise), math.atan2(rise, half)
-	for sd = -1, 1, 2 do
-		box(parent, name .. (sd < 0 and "L" or "R"), Vector3.new(len, thick, depth),
-			frame * CFrame.new(sd * half / 2, rise / 2, 0) * CFrame.Angles(0, 0, -sd * ang) * CFrame.new(0, -thick / 2, 0), m)
+local function archParts(parent, name, frame, span, rise, depth, m)
+	-- corbelled arch: stacked boxes stepping inward, keystone at the apex
+	local steps = math.max(2, math.floor(rise / 0.55))
+	for i = 1, steps do
+		local ch = rise / steps
+		local w = span * (1 - ((i - 1) / steps) * 0.85)
+		box(parent, name .. "C" .. i, Vector3.new(depth, ch + 0.04, w), frame * CFrame.new(0, (i - 0.5) * ch - 0.02, 0), m)
 	end
-	box(parent, name .. "Key", Vector3.new(thick * 1.3, thick * 1.5, depth + 0.3),
-		frame * CFrame.new(0, rise - thick * 0.2, 0), m)
-end
-
-local function spandrels(parent, name, frame, span, rise, depth, m, upTo)
-	for sd = -1, 1, 2 do
-		wedge(parent, name .. (sd < 0 and "L" or "R"), Vector3.new(depth, rise, span / 2),
-			frame * CFrame.new(sd * span / 4, rise / 2, 0) * CFrame.Angles(0, sd * math.pi / 2, 0) * CFrame.Angles(math.pi, 0, 0), m)
-	end
-	if upTo and upTo > rise - 0.2 then
-		local hh = upTo - rise + 0.15
-		box(parent, name .. "Head", Vector3.new(depth, hh, span),
-			frame * CFrame.new(0, rise - 0.075 + hh / 2, 0), m)
-	end
+	box(parent, name .. "Key", Vector3.new(depth * 1.1, rise * 0.5, 1.4), frame * CFrame.new(0, rise + rise * 0.22, 0), m)
 end
 
 local function lancetBay(parent, name, thick, L, h, cf, m, w)
@@ -155,8 +153,16 @@ local function lancetBay(parent, name, thick, L, h, cf, m, w)
 	box(parent, name .. "PL", Vector3.new(thick, ph, pw), cf * CFrame.new(0, sill + ph / 2, -(ow / 2 + pw / 2)), m)
 	box(parent, name .. "PR", Vector3.new(thick, ph, pw), cf * CFrame.new(0, sill + ph / 2, (ow / 2 + pw / 2)), m)
 	local af = cf * CFrame.new(0, spring, 0) * CFrame.Angles(0, math.pi / 2, 0)
-	archParts(parent, name .. "Arch", af, ow, rise, thick, 0.7, m)
-	spandrels(parent, name .. "Sp", af, ow, rise, thick, m, h - spring)
+	archParts(parent, name .. "Arch", af, ow, rise, thick, m)
+	local above = h - spring
+	if above > 0.3 then
+		box(parent, name .. "PUL", Vector3.new(thick, above, pw), cf * CFrame.new(0, spring + above / 2, -(ow / 2 + pw / 2)), m)
+		box(parent, name .. "PUR", Vector3.new(thick, above, pw), cf * CFrame.new(0, spring + above / 2, (ow / 2 + pw / 2)), m)
+		local headH = above - rise
+		if headH > 0.2 then
+			box(parent, name .. "Head", Vector3.new(thick, headH, ow), cf * CFrame.new(0, spring + rise + headH / 2, 0), m)
+		end
+	end
 end
 
 local function doorBay(parent, name, thick, L, h, cf, m)
@@ -165,8 +171,11 @@ local function doorBay(parent, name, thick, L, h, cf, m)
 	box(parent, name .. "PL", Vector3.new(thick, h, pw), cf * CFrame.new(0, h / 2, -(ow / 2 + pw / 2)), m)
 	box(parent, name .. "PR", Vector3.new(thick, h, pw), cf * CFrame.new(0, h / 2, (ow / 2 + pw / 2)), m)
 	local af = cf * CFrame.new(0, spring, 0) * CFrame.Angles(0, math.pi / 2, 0)
-	archParts(parent, name .. "Arch", af, ow, rise, thick, 0.8, m)
-	spandrels(parent, name .. "Sp", af, ow, rise, thick, m, h - spring)
+	archParts(parent, name .. "Arch", af, ow, rise, thick, m)
+	local headH = h - spring - rise
+	if headH > 0.2 then
+		box(parent, name .. "Head", Vector3.new(thick, headH, ow), cf * CFrame.new(0, spring + rise + headH / 2, 0), m)
+	end
 end
 
 local function bayFor(parent, nm, thick, L, cf, m, s)
@@ -186,7 +195,7 @@ local function wallZ(parent, tag, x, z0, z1, spec, thick, m)
 	local n = #spec
 	local L = (z0 - z1) / n
 	for i = 1, n do
-		bayFor(parent, tag .. i, thick, L, CFrame.new(x, GT, z0 - (i - 0.5) * L), m, spec[i])
+		bayFor(parent, tag .. i, thick, L + 0.12, CFrame.new(x, GT, z0 - (i - 0.5) * L), m, spec[i])
 	end
 end
 
@@ -194,14 +203,14 @@ local function wallX(parent, tag, z, x0, x1, spec, thick, m)
 	local n = #spec
 	local L = (x1 - x0) / n
 	for i = 1, n do
-		bayFor(parent, tag .. i, thick, L, CFrame.new(x0 + (i - 0.5) * L, GT, z) * CFrame.Angles(0, math.pi / 2, 0), m, spec[i])
+		bayFor(parent, tag .. i, thick, L + 0.12, CFrame.new(x0 + (i - 0.5) * L, GT, z) * CFrame.Angles(0, math.pi / 2, 0), m, spec[i])
 	end
 end
 
 local function buttress(parent, name, cf, h, m)
 	box(parent, name .. "A", Vector3.new(1.3, h * 0.55, 2), cf * CFrame.new(0.5, h * 0.275, 0), m)
 	box(parent, name .. "B", Vector3.new(0.8, h * 0.45, 1.6), cf * CFrame.new(0.25, h * 0.55 + h * 0.225, 0), m)
-	wedge(parent, name .. "C", Vector3.new(0.8, 0.3, 1.6), cf * CFrame.new(0.25, h + 0.15, 0) * CFrame.Angles(0, math.pi / 2, 0), m)
+	box(parent, name .. "C", Vector3.new(0.8, 0.3, 1.9), cf * CFrame.new(0.25, h + 0.15, 0), m)
 end
 
 -- ============ ground, paths, plaza ============
@@ -260,20 +269,22 @@ box(Shell, "JunctionFillW", Vector3.new(2, 8.0, 0.95), CFrame.new(-9.5, 5.08, -6
 -- front facade
 local nich = { ow = 1.5, sill = 2.8, spring = 8, rise = 1.9 }
 wallX(FrontM, "Front", 15, -13.5, 13.5, { 18, { h = 18, win = nich }, { h = 18, win = { door = true } }, { h = 18, win = nich }, 18 }, WT, P.wall)
-wedge(FrontM, "GableL", Vector3.new(WT, 8, 6.75), CFrame.new(-3.375, GT + 22, 15) * CFrame.Angles(0, -math.pi / 2, 0), P.wall)
-wedge(FrontM, "GableR", Vector3.new(WT, 8, 6.75), CFrame.new(3.375, GT + 22, 15) * CFrame.Angles(0, math.pi / 2, 0), P.wall)
+for gi = 0, 4 do -- gable as stepped courses, shorter toward the apex
+	local gw = 13.5 - gi * 2.9
+	box(FrontM, "GableC" .. gi, Vector3.new(gw, 1.6, WT), CFrame.new(0, GT + 18 + gi * 1.6 + 0.8, 15), P.wall)
+end
 box(FrontM, "RoseBand", Vector3.new(7, 1.2, 2.2), CFrame.new(0, GT + 18.6, 15), P.trim)
 for i = 1, 8 do
 	if not (i == 6 or i == 7 or i == 8) then
 		local a = (i - 0.5) * math.pi / 4
-		box(FrontM, "Rose" .. i, Vector3.new(1.2, 0.9, 1.6),
+		box(FrontM, "Rose" .. i, Vector3.new(1.2, 0.9, 2.4),
 			CFrame.new(math.cos(a) * 2, GT + 21 + math.sin(a) * 2, 15) * CFrame.Angles(0, 0, a + math.pi / 2), P.trim)
 	end
 end
-box(FrontM, "RoseMullV", Vector3.new(0.25, 3.5, 1.2), CFrame.new(0, GT + 21, 15), P.trim)
-box(FrontM, "RoseMullH", Vector3.new(3.5, 0.25, 1.2), CFrame.new(0, GT + 21, 15), P.trim)
-box(FrontM, "GlassA", Vector3.new(1.1, 1.1, 0.12), CFrame.new(-0.8, GT + 21.8, 15), P.iron, { Transparency = 0.45, Color = Color3.fromRGB(150, 60, 50) })
-box(FrontM, "GlassB", Vector3.new(1.1, 1.1, 0.12), CFrame.new(0.9, GT + 20.4, 15), P.iron, { Transparency = 0.45, Color = Color3.fromRGB(60, 80, 160) })
+box(FrontM, "RoseMullV", Vector3.new(0.25, 3.5, 2.4), CFrame.new(0, GT + 21, 15), P.trim)
+box(FrontM, "RoseMullH", Vector3.new(3.5, 0.25, 2.4), CFrame.new(0, GT + 21, 15), P.trim)
+box(FrontM, "GlassA", Vector3.new(1.1, 1.1, 2.3), CFrame.new(-0.8, GT + 21.8, 15), P.iron, { Transparency = 0.45, Color = Color3.fromRGB(150, 60, 50) })
+box(FrontM, "GlassB", Vector3.new(1.1, 1.1, 2.3), CFrame.new(0.9, GT + 20.4, 15), P.iron, { Transparency = 0.45, Color = Color3.fromRGB(60, 80, 160) })
 
 -- tower: passage arches, jagged tops
 local passNS = { ow = 9, y0 = 0, sill = 0.6, spring = 13, rise = 3.2 }
@@ -321,7 +332,7 @@ for sd = -1, 1, 2 do
 		end
 		if i > 0 and i < 5 then
 			local af = CFrame.new(ax, FL + 8.9, z - 1.785) * CFrame.Angles(0, math.pi / 2, 0)
-			archParts(Shell, `Arcade` .. tag .. i, af, 3, 1.6, 2.2, 0.7, P.wall2)
+			archParts(Shell, `Arcade` .. tag .. i, af, 3, 1.6, 2.2, P.wall2)
 		end
 	end
 end
@@ -391,6 +402,8 @@ for i = 1, 2 do
 		slabBetween(Roofs, `ChoirRoofN` .. i, Vector3.new(-3.2, 15.9, zc), Vector3.new(0, 17.5, zc), 4.0, 0.5, P.roof)
 	end
 end
+box(Roofs, "ChoirRidge1", Vector3.new(1.2, 0.7, 4.0), CFrame.new(0, GT + 17.4, -27.9), P.roof)
+box(Roofs, "ChoirRidge2", Vector3.new(1.2, 0.7, 4.0), CFrame.new(0, GT + 17.4, -31.9), P.roof)
 
 -- crossing rubble + fallen bell
 local rub = { { 1.2, -11.0 }, { 2.2, -12.6 }, { 0.4, -12.8 }, { 2.2, -14.5 }, { -2.2, -16.6 }, { 4.8, -13.5 } }
@@ -533,7 +546,7 @@ for i, lp in { { -0.28, -0.28 }, { 0.28, -0.28 }, { -0.28, 0.28 }, { 0.28, 0.28 
 	rodBetween(lantern, `Post` .. i, (lf * CFrame.new(lp[1], 0.1, lp[2])).Position, (lf * CFrame.new(lp[1], 1.0, lp[2])).Position, 0.07, P.iron)
 end
 box(lantern, "Cap", Vector3.new(0.8, 0.12, 0.8), lf * CFrame.new(0, 1.06, 0), P.iron)
-wedge(lantern, "CapTop", Vector3.new(0.8, 0.25, 0.8), lf * CFrame.new(0, 1.24, 0) * CFrame.Angles(0, math.pi / 4, 0), P.iron)
+box(lantern, "CapTop", Vector3.new(0.6, 0.3, 0.6), lf * CFrame.new(0, 1.27, 0), P.iron)
 for i, lp in { { 0, -0.34 }, { 0, 0.34 }, { -0.34, 0 }, { 0.34, 0 } } do
 	box(lantern, `Pane` .. i, Vector3.new(lp[1] == 0 and 0.62 or 0.05, 0.8, lp[1] == 0 and 0.05 or 0.62),
 		lf * CFrame.new(lp[1], 0.55, lp[2]), P.glass, { Transparency = 0.45 })
@@ -590,7 +603,7 @@ for i, cp in { { -34, -46 }, { 8, -46 }, { -34, -70 }, { 8, -70 } } do
 	box(Cemetery, `CemPostCap` .. i, Vector3.new(1.5, 0.25, 1.5), CFrame.new(cp[1], GT + 2.8, cp[2]), P.rock)
 end
 box(Cemetery, "GatePostS", Vector3.new(1.3, 3.6, 1.3), CFrame.new(8.35, GT + 1.8, -51.5), P.rock)
-wedge(Cemetery, "GatePostCapS", Vector3.new(1.6, 0.5, 1.6), CFrame.new(8.35, GT + 3.85, -51.5) * CFrame.Angles(0, math.pi / 4, 0), P.rock)
+box(Cemetery, "GatePostCapS", Vector3.new(1.7, 0.5, 1.7), CFrame.new(8.35, GT + 3.85, -51.5), P.rock)
 box(Cemetery, "GatePostN", Vector3.new(1.3, 3.2, 1.3), CFrame.new(8.35, GT + 1.6, -56.5), P.rock)
 
 local function grave(parent, name, x, z, yaw, kind)
@@ -684,7 +697,7 @@ local function tree(parent, name, x, z, kind, s)
 	elseif kind == "snag" then
 		local h = rr(6.5, 9) * s
 		col(g, "Trunk", rr(1.2, 1.6) * s, h, f * CFrame.new(0, h / 2, 0), P.barkDk)
-		wedge(g, "Break", Vector3.new(1.4 * s, 1.6, 1.4 * s), f * CFrame.new(0, h + 0.7, 0) * CFrame.Angles(math.pi, 0, 0), P.barkDk)
+		box(g, "Break", Vector3.new(1.4 * s, 1.6, 1.4 * s), f * CFrame.new(0, h + 0.7, 0) * CFrame.Angles(jit(0.3), rotY(), jit(0.3)), P.barkDk)
 		rodBetween(g, "Stub1", (f * CFrame.new(0, h * 0.6, 0)).Position, (f * CFrame.new(1.8, h * 0.6 + 1.4, 0.6)).Position, 0.5, P.bark)
 		rodBetween(g, "Stub2", (f * CFrame.new(0, h * 0.4, 0)).Position, (f * CFrame.new(-1.5, h * 0.4 + 1, -1.2)).Position, 0.4, P.bark)
 	end
@@ -748,15 +761,30 @@ cyl(Forest, "LogEnd", 1.0, 0.12, logF * CFrame.new(0, 0, 3.82), P.plank)
 tree(Cemetery, "CemTree", -16, -48.5, "snag", 0.8)
 
 -- ============ atmosphere: shafts, dust, moon ============
-local function shaft(parent, name, a, b, wide, thick)
-	local sh = slabBetween(parent, name, a, b, wide, thick, P.glass,
-		{ Transparency = 0.88, CanCollide = false, CastShadow = false, CanQuery = false, CanTouch = false })
-	return sh
+local function godBeam(parent, name, a, b, w0, w1)
+	local function mount(pos, tag)
+		local anchor = box(parent, name .. tag, Vector3.new(0.3, 0.3, 0.3), CFrame.new(pos), nil,
+			{ Transparency = 1, CanCollide = false, CastShadow = false, CanQuery = false, CanTouch = false })
+		return ensure(anchor, "Att", "Attachment")
+	end
+	local att0, att1 = mount(a, "A"), mount(b, "B")
+	local beam = ensure(att0.Parent, "Beam", "Beam")
+	beam.Attachment0 = att0
+	beam.Attachment1 = att1
+	beam.Texture = "rbxasset://textures/particles/smoke_main.dds"
+	beam.TextureMode = Enum.TextureMode.Stretch
+	beam.TextureSpeed = 0.05
+	beam.FaceCamera = true
+	beam.Width0 = w0
+	beam.Width1 = w1
+	beam.LightEmission = 1
+	beam.Transparency = NumberSequence.new(0.86, 1)
+	beam.Color = ColorSequence.new(Color3.fromRGB(190, 208, 245))
 end
-shaft(Atmos, "ShaftTower", Vector3.new(1.8, 26.5, -14.8), Vector3.new(-1.6, 1.4, -18.2), 5.2, 5.2)
-shaft(Atmos, "ShaftNaveS", Vector3.new(2.2, 15.5, -5.2), Vector3.new(-0.6, 1.4, -6.8), 3.0, 2.6)
-shaft(Atmos, "ShaftNaveN", Vector3.new(-1.8, 20.5, 11.4), Vector3.new(0.7, 1.4, 9.9), 3.0, 2.6)
-shaft(Atmos, "ShaftApse", Vector3.new(0.5, 15.5, -38.6), Vector3.new(-0.9, 2.0, -37.6), 2.6, 2.2)
+godBeam(Atmos, "ShaftTower", Vector3.new(1.0, 24.0, -15.5), Vector3.new(-1.2, 1.6, -17.6), 4.5, 7.0)
+godBeam(Atmos, "ShaftNaveS", Vector3.new(2.0, 13.5, -5.4), Vector3.new(-0.4, 1.5, -6.6), 2.5, 4.0)
+godBeam(Atmos, "ShaftNaveN", Vector3.new(-1.6, 18.5, 11.2), Vector3.new(0.5, 1.5, 10.1), 2.5, 4.0)
+godBeam(Atmos, "ShaftApse", Vector3.new(0.3, 13.5, -38.4), Vector3.new(-0.7, 2.0, -37.7), 2.2, 3.2)
 local function dust(parent, name, cf)
 	local holder = box(parent, name, Vector3.new(0.4, 0.4, 0.4), cf, nil,
 		{ Transparency = 1, CanCollide = false, CastShadow = false, CanQuery = false, CanTouch = false })
@@ -818,6 +846,16 @@ cc.Saturation = -0.12
 cc.TintColor = Color3.fromRGB(214, 224, 255)
 cc.Parent = Lighting
 
+-- ============ INSPECT cutaway (phase 4b) ============
+if INSPECT then
+	for _, d in Roofs:GetDescendants() do
+		if d:IsA("BasePart") then d.Transparency = 0.75 end
+	end
+	for _, d in Shell:GetDescendants() do
+		if d:IsA("BasePart") and d.Name:sub(1, 9) == "NaveWallW" then d.Transparency = 0.75 end
+	end
+end
+
 -- ============ QA summary ============
 local counts, total = {}, 0
 local sigs, dupes = {}, {}
@@ -843,6 +881,7 @@ for k, v in counts do table.insert(parts, k .. "=" .. v) end
 table.sort(parts)
 print(("[QA] %s: %d parts | %s"):format(root.Name, total, table.concat(parts, ", ")))
 if #dupes > 0 then
+
 	print(("[QA] WARNING near-duplicate parts (%d): %s"):format(#dupes, table.concat(dupes, ", ", 1, math.min(8, #dupes))))
 else
 	print("[QA] no near-duplicate parts detected")

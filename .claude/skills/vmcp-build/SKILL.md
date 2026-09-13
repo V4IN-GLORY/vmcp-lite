@@ -203,8 +203,12 @@ optional, not "looked fine":
 - **Covered up.** Every named feature is findable in at least one panel. A window the porch roof
   now hides, a door behind a buttress, a prop inside a wall, a feature only visible from an
   angle nobody stands at.
-- **Scale.** Doors 7–8 tall, steps ~1 rise, chair seat ~2, table ~3, a player is 5. Group against
-  group — a porch a third the height of the door it shelters, a tree taller than the tower.
+- **Scale.** Check every opening, step, ceiling and prop against the Scale table with the
+  `ScaleRef` figure in frame — a player is 5 tall and 2 wide, and if it can't walk through
+  a door, up a step, or under a beam, the number is wrong. Then group against group — a porch
+  a third the height of the door it shelters, a tree taller than the tower.
+- **Particles.** Every emitter has a texture, size and transparency curve, lifetime, rate and
+  speed set for what it is (fog, motes, embers, smoke). No default white sparkles anywhere.
 - **Orientation.** Wedges sloping the wrong way, a roof pitch that reads inverted from the back,
   a rotated roof box sloping into the wall. The renderer models wedges as Roblox does — a wedge that
   looks backwards is backwards.
@@ -310,10 +314,38 @@ Allowed non-box uses, and only these:
   signs or anything on a prop.
 
 Everything else — arches, gables, canopies, tree crowns, stairs, buttress caps, roof edges — is
-boxes. A pointed arch is stacked boxes stepping inward; a gable is a wall stack with shorter
-courses toward the top; a tree crown is 3–6 overlapping boxes at slightly different sizes and
-rotations, never a wedge cluster; a roof is two thin boxes rotated to the pitch (`CFrame.Angles`
-about the ridge axis), meeting at a ridge box that covers the seam.
+boxes, **rotated to follow the shape, not stepped**. Stepped boxes read as a staircase, and a
+staircase over a doorway is ugly. A gable is a wall stack with shorter courses toward the top
+(that one *is* stepped in life); a tree crown is 3–6 overlapping boxes at slightly different
+sizes and rotations, never a wedge cluster; a roof is two thin boxes rotated to the pitch
+(`CFrame.Angles` about the ridge axis), meeting at a ridge box that covers the seam.
+
+**Arches** are the case that gets this wrong most. An arch is a run of short boxes (voussoirs),
+each rotated so its long axis is tangent to the curve, each overlapping its neighbour by
+`PROUD` so there's no slit between them. Never a stack of ever-shorter horizontal boxes:
+
+```lua
+-- frame: centre of the springing line, X along the span, Y up, Z through the wall.
+-- Round arch of `n` voussoirs over `span`, `rise` = span/2 for a semicircle, less for a segmental one.
+-- Pointed: run this twice with half the span and each half's centre offset, meeting at a keystone.
+local function arch(parent, name, frame, span, rise, depth, thick, n)
+	local r = (span * span / 4 + rise * rise) / (2 * rise)          -- radius of the arc through both feet and the apex
+	local cy = rise - r                                                -- arc centre sits below the springing line
+	local a0 = math.acos((span / 2) / r)                               -- angle at the right foot
+	local step = (math.pi - 2 * a0) / n
+	local seg = 2 * r * math.sin(step / 2) + PROUD                     -- chord length, plus overlap
+	for i = 1, n do
+		local a = a0 + (i - 0.5) * step
+		local cf = frame * CFrame.new(0, cy, 0) * CFrame.Angles(0, 0, a) * CFrame.new(r - thick / 2, 0, 0)
+		box(parent, `{name}{i}`, Vector3.new(thick, seg, depth), cf, P.trim)
+	end
+end
+```
+
+`n = 7–11` for a doorway, more for a big window. The voussoirs sit `thick` deep against the
+opening; the wall fill above them (a box from the apex to the wall top plus a box each side
+from the springing line up) is rectangular and tucks `PROUD` behind the arch's back face so
+the curve is what you see. A keystone is one voussoir made taller and `PROUD` prouder.
 
 **No gaps.** A wall is continuous from floor to roof and from corner to corner. A roof closes.
 The rule that makes this true by construction:
@@ -351,6 +383,30 @@ list. A window is the same with a sill band below.
 **Rubble and the ground.** Rocks, roots, fallen beams and leaning stones sit 20–30% into the
 ground on purpose; those overlap/floating lines are meant, say so.
 
+### Scale — a Roblox character is the ruler
+
+R15 is ~5 studs tall, ~2 wide, 4.5 at the eyes, and it steps up 1 stud without jumping. Every
+size in the build is checked against that, not against what looks right in an orthographic
+panel. Reference numbers, use them as the derivation inputs:
+
+| thing | studs |
+|---|---|
+| doorway | 4–6 wide, 7–8 tall (a grand door 6–8 wide, 10–14 tall) |
+| corridor / aisle | ≥ 4 wide, 6 for two abreast |
+| room ceiling | ≥ 8; a hall 12–16; a nave 24–36 with the aisles at 10–14 |
+| step | 1 rise, 1.5–2 tread; a grand stair 0.75 rise |
+| window sill | 3–4 above the floor; a tall church window 4 up, 12–20 tall, 3–5 wide |
+| railing / parapet | 3; a low wall a player sits on 1.5–2 |
+| table / altar | 3 tall; bench / pew seat 1.5, back 3 |
+| column | 1.5–3 wide; a nave pier 3–4 |
+| wall thickness | 1–2 for a house, 3–4 for a cathedral |
+| tree | 8–14 trunk to first branch for a big one, 20–30 to the crown |
+| gravestone | 2–3 tall, 1.5 wide, 0.4 thick |
+
+Put a `ScaleRef` part (2 x 5 x 1, Neon) at the entrance during passes 2 and 3 so every render
+has a person in it; remove it in the last apply. If a door looks like a slot beside it or a
+step comes up to its chest, the numbers are wrong, whatever the design block says.
+
 ### Lighting inside the build
 
 Light is made with light instances, not with geometry pretending to be light:
@@ -365,6 +421,22 @@ Light is made with light instances, not with geometry pretending to be light:
 - Fog, dust, smoke, embers: `ParticleEmitter` on an invisible carrier part (`Transparency = 1`,
   `CanCollide = false`). The carrier is a mount, not the effect; it never has a colour, a
   material or Glass.
+- **A default `ParticleEmitter` is a white sparkle spray and is never shipped.** Every emitter
+  gets a full setup: `Texture`, `Color`, `Size` (a `NumberSequence` that grows or fades),
+  `Transparency` (0 → 1 over life, never constant), `Lifetime`, `Rate`, `Speed`,
+  `SpreadAngle`, `Drag`/`Acceleration`, `LightEmission`, `Rotation`/`RotSpeed`. Write a
+  helper per effect and name the effect, e.g.:
+  - *fog*: big soft texture, `Size` 8–14, `Transparency` `{0: 1, 0.3: 0.85, 1: 1}`,
+    `Lifetime` 8–14, `Rate` 1–2, `Speed` 0.3–0.8, `Drag` 1, slow `RotSpeed`, emitter shape a
+    wide flat box hugging the floor, `LightEmission` 0.
+  - *dust motes in a light shaft*: tiny texture, `Size` 0.05–0.15, `Rate` 6–12, `Speed`
+    0.1–0.3, `Lifetime` 6–10, `Acceleration` slightly negative Y, `LightEmission` 0.6,
+    emitter box the shape of the shaft.
+  - *embers / candle sparks*: `Size` 0.1 → 0, warm `Color`, `Speed` 1–3 upward,
+    `Acceleration` `(0, -1, 0)`, `Lifetime` 1–2, `Rate` 2–5, `LightEmission` 1.
+  - *smoke*: `Size` 0.5 → 3, grey, `Transparency` `{0: 0.6, 1: 1}`, `Speed` 1, `Drag` 2.
+  Restrained: a few emitters where they mean something (the light shaft, the altar candles, the
+  low ground) — not one on every part.
 - `Glass` is for windows and bottles, `ForceField` for force fields. Neither is a lighting tool.
 
 Never `game.Lighting` — see the hard rule at the top.
