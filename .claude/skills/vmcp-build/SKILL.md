@@ -457,6 +457,30 @@ outside), and a block from the lintel to the wall top. Write it once as `opening
 length, openings)` and every wall with holes is one call. Opening sizes come from the access
 list. A window is the same with a sill band below.
 
+**Glass fills the whole opening.** A pane that stops at the springing line, or a rectangle in a
+pointed window, reads as a window someone forgot to finish. One pane from the sill band to the
+springing, then 3-4 stacked slabs up the head whose width follows the ring's *inner* curve
+(measured 40-50% up each slab, so the slab's top corners bury themselves in the ring instead of
+leaving a sliver of sky). Stack the slab depths 0.05 apart so no two share a face. A mullion and a
+transom at the springing are what make it a window and not a hole. Ruin = whole windows left out
+(`glass = false`), not half a pane.
+
+**Gables are triangles, not staircases.** Courses stepped to the pitch read as a ziggurat from
+30 studs away. Fill the triangle with thin courses (rise ~1) and run a raking coping in the trim
+role up each slope over them (`CFrame.Angles(0, 0, -side * pitch)`, 0.5 proud of the wall, half a
+stud past the eave); the coping hides every step and the silhouette is one clean line. A small
+finial on the apex reads as the building's own, not the roof's.
+
+**Cutaway flags go back off before the user looks.** `INSPECT = true` is a render tool. Every apply
+that ships to the place is done with it `false`; a roof left at 0.75 transparency is the first thing
+the user sees in Studio.
+
+**Around the building is part of the build.** A ruin on a billiard-table lawn looks placed, not
+found. Give the ground a `Grounds` group: shallow earth banks against the walls and corners
+(bedded 1-stud boxes, a few degrees of yaw), moss tufts clustered at the wall feet, stones shed
+from the walls within a few studs of them, a dressed block or two lying where a parapet fell.
+Twenty to forty parts, seeded, never a grid.
+
 **Placing props on things.** A candle hanging half off the back edge of the altar, a lantern
 in mid-air beside the table, a book sunk into the shelf — all the same bug: the prop's position
 was typed instead of derived from the surface it sits on. Props go on surfaces through one
