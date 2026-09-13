@@ -24,9 +24,8 @@ Tool.Definition = {
 		.. "an assertion. Contexts share ctx -- write ctx.thing = 1 anywhere and read ctx.thing "
 		.. 'anywhere else, or ctx:Await("thing", 2) to wait for it rather than hope. Every event '
 		.. "also gets vmcp: vmcp.Tool calls any other VMCP tool in any context, vmcp.Game.Require "
-		.. "reads a live module's real state, vmcp.Remotes watches remote traffic, vmcp.Audit reads "
-		.. "handler source and ranks exploitable remotes, vmcp.Exploit "
-		.. "replays the game's own remote traffic with its arguments broken and abuses the ranked ones, vmcp.Bench times a "
+		.. "reads a live module's real state, vmcp.Remotes watches remote traffic, vmcp.Exploit "
+		.. "replays the game's own remote traffic with its arguments broken and abuses remotes you flag, vmcp.Bench times a "
 		.. "function under load. Client events also "
 		.. "get input, for real keys and clicks. Starts its own playtest if one isn't already open.",
 	inputSchema = {

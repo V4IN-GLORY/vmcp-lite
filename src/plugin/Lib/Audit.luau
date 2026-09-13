@@ -1,117 +1,46 @@
 --!strict
 
--- Reads the game's own handler source and points at the remotes worth attacking first.
+-- Collects the code a model needs to review the game's remotes for real.
 --
--- This is the static half of the loop. Exploit fires remotes from a client and watches what falls
--- over; that finds bugs but it's blind -- it can only try things. Audit reads the code the traffic
--- lands in and says *why* a remote is likely exploitable: it grants currency from a number the
--- client sent, it destroys an Instance the client named without checking who owns it, it never
--- rate-limits. The output is a short list of leads, ranked, so the abuse step has somewhere to aim
--- instead of fuzzing four hundred remotes evenly.
+-- The hard part of a security pass isn't the reasoning -- a model can spot a missing ownership
+-- check or a client-authoritative grant on sight. The hard part is putting the *right* code in
+-- front of it: out of a whole game, which scripts actually handle remotes, and which remote does
+-- each one serve. That's what this does. It finds every server-side remote binding, traces the
+-- variable back to the remote it belongs to, and returns the full source of each handling script
+-- so the model reads the real thing -- requires, validation helpers, the lot -- not a sliced window.
 --
--- It reads Script.Source, so it only means anything on the plugin/server side of a Studio session,
--- not from a real client. And it's a text scanner, not a compiler: it matches the shapes that
--- almost always mean trouble, over a fixed window after each handler binding. It will miss a bug
--- hidden behind a helper call and it will occasionally flag a handler that's actually fine. Treat a
--- finding as "aim Exploit here", not "proven" -- the dynamic pass is what proves it.
+-- It reads Script.Source, so it only works on the plugin/server side of a Studio session. It does
+-- no grading of its own on purpose: the point is that the model reviews the code, decides which
+-- remotes are exploitable, and hands those to Exploit to abuse. This just gathers.
 
 local Audit = {}
 
-export type Finding = {
-	remote: string,
-	handler: string,
-	severity: string, -- "high" | "medium" | "low"
-	kind: string,
-	message: string,
-	evidence: string,
+export type Handler = {
+	script: string,
+	remotes: { string }, -- remote names this script binds a server handler for
+	source: string,
 }
 
-local RANK: { [string]: number } = { high = 3, medium = 2, low = 1 }
-
--- Words that mean "this is the economy". A .Value write next to one of these, fed by a client
--- argument, is the classic grant-yourself-cash bug.
-local CURRENCY = {
-	"leaderstats",
-	"Cash",
-	"Coins",
-	"Gold",
-	"Money",
-	"Gems",
-	"Credits",
-	"Points",
-	"Currency",
-	"Tokens",
-	"Bucks",
-	"Balance",
-	"Wallet",
+export type Surface = {
+	handlers: { Handler },
+	remotes: { { name: string, path: string, class: string } },
+	-- Remotes with no server-side binding found in any readable script: client-only, or dispatched
+	-- through a table the tracer can't follow. Worth a manual look.
+	orphans: { string },
 }
 
--- Any of these appearing in the body counts as "the handler looked at its arguments". Absence is
--- the signal, not presence -- a mutating handler with none of these trusts whatever it's handed.
-local VALIDATION = {
-	"type(",
-	"typeof(",
-	":IsA(",
-	"assert(",
-	"tonumber(",
-	"~= nil",
-	"== nil",
-	"math.clamp",
-	"math.max",
-	"math.min",
-	"string.len",
-}
-
--- Proof the handler tied the request back to the caller. Ownership bugs are the absence of all of
--- these while still acting on a client-named Instance.
-local OWNERSHIP = {
-	"GetPlayerFromCharacter",
-	"== player",
-	"player ==",
-	".Owner",
-	"Ownership",
-	"player.Character",
-	"player.UserId",
-	".UserId ==",
-}
-
-local RATE = {
-	"os.clock",
-	"tick(",
-	"debounce",
-	"Debounce",
-	"cooldown",
-	"Cooldown",
-	"lastFire",
-	"lastCall",
-	"RateLimit",
-	"ratelimit",
-	"Throttle",
-}
-
-local function hasAny(body: string, words: { string }): boolean
-	for _, word in words do
-		if string.find(body, word, 1, true) then
-			return true
-		end
-	end
-	return false
-end
-
-local function trim(line: string): string
-	return (line:gsub("^%s+", ""):gsub("%s+$", ""))
-end
+local MAX_SOURCE = 24000
 
 -- The remote a handler serves, read back from the code. Handlers bind through a variable
--- (`combat.OnServerEvent:Connect`), so find the variable, then find where it was pulled from a
--- remote by name. Falls back to the variable name itself when the source doesn't say.
-local function remoteName(source: string, var: string): string
+-- (`combat.OnServerEvent:Connect`), so find the variable, then find where it was assigned from a
+-- remote by name. Returns nil when the source doesn't say plainly enough to trust.
+local function remoteName(source: string, var: string): string?
 	for _, pattern in
 		{
 			`local%s+${var}%s*=%s*[^\n]-[:.]WaitForChild%s*%(%s*["'](.-)["']`,
 			`${var}%s*=%s*[^\n]-[:.]WaitForChild%s*%(%s*["'](.-)["']`,
-			`local%s+${var}%s*=%s*[%w%.]-%.([%w_]+)%s*[\n;]`,
-			`${var}%s*=%s*[%w%.]-%.([%w_]+)%s*[\n;]`,
+			`local%s+${var}%s*=%s*[%w%.%[%]"']-%.([%w_]+)%s*[\n;]`,
+			`${var}%s*=%s*[%w%.%[%]"']-%.([%w_]+)%s*[\n;]`,
 		}
 	do
 		local name = string.match(source, pattern)
@@ -119,232 +48,83 @@ local function remoteName(source: string, var: string): string
 			return name
 		end
 	end
-	return var
+	return nil
 end
 
--- The handler body, roughly. A fixed window after the binding rather than a balanced parse -- Luau
--- text doesn't balance cleanly (strings, `end` inside names) and the signals we're after all sit in
--- the first few dozen lines of a handler anyway.
-local WINDOW = 60
+-- Gather every RemoteEvent/RemoteFunction and every script that binds a server handler, with the
+-- handler's full source, so a model can review the real code.
+function Audit.Surface(root: Instance?): Surface
+	local scope = root or game
 
-local function analyse(path: string, source: string, out: { Finding })
-	-- Every server-side binding in this script: the variable it hangs off, and where it starts.
-	for var, rest in source:gmatch("([%w_]+)%.OnServer[EI][%w]-([^\n]*)") do
-		local isFunction = string.find(rest or "", "Invoke", 1, true) ~= nil
-		local bindAt = string.find(source, `${var}.OnServer`, 1, true)
-		if not bindAt then
-			continue
-		end
-
-		-- Grab the signature (may run onto the next couple of lines) and the window after it.
-		local head = source:sub(bindAt, bindAt + 4000)
-		local params = string.match(head, "function%s*%(%s*(.-)%s*%)") or ""
-		local body = ""
-		do
-			local lines = {}
-			local count = 0
-			for line in head:gmatch("[^\n]*\n?") do
-				table.insert(lines, line)
-				count += 1
-				if count > WINDOW then
-					break
-				end
-			end
-			body = table.concat(lines)
-		end
-
-		local name = remoteName(source, var)
-		local usesArgs = false
-		-- First param is the calling player; the rest are the payload. A handler that references
-		-- any payload param is one that acts on client data.
-		local payload: { string } = {}
-		local first = true
-		for token in params:gmatch("[%w_]+") do
-			if first then
-				first = false
-			else
-				table.insert(payload, token)
-				if string.find(body, token, 1, true) then
-					usesArgs = true
-				end
-			end
-		end
-
-		local function add(severity: string, kind: string, message: string, evidence: string?)
-			table.insert(out, {
-				remote = name,
-				handler = path,
-				severity = severity,
-				kind = kind,
-				message = message,
-				evidence = trim(evidence or ""),
-			})
-		end
-
-		local function lineWith(needle: string): string?
-			for line in body:gmatch("[^\n]+") do
-				if string.find(line, needle, 1, true) then
-					return line
-				end
-			end
-			return nil
-		end
-
-		local mutates = false
-
-		-- Currency written from a client argument: the grant bug.
-		local valueWrite = string.find(body, "%.Value%s*[%+%-]?=")
-		if valueWrite and hasAny(body, CURRENCY) then
-			mutates = true
-			if usesArgs then
-				add(
-					"high",
-					"currency-from-client",
-					"writes a currency/Value using an argument the client sent -- send a huge or negative amount",
-					lineWith(".Value") or lineWith("leaderstats")
-				)
-			end
-		end
-
-		-- Reflection / arbitrary code from client input.
-		if string.find(body, "loadstring", 1, true) or string.find(body, "getfenv", 1, true) then
-			add(
-				"high",
-				"arbitrary-code",
-				"loadstring/getfenv in a remote handler -- client can run code",
-				lineWith("loadstring") or lineWith("getfenv")
-			)
-		end
-
-		-- DataStore write driven by the handler: client can steer persistence.
-		if
-			string.find(body, "SetAsync", 1, true)
-			or string.find(body, "UpdateAsync", 1, true)
-			or string.find(body, "IncrementAsync", 1, true)
-		then
-			mutates = true
-			if usesArgs then
-				add(
-					"high",
-					"datastore-from-client",
-					"writes a DataStore from a remote handler using client input",
-					lineWith("Async")
-				)
-			end
-		end
-
-		-- Damage / health from a client number: client-authoritative combat.
-		if
-			string.find(body, ":TakeDamage(", 1, true)
-			or string.find(body, "Humanoid.Health", 1, true)
-			or string.find(body, ".Health%s*[%+%-]?=")
-		then
-			mutates = true
-			if usesArgs then
-				add(
-					"high",
-					"client-damage",
-					"applies damage/health from the handler -- client decides the number",
-					lineWith("Damage") or lineWith("Health")
-				)
-			end
-		end
-
-		-- Acts on a client-named Instance with no tie back to the caller: missing ownership check.
-		local touchesInstance = string.find(body, ":Destroy(", 1, true)
-			or string.find(body, "%.Parent%s*=")
-			or string.find(body, ":FindFirstChild", 1, true)
-			or string.find(body, ".Character", 1, true)
-		local instancePayload = false
-		for _, token in payload do
-			if string.find(body, `${token}%.`) or string.find(body, `${token}:`) then
-				instancePayload = true
-			end
-		end
-		if touchesInstance and instancePayload and not hasAny(body, OWNERSHIP) then
-			mutates = true
-			add(
-				"high",
-				"missing-ownership",
-				"acts on a client-supplied Instance without checking who owns it -- swap in another player's",
-				lineWith(":Destroy(") or lineWith(".Parent")
-			)
-		end
-
-		-- Whatever else, if it fires clients or sets Values it's a state change.
-		if string.find(body, "FireAllClients", 1, true) or valueWrite then
-			mutates = true
-		end
-
-		-- No validation at all on a handler that takes and uses a payload.
-		if usesArgs and not hasAny(body, VALIDATION) then
-			add(
-				if mutates then "high" else "medium",
-				"no-validation",
-				"uses its arguments without a single type/nil/range check",
-				`function(${params})`
-			)
-		end
-
-		-- Mutating handler with nothing that looks like a cooldown.
-		if mutates and not hasAny(body, RATE) then
-			add(
-				"medium",
-				"no-rate-limit",
-				"changes state with no visible rate limit -- spam it",
-				`${var}.OnServer${if isFunction then "Invoke" else "Event"}`
-			)
+	local remotes: { { name: string, path: string, class: string } } = {}
+	local bound: { [string]: boolean } = {}
+	for _, instance in scope:GetDescendants() do
+		if instance:IsA("RemoteEvent") or instance:IsA("UnreliableRemoteEvent") or instance:IsA("RemoteFunction") then
+			table.insert(remotes, { name = instance.Name, path = instance:GetFullName(), class = instance.ClassName })
 		end
 	end
-end
 
--- Scan everything readable under `root` (default: the whole DataModel). Returns findings ranked
--- worst-first.
-function Audit.Scan(root: Instance?): { Finding }
-	local out: { Finding } = {}
-	for _, instance in (root or game):GetDescendants() do
+	local handlers: { Handler } = {}
+	for _, instance in scope:GetDescendants() do
 		if not instance:IsA("LuaSourceContainer") then
 			continue
 		end
 		local ok, source = pcall(function()
 			return (instance :: any).Source
 		end)
-		if ok and type(source) == "string" and string.find(source, "OnServer", 1, true) then
-			analyse(instance:GetFullName(), source, out)
+		if not ok or type(source) ~= "string" or not string.find(source, "OnServer", 1, true) then
+			continue
+		end
+
+		local names: { string } = {}
+		local seen: { [string]: boolean } = {}
+		for var in source:gmatch("([%w_]+)%.OnServer[EI]") do
+			local name = remoteName(source, var) or var
+			if not seen[name] then
+				seen[name] = true
+				bound[name] = true
+				table.insert(names, name)
+			end
+		end
+
+		if #names > 0 then
+			table.insert(handlers, {
+				script = instance:GetFullName(),
+				remotes = names,
+				source = if #source > MAX_SOURCE
+					then source:sub(1, MAX_SOURCE) .. "\n-- ...(truncated, read the script directly for the rest)"
+					else source,
+			})
 		end
 	end
 
-	table.sort(out, function(a, b)
-		return RANK[a.severity] > RANK[b.severity]
-	end)
-	return out
-end
-
--- The remotes worth handing to Exploit, high severity first, each once. This is the bridge between
--- the two halves: Scan on the server/plugin side, cross the names through ctx, resolve and abuse
--- them on the client.
-function Audit.Harsh(findings: { Finding }): { string }
-	local seen: { [string]: boolean } = {}
-	local out: { string } = {}
-	for _, finding in findings do
-		if finding.severity == "high" and not seen[finding.remote] then
-			seen[finding.remote] = true
-			table.insert(out, finding.remote)
+	local orphans: { string } = {}
+	for _, remote in remotes do
+		if not bound[remote.name] then
+			table.insert(orphans, remote.path)
 		end
 	end
-	return out
+
+	return { handlers = handlers, remotes = remotes, orphans = orphans }
 end
 
-function Audit.Report(findings: { Finding }): string
-	if #findings == 0 then
-		return "scanned every readable script; no server remote handlers looked exploitable (or none were readable)"
+-- The surface as text, for a model to read and review. No verdicts -- that's the reader's job.
+function Audit.Render(surface: Surface): string
+	local lines = {
+		`{#surface.remotes} remote(s), {#surface.handlers} handling script(s). Review each handler `
+			.. "below for exploitable remotes -- missing type/ownership/rate checks, client-authoritative "
+			.. "state, anything a client could abuse -- then hand the ones you flag to Exploit.AbuseAll.",
+		"",
+	}
+	for _, handler in surface.handlers do
+		table.insert(lines, `=== {handler.script}  (binds: {table.concat(handler.remotes, ", ")}) ===`)
+		table.insert(lines, handler.source)
+		table.insert(lines, "")
 	end
-
-	local lines = { `{#findings} finding(s), worst first:` }
-	for _, finding in findings do
-		table.insert(lines, `  [{finding.severity:upper()}] {finding.remote} ({finding.kind}) -- {finding.message}`)
-		if finding.evidence ~= "" then
-			table.insert(lines, `      {finding.evidence}   @ {finding.handler}`)
+	if #surface.orphans > 0 then
+		table.insert(lines, `no server handler found for (client-only or dynamically dispatched -- look manually):`)
+		for _, path in surface.orphans do
+			table.insert(lines, `  {path}`)
 		end
 	end
 	return table.concat(lines, "\n")
