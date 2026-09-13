@@ -18,7 +18,7 @@ Updating the plugin therefore means: bump the package version, publish. Nothing 
 
 ## What changed in VMCP
 
-- `server/src/install-plugin.ts` — `installBundledPlugin()`: resolves `plugin/VMCP.rbxmx` next
+- `server/src/install-plugin.ts` — `installBundledPlugin()`: resolves `VMCP.rbxmx` next
   to `dist/`, compares with the installed copy, stages + renames if different.
   `VMCP_PLUGINS_DIR` overrides the destination folder.
 - `server/src/index.ts` — runs it first when `--auto-install-plugin` is in argv. Failure is
@@ -26,10 +26,10 @@ Updating the plugin therefore means: bump the package version, publish. Nothing 
 - `server/package.json`
   - `name`: `@v4in-glory/mcp-test` (npm scopes must be lowercase)
   - `private` removed
-  - `files`: `dist`, `plugin/VMCP.rbxmx`
-  - `build:plugin`: `rojo build ../plugin.project.json -o plugin/VMCP.rbxmx`
+  - `files`: `dist`, `VMCP.rbxmx`
+  - `build:plugin`: `rojo build ../plugin.project.json -o VMCP.rbxmx`
   - `prepack`: `npm run build && npm run build:plugin` — publish always bundles a fresh plugin
-- `.gitignore` — `server/plugin/` is build output, not source.
+- `.gitignore` — `server/VMCP.rbxmx` is build output, not source.
 
 The asset is named `VMCP.rbxmx` to match the file already in the Plugins folder, so the first
 install overwrites instead of creating a duplicate. The auth token lives in plugin settings

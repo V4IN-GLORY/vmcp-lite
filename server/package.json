@@ -13,7 +13,7 @@
     "token": "node scripts/print-token.mjs",
     "probe": "node scripts/probe.mjs",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
-    "build:plugin": "rojo build ../plugin.project.json -o plugin/VMCP.rbxmx",
+    "build:plugin": "rojo build ../plugin.project.json -o VMCP.rbxmx",
     "prepack": "npm run build && npm run build:plugin"
   },
   "dependencies": {
@@ -28,7 +28,7 @@
   },
   "files": [
     "dist",
-    "plugin/VMCP.rbxmx"
+    "VMCP.rbxmx"
   ],
   "private": true
 }
