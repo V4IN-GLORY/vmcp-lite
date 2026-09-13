@@ -1,5 +1,5 @@
 {
-  "name": "@v4in-glory/mcp-test",
+  "name": "vmcp-server",
   "version": "0.1.2",
   "type": "module",
   "bin": {
@@ -29,5 +29,6 @@
   "files": [
     "dist",
     "plugin/VMCP.rbxmx"
-  ]
+  ],
+  "private": true
 }
