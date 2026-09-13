@@ -53,9 +53,9 @@ that panel, and take another panel if you cannot. See the field notes at the end
 
 **Run the phases in fresh contexts, not one long conversation.** The phase loop is a series of small
 commits to a file on disk, so no pass needs the transcript that produced the last one. An audited
-1 500-part build spent 95 % of its 88 M tokens re-reading its own growing history and only 3.4 M on new
-input, across 270 requests made from a conversation that reached 644 k tokens. One phase per context,
-state on disk, a short report out — §9 has the numbers and the rules.
+1 500-part build spent 43.2 M of its 44.3 M tokens re-reading its own growing history, and 80 % of the
+input it did read fresh was text it had already seen. One phase per context, state on disk, a short
+report out — §9 has the numbers and the rules.
 
 **Accessibility is a requirement, not a nicety.** Unless the user says a space is sealed (a
 crypt, a decorative tower, a ruin with a collapsed stair), every interior space a player could
@@ -877,21 +877,31 @@ transcript of pass 29 — and yet that is exactly what a single-session build pa
 
 A real 1 500-part build, audited from its own session transcript (recipe at the end of this section):
 
-- reported total: **88.5 M tokens** across 270 requests
-- cached re-reads of the conversation: **84.4 M — 95 % of it**
-- genuinely new input: 3.4 M. Output plus reasoning: 1.0 M.
+- total: **44.3 M tokens** over 157 requests — 1.09 M fresh input, 43.2 M cached re-reads (**97.5 %**)
 - peak conversation size: **644 k tokens**
-- every tool result that ever reached the model, added together: **0.58 MB, about 145 k tokens**
+- every tool result that ever reached the model, added together: 542 KB, about **139 k tokens**
+- of the 1.09 M fresh input, **0.88 M — 80 % — was re-processing, not new information**
 
-That last line overturns the intuition. **The reports were not the expense.** Every `apply_build` and
-`render_build` result ever shown to the model is 0.16 % of the session. The expense was carrying a
-644 k-token conversation through 270 requests, because the model-visible prefix is re-read on every
-single one of them.
+Two of those lines overturn the intuition. **The reports were not the expense**: every `apply_build` and
+`render_build` result ever shown to the model is 0.3 % of the session. And **the new information was not
+the expense either** — four fifths of the fresh-input budget went on re-reading text the model had
+already read, because something had invalidated the cached prefix.
 
-So cost scales as `steps × context size`, which is quadratic in the length of a build whenever the
-context grows with it. Capping that same session at 120 k tokens removes about 67 % of those reads; at
-60 k, about 83 %. That single lever is worth more than every other optimisation in this file combined,
-and unlike a geometry fix it is entirely within your control.
+So cost scales as `steps × context size`, and the second factor is what punishes a long build: at a
+644 k-token conversation, every single request re-reads all of it. Capping that same session at 120 k
+tokens removes about 67 % of those reads; at 60 k, about 83 %.
+
+**The most expensive thing measured in that session was looking at a picture.** Requests following an
+image attach averaged **46 110** fresh input tokens; every other request averaged **1 549** — a 30×
+difference — and only about 12 k of that 46 k was new content. Attaching an image invalidated the cached
+prefix, so the whole conversation was re-read at full price to deliver a few thousand tokens of picture
+and report. Summed over the build, image-triggered re-prefill accounted for **0.88 M tokens, 80 % of all
+fresh input**. Near the end, at 560 k context, a single render cost 170 k fresh tokens to deliver about
+1.7 k of new content: a hundredfold overhead on the act of checking your own work.
+
+None of that argues against rendering — rendering is mandatory (§2, §3). It argues for rendering
+**deliberately**: take every view a pass needs in one attach, take them while the context is short, and
+never re-attach a picture you have already shown.
 
 1. **One phase per fresh context.** State belongs on disk and nowhere else: a phase should read only the
    line ranges it needs, change the file, run its own assertions, and end by returning a short report —
@@ -906,12 +916,13 @@ and unlike a geometry fix it is entirely within your control.
    history is paid for again by every later step. The pattern that works: call the tool from inside the
    code runner, reduce the result to counts and named faults, and print five lines. Transport limits (§4)
    are the same problem seen from the other end.
-4. **Attachments are permanent.** Every image enters the prefix and is re-read by every subsequent
-   request, so a picture has a cost that outlives the pass it was taken for. Render the panel that answers
-   a question, prefer several small aimed views to one wide one, and downscale before attaching.
-5. **Stay append-only within a phase.** Editing, pruning or re-ordering history invalidates the cached
-   prefix and re-bills the whole context at full price — observed here as 170 k fresh tokens against a
-   564 k context, twice in a row.
+4. **Render in batches; every attach re-reads the whole conversation.** A render after every pass stays
+   required, but the *cost* of one is the entire prefix, not the picture. Take the views a pass needs in a
+   single call, prefer several small aimed views to one wide one, take them while the context is still
+   short, and never re-attach an image you have already shown. Downscale before attaching.
+5. **Stay append-only within a phase.** Editing, pruning, re-ordering, or splicing new material into the
+   middle of history invalidates the cached prefix and re-bills the whole context at full price. This is
+   the mechanism behind the 30× figure above: it was not the images themselves, it was where they landed.
 6. **The late defect is the expensive one.** A bug found in phase 4 is found, diagnosed and fixed at
    maximum context, which is precisely when every step costs the most. The orientation assertions in §1
    and §3 are therefore a cost control as much as a correctness one: front-loading invariants is far
@@ -924,5 +935,11 @@ nearly ended before it started. Split the buffer on the frame magic `28 b5 2f fd
 concatenate, and parse the lines as JSON. Then sum the `cacheReadTokens` and `inputTokens` fields of
 every `usage` object and bucket them by request index. The shape tells you which lever you own: rising
 `cacheReadTokens` with flat `inputTokens` means you are paying for context length, while spiking
-`inputTokens` means you are invalidating the cache.
+`inputTokens` means you are invalidating the cache — and if the spikes line up with the steps where an
+image arrived, the attach is what invalidated it.
+
+Count **one usage record per request**. That file held 270 of them for 157 requests, and adding up all
+270 overstates a session by about 2×. It is a cheap mistake to make and it was made here: the first
+version of this section reported 88.5 M and called 95 % of it cache reads before the duplicate records
+were noticed. The deduplicated figure is 44.3 M and 97.5 %.
 
