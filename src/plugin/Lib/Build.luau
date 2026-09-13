@@ -390,6 +390,39 @@ local NEAR_MISS_DEGREES = 5
 local SUPPORTED_GAP = 0.25
 local THIN = 0.1
 local OUTLIER_STUDS = 250
+-- Two parts sharing a face are touching, not sunk in; a build made of flush boxes would otherwise
+-- report every wall against its floor.
+local FLUSH = 0.05
+
+local AXES = { "X", "Y", "Z" }
+
+-- World-space box around a part, rotation and all. Rotated parts get a box bigger than they are,
+-- which makes the depth below an estimate -- still a number you can subtract from a position.
+local function aabb(part: BasePart): (Vector3, Vector3)
+	local cframe = part.CFrame
+	local half = part.Size / 2
+	local right, up, look = cframe.RightVector, cframe.UpVector, cframe.LookVector
+	local extent = Vector3.new(
+		math.abs(right.X) * half.X + math.abs(up.X) * half.Y + math.abs(look.X) * half.Z,
+		math.abs(right.Y) * half.X + math.abs(up.Y) * half.Y + math.abs(look.Y) * half.Z,
+		math.abs(right.Z) * half.X + math.abs(up.Z) * half.Y + math.abs(look.Z) * half.Z
+	)
+	return cframe.Position - extent, cframe.Position + extent
+end
+
+-- How far one box is sunk into another and along which axis the shortest way out is.
+local function penetration(a: BasePart, b: BasePart): (number, string)
+	local aMin, aMax = aabb(a)
+	local bMin, bMax = aabb(b)
+	local depth, axis = math.huge, "Y"
+	for _, name in AXES do
+		local overlap = math.min(aMax[name], bMax[name]) - math.max(aMin[name], bMin[name])
+		if overlap < depth then
+			depth, axis = overlap, name
+		end
+	end
+	return depth, axis
+end
 
 local function degreesOffAxis(cframe: CFrame): number
 	local worst = 0
@@ -460,17 +493,18 @@ function Build.Problems(root: Instance, maxParts: number?, known: { BasePart }?)
 		local touching = workspace:GetPartsInPart(part, overlap)
 		local connected = false
 		for _, other in touching do
-			if other ~= part then
-				connected = true
-				if not reportedOverlap[part] and not reportedOverlap[other] then
-					reportedOverlap[part] = true
-					table.insert(problems, {
-						part = part,
-						kind = "overlapping",
-						detail = `sunk into {other:GetFullName()}`,
-					})
-				end
-				break
+			if other == part then
+				continue
+			end
+			connected = true
+			local depth, axis = penetration(part, other)
+			if depth > FLUSH and not reportedOverlap[part] and not reportedOverlap[other] then
+				reportedOverlap[part] = true
+				table.insert(problems, {
+					part = part,
+					kind = "overlapping",
+					detail = `sunk about {string.format("%.2f", depth)} studs into {other:GetFullName()} along {axis}`,
+				})
 			end
 		end
 
@@ -504,6 +538,99 @@ function Build.Problems(root: Instance, maxParts: number?, known: { BasePart }?)
 	end
 
 	return problems
+end
+
+-- The build as numbers: where it sits, how big each top-level group is, what's wrong, and which
+-- badge is which part. This is the part of a render that survives being read -- a picture can't be
+-- held in your head next to the code, a list of extents can.
+
+local function fmt(value: number): string
+	return string.format(if value % 1 == 0 then "%d" else "%.1f", value)
+end
+
+local function v3(value: Vector3): string
+	return `({fmt(value.X)}, {fmt(value.Y)}, {fmt(value.Z)})`
+end
+
+local function span(min: Vector3, max: Vector3): string
+	local size = max - min
+	return `{fmt(size.X)}x{fmt(size.Y)}x{fmt(size.Z)} spanning x {fmt(min.X)}..{fmt(max.X)}, y {fmt(min.Y)}..{fmt(max.Y)}, z {fmt(min.Z)}..{fmt(max.Z)}`
+end
+
+local function shorten(instance: Instance, root: Instance): string
+	local full = instance:GetFullName()
+	local prefix = `{root:GetFullName()}.`
+	if string.sub(full, 1, #prefix) == prefix then
+		return string.sub(full, #prefix + 1)
+	end
+	return full
+end
+
+type Extent = { min: Vector3, max: Vector3, count: number }
+
+local function grow(extent: Extent?, min: Vector3, max: Vector3): Extent
+	if not extent then
+		return { min = min, max = max, count = 1 }
+	end
+	extent.min = extent.min:Min(min)
+	extent.max = extent.max:Max(max)
+	extent.count += 1
+	return extent
+end
+
+function Build.Report(root: Instance, parts: { BasePart }, badges: boolean, problems: { Problem }?): string
+	local lines = {}
+
+	local whole: Extent? = nil
+	local groups: { [Instance]: Extent } = {}
+	local order: { Instance } = {}
+	for _, part in parts do
+		local min, max = aabb(part)
+		whole = grow(whole, min, max)
+		-- The group is whichever child of the root this part lives under -- a loose part is its own.
+		local top: Instance = part
+		while top.Parent ~= root and top.Parent ~= nil do
+			top = top.Parent :: Instance
+		end
+		if not groups[top] then
+			table.insert(order, top)
+		end
+		groups[top] = grow(groups[top], min, max)
+	end
+
+	if whole then
+		table.insert(lines, `bounds: {span(whole.min, whole.max)}`)
+	end
+	if #order > 1 then
+		table.insert(lines, "groups (direct children of the root):")
+		for _, top in order do
+			local extent = groups[top]
+			local plural = if extent.count == 1 then "part" else "parts"
+			table.insert(lines, `  {top.Name}  {extent.count} {plural}, {span(extent.min, extent.max)}`)
+		end
+	end
+
+	if problems then
+		table.insert(lines, "")
+		if #problems == 0 then
+			table.insert(lines, "nothing looks wrong with the geometry")
+		else
+			table.insert(lines, `{#problems} thing(s) worth a look:`)
+			for _, problem in problems do
+				table.insert(lines, `  {shorten(problem.part, root)} -- {problem.kind}: {problem.detail}`)
+			end
+		end
+	end
+
+	table.insert(lines, "")
+	table.insert(lines, if badges then "legend (the number in the picture):" else "parts:")
+	for index, part in parts do
+		local size = part.Size
+		table.insert(lines, `  #{index} {shorten(part, root)}  {fmt(size.X)}x{fmt(size.Y)}x{fmt(size.Z)} at {v3(part.Position)}`)
+	end
+
+	return table.concat(lines, "
+")
 end
 
 return Build
