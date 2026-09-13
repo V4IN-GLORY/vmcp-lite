@@ -78,6 +78,10 @@ What makes that source good, and what to hold yourself to:
   edge is `W / 2 - T / 2`. Every literal you type is a place two parts can disagree. When the
   problem list says something is floating or sunk in, the fix is nearly always a derivation that
   was typed as a number.
+- **Size things by what they fit into.** A door leaf is `openingWidth / leaves` by
+  `springHeight`, a glass panel is the window bay minus the mullion, a lid is the crate top. A
+  prop with its own typed size next to an opening with derived numbers ends up the wrong
+  proportion every time, and the picture shows it before the report does.
 - **Name everything, and keep the names.** `ensure` updates by name, so re-applying moves only the
   lines you changed. Rename a part and the old one stays behind — pass `clear = true` on that pass.
 - **Group into Models by what they are** — `Shell`, `Props`, `Stairs` — because the report
