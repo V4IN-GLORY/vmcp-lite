@@ -38,6 +38,13 @@ Tool.Definition = {
 				description = "Luau source ending in `return function(root) ... end`. `ensure(parent, "
 					.. "name, class)` inside it updates by name, so re-applying moves only what changed.",
 			},
+			file = {
+				type = "string",
+				description = "Path to a file holding the source, read by the VMCP server on the machine "
+					.. "it runs on; absolute or relative to the server's working directory. Use this "
+					.. "instead of code once the build lives in a file: edit the file, apply by path, "
+					.. "and the source never has to be re-sent.",
+			},
 			root = {
 				type = "string",
 				description = 'Dotted path, like "Workspace.Arena". If the last segment is missing a '
@@ -78,7 +85,8 @@ Tool.Definition = {
 				description = `Number each part in the picture. On by default up to {BADGE_LIMIT} parts.`,
 			},
 		},
-		required = { "code" },
+		-- One of code or file; the server turns file into code before it gets here.
+		required = {},
 	},
 	tags = { title = "Apply Build", destructive = true },
 	timeoutMs = 60000,
@@ -115,7 +123,7 @@ function Tool.Run(arguments: {
 }): Result
 	local code = arguments.code
 	if type(code) ~= "string" or code == "" then
-		return { content = { { type = "text", text = "code must be a non-empty string" } }, isError = true }
+		return { content = { { type = "text", text = "pass code or file" } }, isError = true }
 	end
 
 	local root: Instance = workspace

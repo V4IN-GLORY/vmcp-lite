@@ -69,6 +69,9 @@
 --    boxes so no two stand in a row.
 --=====================================================================================
 
+local INSPECT = false -- true only for a look inside: draws the roof and one wall see-through
+local NIGHT = true   -- false leaves game.Lighting exactly as it was found
+
 local PROUD = 0.2     -- how far trim stands off the surface it decorates
 local EPS = 0.06      -- how much a layer differs from the one under it, so no two faces coincide
 
@@ -711,8 +714,8 @@ phase(function(root)
 			elseif up == "half" then
 				-- this bay came down through the middle: two torn ends still hang from ridge and eave
 				local zc = NAVE_Z0 + (bay - 0.5) * BAY
-				for k, edge in ipairs({ { -1, -0.22 }, { 0.22, 1 } }) do
-					local segLen = len * 0.38
+				for k, edge in ipairs({ { -0.05, 0.4 }, { 0.6, 1.05 } }) do   -- d is distance down the slope from the ridge
+					local segLen = (edge[2] - edge[1]) * len
 					local mid = (edge[1] + edge[2]) / 2 * len
 					box(roof, string.format("SlopeTorn%d%s", bay, if k == 1 then "a" else "b"),
 						Vector3.new(segLen, 0.9, BAY + 0.2),
@@ -724,7 +727,7 @@ phase(function(root)
 	end
 	-- the ridge: two lengths of cap with one break where the fallen bay took it down
 	for i, run in ipairs({ { -20.5, -6.4 }, { -5.6, 20.5 } }) do
-		box(roof, string.format("Ridge%d", i), Vector3.new(2.0, 1.5, run[2] - run[1] + 0.3),
+		box(roof, string.format("Ridge%d", i), Vector3.new(2.2, 2.4, run[2] - run[1] + 0.3),
 			CFrame.new(0, RIDGE - 0.25, (run[1] + run[2]) / 2), P.roof)
 	end
 	-- aisle lean-tos: from the outer wall head up to the nave wall foot
@@ -890,11 +893,11 @@ phase(function(root)
 		box(ground, name, Vector3.new(w, 0.14, d), CFrame.new(x, 0.07, z) * CFrame.Angles(0, math.rad(rot or 0), 0), P.dirt)
 	end
 	path("PathApproach", 0, -50, 13, 26)
-	path("PathTurn", 12, -40, 22, 11, 6)
-	path("PathSideE", 30, -6, 24, 11, 4)
-	path("PathToGraves", 28, 24, 11, 26, -3)
+	path("PathTurn", 12, -40, 22, 11, 11)
+	path("PathSideE", 30, -6, 24, 11, -13)
+	path("PathToGraves", 28, 24, 11, 26, 9)
 	path("PathGrave", 12, 40, 30, 10)
-	path("PathWest", -30, 8, 24, 10, -5)
+	path("PathWest", -30, 8, 24, 10, -16)
 	-- the plinth edge is a three stud step: give the player a way up on both busy sides
 	steps(ground, "SideStep", 26.5, 8, 6, 1.2, 3, P.trim)
 	steps(ground, "BreachRamp", 24.6, 0, 9, 1.3, 3, P.plinth)
@@ -1035,6 +1038,338 @@ phase(function(root)
 	end
 end)
 
+--=====================================================================================
+-- PHASE 6 -- THE SOLDIER. The one prop the map is remembered by: a long-dead man slumped
+-- against the broken tower, run through with his own sword. No rig, no mesh: bones are
+-- boxes and thin cylinders laid along the pose, armour is layered plates over them.
+--=====================================================================================
+phase(function(root)
+	local props = model(root, "Soldier")
+	local ground = PLINTH_TOP
+	-- he sits with his back to the tower's inner face, legs folded to his left, head rolled
+	-- forward and down. `hip` is the root of the pose; everything else hangs off it.
+	local hip = CFrame.new(9.1, ground + 0.55, -28.6) * CFrame.Angles(0, math.rad(-24), 0)
+	local bone, steel, iron, leather = P.bone, P.bone, P.iron, P.beam
+	-- pelvis and spine
+	box(props, "Pelvis", Vector3.new(1.9, 0.9, 1.3), hip * CFrame.new(0, 0, 0), P.iron)
+	box(props, "Belt", Vector3.new(2.1, 0.36, 1.5), hip * CFrame.new(0, 0.42, 0), leather)
+	box(props, "Buckle", Vector3.new(0.42, 0.42, 0.22), hip * CFrame.new(0, 0.42, -0.78), P.brass)
+	local spine = { { 0.55, 0.28, 0.5, 0.3 }, { 1.1, 0.5, 0.85, 0.34 }, { 1.6, 0.66, 1.15, 0.36 }, { 2.05, 0.72, 1.4, 0.36 } }
+	for i, s in ipairs(spine) do
+		box(props, string.format("Vertebra%d", i), Vector3.new(0.5, 0.42, 0.5),
+			hip * CFrame.new(0, s[2], -s[1] * 0.5) * CFrame.Angles(-0.12 * i, 0, 0), bone)
+	end
+	-- ribcage: six pairs of thin bars curving forward off the spine, then the sternum
+	local chest = hip * CFrame.new(0, 1.85, -0.55) * CFrame.Angles(-0.35, 0, 0.12)
+	for i = 1, 6 do
+		local w = 1.55 - i * 0.12
+		local y = -i * 0.34 + 0.7
+		for _, sx in ipairs({ 1, -1 }) do
+			rod(props, string.format("Rib%d%s", i, if sx > 0 then "a" else "b"), 0.09, w,
+				chest * CFrame.new(sx * w / 2, y, -0.35) * CFrame.Angles(0, 0, math.rad(90) + sx * 0.25), bone)
+		end
+	end
+	box(props, "Sternum", Vector3.new(0.34, 1.5, 0.26), chest * CFrame.new(0, -0.35, -0.7), bone)
+	box(props, "CollarL", Vector3.new(0.9, 0.2, 0.2), chest * CFrame.new(0.5, 0.85, -0.4) * CFrame.Angles(0, 0, -0.25), bone)
+	box(props, "CollarR", Vector3.new(0.9, 0.2, 0.2), chest * CFrame.new(-0.5, 0.85, -0.4) * CFrame.Angles(0, 0, 0.25), bone)
+	-- the sword: in through the right shoulder blade, out through the chest, into the ground
+	local bladeCF = chest * CFrame.Angles(math.rad(58), 0, math.rad(14)) * CFrame.new(0, 0, -1.0)
+	box(props, "Blade", Vector3.new(0.34, 0.12, 7.4), bladeCF, iron)
+	box(props, "BladeTip", Vector3.new(0.24, 0.12, 0.6), bladeCF * CFrame.new(0, 0, 3.9), iron)
+	box(props, "Guard", Vector3.new(1.5, 0.24, 0.24), bladeCF * CFrame.new(0, 0, -3.8), P.brass)
+	rod(props, "Grip", 0.17, 1.1, bladeCF * CFrame.new(0, 0, -4.5) * CFrame.Angles(0, math.pi / 2, 0), leather)
+	box(props, "Pommel", Vector3.new(0.4, 0.4, 0.4), bladeCF * CFrame.new(0, 0, -5.2), P.brass)
+	-- armour: a shoulder plate still buckled on, the breastplate undone and hanging open
+	box(props, "PauldronTop", Vector3.new(1.3, 0.4, 1.5), chest * CFrame.new(0.95, 1.0, -0.2) * CFrame.Angles(0, 0, -0.3), iron)
+	box(props, "PauldronSkirt", Vector3.new(1.2, 0.9, 1.4), chest * CFrame.new(1.15, 0.45, -0.15) * CFrame.Angles(0, 0, -0.18), iron)
+	box(props, "PauldronRim", Vector3.new(1.4, 0.16, 1.6), chest * CFrame.new(1.05, 1.22, -0.2) * CFrame.Angles(0, 0, -0.3), P.brass)
+	box(props, "Breastplate", Vector3.new(1.9, 1.9, 0.3), chest * CFrame.new(-0.8, -0.5, -1.15) * CFrame.Angles(0.2, math.rad(38), 0.35), iron)
+	box(props, "BreastplateRim", Vector3.new(2.0, 0.16, 0.34), chest * CFrame.new(-0.8, 0.4, -1.2) * CFrame.Angles(0.2, math.rad(38), 0.35), P.brass)
+	box(props, "Tabard", Vector3.new(1.5, 1.3, 0.14), chest * CFrame.new(-0.15, -1.0, -0.75) * CFrame.Angles(0.15, 0, 0.1), P.flag)
+	-- skull: cranium, brow, sockets, jaw, all tipped forward and to one side
+	local neck = chest * CFrame.new(-0.1, 0.95, -0.55)
+	box(props, "Neck", Vector3.new(0.4, 0.7, 0.4), neck * CFrame.new(0, 0.2, 0), bone)
+	local skull = neck * CFrame.Angles(-0.55, math.rad(-16), 0.42) * CFrame.new(0, 0.85, -0.1)
+	box(props, "Cranium", Vector3.new(0.95, 0.95, 1.0), skull, bone)
+	box(props, "BrowRidge", Vector3.new(1.0, 0.24, 0.3), skull * CFrame.new(0, 0.2, -0.5), bone)
+	box(props, "Face", Vector3.new(0.8, 0.62, 0.36), skull * CFrame.new(0, -0.2, -0.46), bone)
+	box(props, "SocketL", Vector3.new(0.26, 0.28, 0.2), skull * CFrame.new(0.24, -0.12, -0.6), P.plinth)
+	box(props, "SocketR", Vector3.new(0.26, 0.28, 0.2), skull * CFrame.new(-0.24, -0.12, -0.6), P.plinth)
+	box(props, "Nose", Vector3.new(0.16, 0.24, 0.18), skull * CFrame.new(0, -0.34, -0.6), P.plinth)
+	box(props, "Jaw", Vector3.new(0.78, 0.34, 0.62), skull * CFrame.new(0, -0.6, -0.28) * CFrame.Angles(0.35, 0, 0), bone)
+	box(props, "Teeth", Vector3.new(0.6, 0.12, 0.5), skull * CFrame.new(0, -0.46, -0.34), bone)
+	-- arms: the right one folded across the chest, the left hanging to the floor
+	local function arm(name, shoulder, elbow, hand, r)
+		rodBetween(props, name .. "Upper", shoulder, elbow, r, bone)
+		rodBetween(props, name .. "Fore", elbow, hand, r * 0.85, bone)
+		box(props, name .. "Hand", Vector3.new(0.3, 0.22, 0.5), CFrame.lookAt(hand, hand + (hand - elbow)), bone)
+		for i = 1, 3 do
+			box(props, string.format("%sFinger%d", name, i), Vector3.new(0.14, 0.14, 0.38),
+				CFrame.lookAt(hand + (hand - elbow).Unit * 0.3, hand + (hand - elbow)) * CFrame.new((i - 2) * 0.16, 0, 0), bone)
+		end
+	end
+	local shR = chest * CFrame.new(-0.15, 0.75, -0.85)
+	local elR = chest * CFrame.new(-1.05, -0.35, -1.15)
+	arm("ArmR", shR, elR, chest * CFrame.new(0.35, -1.15, -1.25), 0.17)
+	local shL = chest * CFrame.new(0.15, 0.7, -0.8)
+	arm("ArmL", shL, chest * CFrame.new(-0.45, -1.3, -0.35), hip * CFrame.new(-1.35, 0.35, -1.5), 0.17)
+	box(props, "VambraceL", Vector3.new(0.5, 0.95, 0.5), chest * CFrame.new(-0.7, -1.6, -0.4) * CFrame.Angles(0.4, 0, 0.2), iron)
+	-- legs folded under and to his left, one boot still laced, one lost
+	local kneeR = hip * CFrame.new(-1.5, -0.15, -1.5)
+	local footR = hip * CFrame.new(-2.6, 0.1, 0.15)
+	rodBetween(props, "ThighR", hip * CFrame.new(-0.6, 0.1, 0), kneeR, 0.24, bone)
+	rodBetween(props, "ShinR", kneeR, footR, 0.2, bone)
+	box(props, "BootR", Vector3.new(0.62, 0.5, 1.5), CFrame.new(footR.Position + Vector3.new(-0.2, -0.05, 0.75)) * CFrame.Angles(0, math.rad(-70), 0), leather)
+	local kneeL = hip * CFrame.new(-0.9, -0.25, 1.15)
+	local footL = hip * CFrame.new(0.5, 0.1, 2.1)
+	rodBetween(props, "ThighL", hip * CFrame.new(-0.4, 0.1, 0.4), kneeL, 0.24, bone)
+	rodBetween(props, "ShinL", kneeL, footL, 0.2, bone)
+	box(props, "GreaveL", Vector3.new(0.56, 0.56, 1.1), CFrame.lookAt((kneeL.Position + footL.Position) / 2, footL.Position), iron)
+	box(props, "BootL", Vector3.new(0.6, 0.5, 1.4), CFrame.new(footL.Position + Vector3.new(0.4, -0.04, 0.5)) * CFrame.Angles(0, math.rad(35), 0), leather)
+	-- his helm came off and rolled: it lies a couple of studs away, dented
+	box(props, "Helm", Vector3.new(1.1, 0.95, 1.2), CFrame.new(6.4, ground + 0.5, -27.2) * CFrame.Angles(0.2, math.rad(28), 1.5), iron)
+	box(props, "HelmRim", Vector3.new(1.25, 0.16, 1.35), CFrame.new(6.4, ground + 0.12, -27.2) * CFrame.Angles(0.2, math.rad(28), 1.5), P.brass)
+	box(props, "HelmNasal", Vector3.new(0.18, 0.9, 0.3), CFrame.new(6.0, ground + 0.35, -27.8) * CFrame.Angles(0.3, math.rad(28), 0.2), iron)
+	-- his shield, dropped face up in the leaves beside him
+	box(props, "Shield", Vector3.new(2.2, 0.28, 2.8), CFrame.new(5.2, ground + 0.2, -31.2) * CFrame.Angles(0, math.rad(24), 0.06), P.beam)
+	box(props, "ShieldBoss", Vector3.new(0.7, 0.34, 0.7), CFrame.new(5.2, ground + 0.42, -31.2) * CFrame.Angles(0, math.rad(24), 0.06), P.brass)
+	box(props, "ShieldRim", Vector3.new(2.4, 0.16, 3.0), CFrame.new(5.2, ground + 0.1, -31.2) * CFrame.Angles(0, math.rad(24), 0), P.iron)
+	-- and the ground he fell on: leaves drifted against him, moss creeping over the boot
+	box(props, "Leaves1", Vector3.new(2.6, 0.14, 2.0), CFrame.new(7.6, ground + 0.06, -29.6) * CFrame.Angles(0, math.rad(20), 0), P.moss)
+	box(props, "Leaves2", Vector3.new(2.0, 0.12, 1.6), CFrame.new(10.2, ground + 0.05, -26.4) * CFrame.Angles(0, math.rad(-35), 0), P.moss)
+end)
+
+--=====================================================================================
+-- PHASE 7 -- LIGHT AND AIR. Every light is a Light instance with a visible source; every
+-- shaft is a Beam between two attachments; every emitter is set up for what it is.
+--=====================================================================================
+
+local function flame(parent, name, at, size, range, brightness, colour)
+	local core = box(parent, name, Vector3.new(size, size, size), at, P.brass)
+	core.Material = Enum.Material.Neon
+	core.Color = colour or Color3.fromRGB(255, 206, 138)
+	local light = ensure(core, "Glow", "PointLight")
+	light.Brightness, light.Range, light.Color = brightness, range, colour or Color3.fromRGB(255, 196, 120)
+	return core
+end
+
+local function candle(parent, name, at, h, lit)
+	local wax = P.bone
+	rod(parent, name .. "Wax", 0.16, h, at, wax)
+	if lit then
+		flame(parent, name .. "Flame", at * CFrame.new(0, 0, -(h / 2 + 0.28)) * CFrame.Angles(0, math.pi / 2, 0), 0.3, 9, 1.6)
+	end
+end
+
+local function lantern(parent, name, at, scale)
+	local s = scale or 1
+	box(parent, name .. "Top", Vector3.new(0.9 * s, 0.16 * s, 0.9 * s), at * CFrame.new(0, 0.75 * s, 0), P.brass)
+	box(parent, name .. "Base", Vector3.new(0.8 * s, 0.16 * s, 0.8 * s), at * CFrame.new(0, -0.7 * s, 0), P.brass)
+	for _, c in ipairs({ { 0.34, 0.34 }, { -0.34, 0.34 }, { 0.34, -0.34 }, { -0.34, -0.34 } }) do
+		box(parent, string.format("%sPost%d%d", name, c[1] > 0 and 1 or 0, c[2] > 0 and 1 or 0),
+			Vector3.new(0.12 * s, 1.45 * s, 0.12 * s), at * CFrame.new(c[1] * s, 0, c[2] * s), P.brass)
+	end
+	box(parent, name .. "Ring", Vector3.new(0.24 * s, 0.3 * s, 0.24 * s), at * CFrame.new(0, 0.95 * s, 0), P.iron)
+end
+
+phase(function(root)
+	local fx = model(root, "Effects")
+	local cath = model(root, "Cathedral")
+	local inside = model(cath, "Interior")
+	-- ---- hanging lanterns, wall sconces, altar candles ---------------------------------
+	local hang = { { -5.4, -10.5, 15.6 }, { 4.6, -1.5, 14.4 }, { -3.2, 9.5, 15.2 } }
+	for i, h in ipairs(hang) do
+		local at = CFrame.new(h[1], h[3], h[2])
+		rod(inside, string.format("Chain%d", i), 0.1, 3.6, at * CFrame.new(0, 1.8, 0), P.iron)
+		for k = 1, 4 do
+			box(inside, string.format("Chain%dLink%d", i, k), Vector3.new(0.3, 0.1, 0.1), at * CFrame.new(0, 0.6 + k * 0.6, 0) * CFrame.Angles(0, 0, k * 0.8), P.iron)
+		end
+		lantern(inside, string.format("Lantern%d", i), at * CFrame.new(0, -0.4, 0), 1)
+		flame(inside, string.format("Lantern%dGlow", i), at * CFrame.new(0, -0.35, 0), 0.42, 15, 2.2)
+	end
+	for i, s in ipairs({ { -11.2, -13.5, 8.6 }, { 11.2, 7.5, 8.6 } }) do
+		local at = CFrame.new(s[1], s[3], s[2]) * CFrame.Angles(0, if s[1] > 0 then math.pi / 2 else -math.pi / 2, 0)
+		box(inside, string.format("Sconce%d", i), Vector3.new(0.5, 0.4, 0.9), at * CFrame.new(0, 0, 0.45), P.brass)
+		box(inside, string.format("Sconce%dBracket", i), Vector3.new(0.34, 0.9, 0.34), at * CFrame.new(0, -0.6, 0.2), P.iron)
+		candle(inside, string.format("Sconce%dCandle", i), at * CFrame.new(0, 0.75, 0.55) * CFrame.Angles(0, -math.pi / 2, 0), 1.1, true)
+	end
+	-- candles on the altar and on the sanctuary step
+	for i, c in ipairs({ { -3.4, 21.4, 1.2 }, { -2.2, 21.7, 0.9 }, { 2.6, 21.6, 1.1 }, { 3.8, 21.3, 0.8 } }) do
+		candle(inside, string.format("AltarCandle%d", i), CFrame.new(c[1], 8.3 + c[3] / 2, c[2]), c[3], true)
+	end
+	for i, c in ipairs({ { -5.6, 16.4, 0.75 }, { 5.2, 16.8, 0.75 } }) do
+		candle(inside, string.format("StepCandle%d", i), CFrame.new(c[1], 4.35 + c[2] * 0 + c[3] / 2, c[2]), c[3], i == 1)
+	end
+	-- a lantern left on the porch step, which is what lights the soldier outside
+	lantern(model(cath, "Porch"), "PorchLantern", CFrame.new(8.2, PLINTH_TOP + 1.1, -28.4), 1.15)
+	flame(model(cath, "Porch"), "PorchLanternGlow", CFrame.new(8.2, PLINTH_TOP + 1.05, -28.4), 0.5, 17, 2.4)
+	box(model(cath, "Porch"), "PorchLanternBracket", Vector3.new(0.5, 0.5, 1.2), CFrame.new(9.5, PLINTH_TOP + 1.1, -28.4), P.iron)
+	-- ---- light shafts through the broken roof and the aisle breach -----------------------
+	local shafts = {
+		{ { -7.6, 39.2, -8.0 }, { -3.4, FLOOR, -7.2 }, 11, 15, Color3.fromRGB(150, 172, 214) },
+		{ { 7.6, 39.2, 8.0 }, { 3.6, FLOOR, 8.4 }, 10, 13, Color3.fromRGB(150, 172, 214) },
+		{ { 19.5, 12.6, 0.0 }, { 15.0, FLOOR, 0.4 }, 8, 11, Color3.fromRGB(168, 184, 220) },
+	}
+	for i, s in ipairs(shafts) do
+		local top, bottom = Vector3.new(s[1][1], s[1][2], s[1][3]), Vector3.new(s[2][1], s[2][2], s[2][3])
+		local a0 = ensure(fx, string.format("Shaft%dTop", i), "Attachment")
+		a0.WorldPosition = top
+		local a1 = ensure(fx, string.format("Shaft%dFoot", i), "Attachment")
+		a1.WorldPosition = bottom
+		local beam = ensure(fx, string.format("Shaft%d", i), "Beam")
+		beam.Attachment0, beam.Attachment1 = a0, a1
+		beam.Width0, beam.Width1 = s[3], s[4]
+		beam.Color = s[5]
+		beam.LightEmission = 1
+		beam.FaceCamera = false
+		beam.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.82), NumberSequenceKeypoint.new(0.45, 0.9), NumberSequenceKeypoint.new(1, 1) })
+		beam.Texture = "rbxasset://textures/particles/smoke_main.dds"
+		beam.TextureSpeed = 0.06
+		-- the moonlight that makes the shaft readable, aimed down it
+		local carrier = ensure(fx, string.format("Shaft%dLight", i), "Part")
+		carrier.Size, carrier.Anchored, carrier.CanCollide = Vector3.new(1, 1, 1), true, false
+		carrier.Transparency, carrier.CanQuery = 1, false
+		carrier.CFrame = CFrame.lookAt(top, bottom)
+		local spot = ensure(carrier, "Moon", "SpotLight")
+		spot.Angle, spot.Range, spot.Brightness = 70, 70, 2.6
+		spot.Face, spot.Color = Enum.NormalId.Front, Color3.fromRGB(158, 180, 224)
+		local dust = ensure(carrier, "Motes", "ParticleEmitter")
+		dust.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+		dust.Color = ColorSequence.new(Color3.fromRGB(198, 210, 236))
+		dust.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.09), NumberSequenceKeypoint.new(1, 0.02) })
+		dust.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.35), NumberSequenceKeypoint.new(1, 1) })
+		dust.Lifetime, dust.Rate, dust.Speed = NumberRange.new(7, 10), 9, NumberRange.new(0.1, 0.3)
+		dust.SpreadAngle, dust.LightEmission, dust.Acceleration = Vector2.new(24, 24), 0.7, Vector3.new(0, -0.25, 0)
+		dust.RotSpeed, dust.Rotation = NumberRange.new(-14, 14), NumberRange.new(0, 360)
+	end
+	-- ---- ground fog and candle smoke, restrained -----------------------------------------
+	local fogs = { { 0, 1.1, -6, 44, 30 }, { 0, 1.1, 26, 34, 24 }, { 0, 1.1, -44, 40, 26 }, { 0, 1.1, 52, 46, 30 } }
+	for i, f in ipairs(fogs) do
+		local c = ensure(fx, string.format("FogCarrier%d", i), "Part")
+		c.Size, c.Anchored, c.CanCollide = Vector3.new(f[4], 1, f[5]), true, false
+		c.Transparency, c.CanQuery = 1, false
+		c.CFrame = CFrame.new(f[1], f[2], f[3])
+		local em = ensure(c, "Fog", "ParticleEmitter")
+		em.Texture = "rbxasset://textures/particles/smoke_main.dds"
+		em.Color = ColorSequence.new(Color3.fromRGB(126, 136, 152))
+		em.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 9), NumberSequenceKeypoint.new(0.4, 15), NumberSequenceKeypoint.new(1, 18) })
+		em.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.3, 0.88), NumberSequenceKeypoint.new(1, 1) })
+		em.Lifetime, em.Rate, em.Speed = NumberRange.new(10, 15), 1.4, NumberRange.new(0.3, 0.7)
+		em.SpreadAngle, em.Drag, em.LightEmission = Vector2.new(180, 180), 1, 0
+		em.RotSpeed, em.Rotation = NumberRange.new(-3, 3), NumberRange.new(0, 360)
+		em.Shape, em.ShapeStyle = Enum.ParticleEmitterShape.Box, Enum.ParticleEmitterShapeStyle.Volume
+	end
+	for i, e in ipairs({ { -5.4, 15.2, -10.5 }, { 4.6, 14.0, -1.5 }, { -3.4, 8.9, 21.4 } }) do
+		local c = ensure(fx, string.format("EmberCarrier%d", i), "Part")
+		c.Size, c.Anchored, c.CanCollide = Vector3.new(0.6, 0.6, 0.6), true, false
+		c.Transparency, c.CanQuery = 1, false
+		c.CFrame = CFrame.new(e[1], e[2], e[3])
+		local em = ensure(c, "Embers", "ParticleEmitter")
+		em.Texture = "rbxasset://textures/particles/fire_main.dds"
+		em.Color = ColorSequence.new(Color3.fromRGB(255, 186, 108), Color3.fromRGB(178, 92, 44))
+		em.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.14), NumberSequenceKeypoint.new(1, 0) })
+		em.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.15), NumberSequenceKeypoint.new(1, 1) })
+		em.Lifetime, em.Rate, em.Speed = NumberRange.new(1.1, 2.0), 3.5, NumberRange.new(1.0, 2.4)
+		em.SpreadAngle, em.LightEmission, em.Acceleration = Vector2.new(12, 12), 1, Vector3.new(0, -1.1, 0)
+		em.RotSpeed, em.Rotation = NumberRange.new(-40, 40), NumberRange.new(0, 360)
+	end
+end)
+
+--=====================================================================================
+-- PHASE 8 -- NIGHT, POST, AND THE QA PASS. Atmosphere is never touched: only Lighting's
+-- own properties and two post effects this script owns by name.
+--=====================================================================================
+local function night()
+	local Lighting = game:GetService("Lighting")
+	Lighting.ClockTime = 0
+	Lighting.GeographicLatitude = 12
+	Lighting.Brightness = 1.5
+	Lighting.Ambient = Color3.fromRGB(20, 22, 32)
+	Lighting.OutdoorAmbient = Color3.fromRGB(30, 34, 50)
+	Lighting.FogColor = Color3.fromRGB(17, 20, 30)
+	Lighting.FogStart, Lighting.FogEnd = 40, 190
+	Lighting.GlobalShadows = true
+	Lighting.ShadowSoftness = 0.35
+	Lighting.EnvironmentDiffuseScale = 0.25
+	Lighting.EnvironmentSpecularScale = 0.2
+	Lighting.ExposureCompensation = -0.1
+	local bloom = Lighting:FindFirstChild("RuinedCathedralBloom") or Instance.new("BloomEffect")
+	bloom.Name, bloom.Parent = "RuinedCathedralBloom", Lighting
+	bloom.Intensity, bloom.Size, bloom.Threshold = 0.55, 26, 1.5
+	local cc = Lighting:FindFirstChild("RuinedCathedralGrade") or Instance.new("ColorCorrectionEffect")
+	cc.Name, cc.Parent = "RuinedCathedralGrade", Lighting
+	cc.TintColor = Color3.fromRGB(198, 208, 238)
+	cc.Contrast, cc.Saturation, cc.Brightness = 0.12, -0.06, -0.02
+end
+
+local function qa(root)
+	local parts, aligned, seen = {}, {}, {}
+	local dupes, thin = {}, {}
+	for _, d in root:GetDescendants() do
+		if d:IsA("BasePart") then
+			if d.Transparency < 1 then
+				table.insert(parts, d)
+				local o = d.CFrame.Rotation
+				if math.abs(o.XVector.X) > 0.999 or math.abs(o.XVector.Y) > 0.999 or math.abs(o.XVector.Z) > 0.999 then
+					local h = d.CFrame:VectorToWorldSpace(d.Size / 2)
+					h = Vector3.new(math.abs(h.X), math.abs(h.Y), math.abs(h.Z))
+					table.insert(aligned, { p = d, lo = d.Position - h, hi = d.Position + h })
+				end
+			end
+			if math.min(d.Size.X, d.Size.Y, d.Size.Z) < 0.1 then table.insert(thin, d.Name) end
+			local key = string.format("%s|%.2f,%.2f,%.2f|%.1f,%.1f,%.1f", d.Name, d.Size.X, d.Size.Y, d.Size.Z,
+				d.Position.X, d.Position.Y, d.Position.Z)
+			if seen[key] then table.insert(dupes, d.Name) else seen[key] = true end
+		end
+	end
+	-- one pass over the axis aligned parts: faces that coincide while the volumes overlap flicker
+	local E, coplanar, unsupported = 0.02, {}, {}
+	for i = 1, #aligned do
+		local a = aligned[i]
+		local touching = false
+		for j = 1, #aligned do
+			if i ~= j then
+				local b = aligned[j]
+				local ox = a.lo.X < b.hi.X - E and b.lo.X < a.hi.X - E
+				local oy = a.lo.Y < b.hi.Y - E and b.lo.Y < a.hi.Y - E
+				local oz = a.lo.Z < b.hi.Z - E and b.lo.Z < a.hi.Z - E
+				if ox or oy or oz then touching = true end
+				if ox and oy and oz then
+					for _, ax in ipairs({ "X", "Y", "Z" }) do
+						local rest = (ax == "X" and oy and oz) or (ax == "Y" and ox and oz) or (ax == "Z" and ox and oy)
+						if rest and (math.abs(a.lo[ax] - b.lo[ax]) < E or math.abs(a.hi[ax] - b.hi[ax]) < E) then
+							if #coplanar < 8 then
+								table.insert(coplanar, string.format("%s / %s on %s", a.p.Name, b.p.Name, ax))
+							end
+						end
+					end
+				end
+				-- a part resting on another: tops and bottoms within a hair, footprints overlapping
+				if not touching and math.abs(a.lo.Y - b.hi.Y) < 0.35 and a.lo.X < b.hi.X and b.lo.X < a.hi.X and a.lo.Z < b.hi.Z and b.lo.Z < a.hi.Z then
+					touching = true
+				end
+			end
+		end
+		if not touching and #unsupported < 8 then table.insert(unsupported, a.p.Name) end
+	end
+	local function count(className)
+		local n = 0
+		for _, d in root:GetDescendants() do if d:IsA(className) then n += 1 end end
+		return n
+	end
+	print(string.format("[RuinedCathedral] QA  %d parts (%d axis aligned) | %d lights, %d emitters, %d beams",
+		#parts, #aligned, count("Light"), count("ParticleEmitter"), count("Beam")))
+	print(string.format("[RuinedCathedral] QA  coplanar-flicker pairs: %d | near-duplicates: %d | unsupported: %d | paper thin: %d",
+		#coplanar, #dupes, #unsupported, #thin))
+	if #coplanar > 0 then print("[RuinedCathedral] QA  flicker: " .. table.concat(coplanar, "; ")) end
+	if #dupes > 0 then print("[RuinedCathedral] QA  near-duplicate names: " .. table.concat(dupes, ", ")) end
+	if #unsupported > 0 then print("[RuinedCathedral] QA  nothing under: " .. table.concat(unsupported, ", ")) end
+	if #thin > 0 then print("[RuinedCathedral] QA  paper thin: " .. table.concat(thin, ", ")) end
+	if #coplanar == 0 and #dupes == 0 and #unsupported == 0 and #thin == 0 then
+		print("[RuinedCathedral] QA  no flicker, no duplicates, nothing floating: clean")
+	end
+end
+
 --@@SECTION@@
 
 
@@ -1042,6 +1377,18 @@ local function BUILD(root)
 	for _, fn in ipairs(PHASES) do
 		fn(root)
 	end
+	if INSPECT then   -- a look inside only: the roof and the east aisle wall go see-through
+		for _, d in root:GetDescendants() do
+			if d:IsA("BasePart") then
+				local group = d.Parent and d.Parent.Name or ""
+				if group == "Roof" or (d.Position.X > 17.5 and d.Position.Y > 3 and d.Position.Y < 15 and group == "Shell") then
+					d.Transparency = 0.75
+				end
+			end
+		end
+	end
+	if NIGHT then night() end
+	qa(root)
 	return root
 end
 

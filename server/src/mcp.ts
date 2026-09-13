@@ -7,6 +7,8 @@ import {
 	type Tool,
 	type ToolAnnotations,
 } from "@modelcontextprotocol/sdk/types.js";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { log } from "./config.js";
 import { RETRY_KEY, type ToolDefinition, type ToolResult } from "./protocol.js";
 import { settle } from "./postprocess.js";
@@ -61,7 +63,20 @@ export async function startMcp(service: ToolService): Promise<Server> {
 							.notification({ method: "notifications/progress", params: { progressToken, ...update } })
 							.catch(() => {});
 					};
-		return service.call(request.params.name, (request.params.arguments ?? {}) as Record<string, unknown>, onProgress);
+		const args = (request.params.arguments ?? {}) as Record<string, unknown>;
+		// apply_build's source can come from a file so the caller edits it in place instead of
+		// re-sending the whole thing every pass. Read here, in the process the client launched,
+		// so a relative path means what the caller thinks it means.
+		if (typeof args.file === "string" && args.code === undefined) {
+			const path = resolve(args.file);
+			try {
+				args.code = readFileSync(path, "utf8");
+			} catch (err) {
+				return { content: [{ type: "text", text: `couldn't read ${path}: ${(err as Error).message}` }], isError: true };
+			}
+			delete args.file;
+		}
+		return service.call(request.params.name, args, onProgress);
 	});
 
 	service.onChanged(() => {
@@ -106,7 +121,7 @@ async function callLocal(
 
 	try {
 		const result = withRevisionNotice(await settle(await target.call(exposed.tool.name, args, onProgress)), session);
-		// Only a real reply is cached — a timeout is exactly what's worth retrying.
+		// Only a real reply is cached ï¿½ a timeout is exactly what's worth retrying.
 		if (cacheKey) retries.set(cacheKey, result);
 		return result;
 	} catch (err) {

@@ -133,7 +133,8 @@ until that line is true.
 
 Order: shell openings → roof → interior floors and stairs → interior props → exterior props →
 effects. A real build is 800+ lines and won't fit one reply; keep the source in a file and apply
-from there.
+with `apply_build { file = "<absolute path>" }`: the server reads the file itself, so each pass
+is an `Edit` of the lines that change plus the apply — never re-read or re-send the whole file.
 
 Each pass, exactly:
 
