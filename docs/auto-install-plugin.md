@@ -35,23 +35,22 @@ The asset is named `VMCP.rbxmx` to match the file already in the Plugins folder,
 install overwrites instead of creating a duplicate. The auth token lives in plugin settings
 (`plugin:SetSetting`), so replacing the file doesn't lose it.
 
+## Distribution: GitHub, not npm
+
+Private npm scopes cost money, so the package is installed straight from the repo:
+
+```
+claude mcp add vmcp -- npx -y github:V4IN-GLORY/mcp-test --auto-install-plugin
+```
+
+npm resolves `main` to a commit on every startup, clones it, installs the root
+`package.json` deps, and runs its `prepare` script (`tsc -p server` + `rojo build` to
+`VMCP.rbxmx` at the repo root). `.npmignore` exists because npm would otherwise use
+`.gitignore` and strip `server/dist/`. Requires `rojo` on PATH (`rokit install`).
+
+The root `package.json` owns the runtime deps because npm git installs can't target a
+subfolder; `server/package.json` is kept for the dev scripts only.
+
 ## Release flow
 
-```
-cd server
-npm version patch          # required â€” @latest only sees new versions
-npm publish --access public
-```
-
-## Registering with Claude
-
-```
-claude mcp add vmcp -- npx -y @v4in-glory/mcp-test@latest --auto-install-plugin
-```
-
-Use a different name than `robloxstudio` if the chrrxs server should stay installed too.
-
-## Verified
-
-- First run: `[vmcp] installed VMCP.rbxmx to C:\Users\...\Roblox\Plugins\VMCP.rbxmx`
-- Second run with no change: no install line, server starts normally.
+Push to `main`. That's it — the next Claude startup rebuilds and reinstalls the plugin.
