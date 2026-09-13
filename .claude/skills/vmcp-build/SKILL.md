@@ -1,6 +1,6 @@
 ---
 name: vmcp-build
-description: Reading and editing areas of a Roblox place as Luau with VMCP's get_build — a region comes back as code that rebuilds it, you change the lines you care about, and run it back. Use when moving, retexturing or restructuring part of a build.
+description: Reading, editing and looking at areas of a Roblox place with VMCP — get_build returns a region as code that rebuilds it, and render_build draws it as a picture so you can see what the code made. Use when moving, retexturing or restructuring part of a build.
 ---
 
 # Builds as code
@@ -47,6 +47,42 @@ duplicating. A part whose lines you didn't touch doesn't move. That's what makes
 a diffing pass, and it's why you should keep the names.
 
 Changing a node's class destroys and recreates it — that one is not an update.
+
+## Looking at it
+
+Reading the code back is the same guess twice. `render_build` draws the region and writes a PNG:
+
+```
+render_build { root = "Workspace.Arena", views = ["iso", "front", "top"] }
+```
+
+Studio sends the geometry — about forty bytes a part — and the VMCP **server** renders it. No
+camera, no playtest, no screenshot, and it works on a place that was never saved.
+
+It's an orthographic blockout, not a render: flat shading, a dark outline on every part, and **all
+views at one scale**, so a part is the same size in the top panel as in the front panel. Views tile
+into one image and are labelled.
+
+Named views are `iso`, `corner`, `front`, `back`, `left`, `right`, `top`, `bottom`; or pass
+`{ "yaw": 20, "pitch": 60, "name": "over" }` in degrees. `size` is pixels per view, 512 by default.
+
+The loop this is for:
+
+```
+get_build  -> read the region as code
+   edit the lines you care about
+run_luau   -> vmcp.Build.Apply(source, root)
+render_build -> look at what you actually made
+   edit again
+```
+
+Two things it shows that the code doesn't: a part that's rotated when you meant it flat, and a
+part floating where you meant it sitting on something. `top` catches footprint mistakes; `front`
+catches height ones.
+
+What it draws: boxes, spheres, cylinders and wedges, with colour and transparency. **Meshes and
+unions come through as their bounding box** — right for a blockout, and honest about what it knows.
+Decals, textures, lights and particles aren't drawn at all.
 
 ## Copying a region
 

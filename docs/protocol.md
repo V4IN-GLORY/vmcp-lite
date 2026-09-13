@@ -425,7 +425,8 @@ folder, or point `VMCP_PROJECT` at one.
 ## 10. `postProcess` — asking the server to finish a result
 
 A tool result may carry a `postProcess` object alongside `content`. It's for work the plugin
-genuinely can't do, which so far means writing a file:
+genuinely can't do, which so far means drawing something and writing the file. Two kinds: `png`
+replays a Canvas recording, `scene` renders collected part geometry as a blockout picture.
 
 ```json
 {

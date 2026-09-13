@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { config, log } from "./config.js";
 import type { ToolResult } from "./protocol.js";
 import { encodePng, rasterize, type Recording } from "./image.js";
+import { renderScene, type Scene } from "./scene.js";
 
 /**
  * The one place the relay acts on a result instead of passing it along.
@@ -33,13 +34,17 @@ function pngPath(directive: Directive): string {
 
 /** Returns a line to append to the tool's own output, or undefined if there was nothing to do. */
 export function runPostProcess(directive: Directive): string | undefined {
-	if (directive.kind !== "png") {
+	if (directive.kind !== "png" && directive.kind !== "scene") {
 		return `[vmcp doesn't know how to finish a "${String(directive.kind)}" job]`;
 	}
 
 	try {
+		const surface =
+			directive.kind === "scene"
+				? renderScene(directive as unknown as Scene)
+				: rasterize(directive as unknown as Recording);
 		const path = pngPath(directive);
-		writeFileSync(path, encodePng(rasterize(directive as unknown as Recording)));
+		writeFileSync(path, encodePng(surface));
 		log(`wrote ${path}`);
 		return `[wrote the image to ${path}]`;
 	} catch (err) {

@@ -298,4 +298,85 @@ function Build.Apply(source: string, root: Instance): (boolean, string?)
 	return ran, if ran then nil else tostring(failure)
 end
 
+-- Every part in a region as plain numbers, for the VMCP server to draw.
+--
+-- Studio can't hand out a picture -- a viewport screenshot needs a real camera, a real frame and a
+-- place saved somewhere -- but it can hand out the geometry, and the geometry is tiny. What comes
+-- back is roughly forty bytes per part, and the server renders it into something you can look at.
+--
+-- Shape names here are the four the renderer knows. Everything with a mesh or a union becomes its
+-- bounding box, which is right for a blockout and honest about what it is.
+local SHAPES: { [Enum.PartType]: string } = {
+	[Enum.PartType.Block] = "box",
+	[Enum.PartType.Ball] = "ball",
+	[Enum.PartType.Cylinder] = "cylinder",
+	[Enum.PartType.Wedge] = "wedge",
+	[Enum.PartType.CornerWedge] = "wedge",
+}
+
+local function shapeOf(part: BasePart): string
+	if part:IsA("WedgePart") or part:IsA("CornerWedgePart") then
+		return "wedge"
+	end
+	if part:IsA("Part") then
+		return SHAPES[part.Shape] or "box"
+	end
+	return "box"
+end
+
+local function round(value: number): number
+	return math.floor(value * 1000 + 0.5) / 1000
+end
+
+export type Geometry = { { [string]: any } }
+
+function Build.Geometry(root: Instance, maxParts: number?): (Geometry, number, boolean)
+	local limit = maxParts or 1500
+	local parts: Geometry = {}
+	local skipped = 0
+
+	for _, descendant in root:GetDescendants() do
+		if not descendant:IsA("BasePart") then
+			continue
+		end
+		if #parts >= limit then
+			skipped += 1
+			continue
+		end
+
+		local components = { descendant.CFrame:GetComponents() }
+		for index, value in components do
+			components[index] = round(value)
+		end
+
+		local size = descendant.Size
+		local color = descendant.Color
+		table.insert(parts, {
+			n = descendant.Name,
+			s = shapeOf(descendant),
+			m = components,
+			d = { round(size.X), round(size.Y), round(size.Z) },
+			c = { round(color.R), round(color.G), round(color.B) },
+			t = if descendant.Transparency > 0 then round(descendant.Transparency) else nil,
+		})
+	end
+
+	if root:IsA("BasePart") and #parts < limit then
+		local components = { root.CFrame:GetComponents() }
+		for index, value in components do
+			components[index] = round(value)
+		end
+		table.insert(parts, {
+			n = root.Name,
+			s = shapeOf(root),
+			m = components,
+			d = { round(root.Size.X), round(root.Size.Y), round(root.Size.Z) },
+			c = { round(root.Color.R), round(root.Color.G), round(root.Color.B) },
+			t = if root.Transparency > 0 then round(root.Transparency) else nil,
+		})
+	end
+
+	return parts, #parts, skipped > 0
+end
+
 return Build

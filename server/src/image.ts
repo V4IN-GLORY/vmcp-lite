@@ -24,7 +24,7 @@ export interface Recording {
 
 const MAX_SIZE = 1024;
 
-class Surface {
+export class Surface {
 	readonly pixels: Uint8ClampedArray;
 
 	constructor(

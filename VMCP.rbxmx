@@ -2103,6 +2103,87 @@ function Build.Apply(source: string, root: Instance): (boolean, string?)
 	return ran, if ran then nil else tostring(failure)
 end
 
+-- Every part in a region as plain numbers, for the VMCP server to draw.
+--
+-- Studio can't hand out a picture -- a viewport screenshot needs a real camera, a real frame and a
+-- place saved somewhere -- but it can hand out the geometry, and the geometry is tiny. What comes
+-- back is roughly forty bytes per part, and the server renders it into something you can look at.
+--
+-- Shape names here are the four the renderer knows. Everything with a mesh or a union becomes its
+-- bounding box, which is right for a blockout and honest about what it is.
+local SHAPES: { [Enum.PartType]: string } = {
+	[Enum.PartType.Block] = "box",
+	[Enum.PartType.Ball] = "ball",
+	[Enum.PartType.Cylinder] = "cylinder",
+	[Enum.PartType.Wedge] = "wedge",
+	[Enum.PartType.CornerWedge] = "wedge",
+}
+
+local function shapeOf(part: BasePart): string
+	if part:IsA("WedgePart") or part:IsA("CornerWedgePart") then
+		return "wedge"
+	end
+	if part:IsA("Part") then
+		return SHAPES[part.Shape] or "box"
+	end
+	return "box"
+end
+
+local function round(value: number): number
+	return math.floor(value * 1000 + 0.5) / 1000
+end
+
+export type Geometry = { { [string]: any } }
+
+function Build.Geometry(root: Instance, maxParts: number?): (Geometry, number, boolean)
+	local limit = maxParts or 1500
+	local parts: Geometry = {}
+	local skipped = 0
+
+	for _, descendant in root:GetDescendants() do
+		if not descendant:IsA("BasePart") then
+			continue
+		end
+		if #parts >= limit then
+			skipped += 1
+			continue
+		end
+
+		local components = { descendant.CFrame:GetComponents() }
+		for index, value in components do
+			components[index] = round(value)
+		end
+
+		local size = descendant.Size
+		local color = descendant.Color
+		table.insert(parts, {
+			n = descendant.Name,
+			s = shapeOf(descendant),
+			m = components,
+			d = { round(size.X), round(size.Y), round(size.Z) },
+			c = { round(color.R), round(color.G), round(color.B) },
+			t = if descendant.Transparency > 0 then round(descendant.Transparency) else nil,
+		})
+	end
+
+	if root:IsA("BasePart") and #parts < limit then
+		local components = { root.CFrame:GetComponents() }
+		for index, value in components do
+			components[index] = round(value)
+		end
+		table.insert(parts, {
+			n = root.Name,
+			s = shapeOf(root),
+			m = components,
+			d = { round(root.Size.X), round(root.Size.Y), round(root.Size.Z) },
+			c = { round(root.Color.R), round(root.Color.G), round(root.Color.B) },
+			t = if root.Transparency > 0 then round(root.Transparency) else nil,
+		})
+	end
+
+	return parts, #parts, skipped > 0
+end
+
 return Build
 ]]></string>
         </Properties>
@@ -4761,6 +4842,116 @@ return Tool
       </Item>
       <Item class="ModuleScript" referent="35">
         <Properties>
+          <string name="Name">RenderBuild</string>
+          <string name="Source"><![CDATA[--!strict
+
+local Build = require(script.Parent.Parent.Lib.Build)
+local Path = require(script.Parent.Parent.Path)
+
+local MAX_PARTS = 1500
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+	postProcess: { [string]: any }?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "render_build",
+	description = "Draws a region of the place as a picture and writes it to a PNG, so you can "
+		.. "look at what your build code actually made instead of reading it back and guessing. "
+		.. "Studio sends the geometry; the VMCP server renders it, so this needs no camera, no "
+		.. "playtest and no screenshot. Orthographic blockout: flat shading, an outline on every "
+		.. "part, all views at one scale so sizes stay comparable. Pair it with get_build -- read "
+		.. "the region as code, edit it, run it back, render, look, edit again.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			root = {
+				type = "string",
+				description = 'Dotted path to the region, like "Workspace.Arena". Defaults to Workspace.',
+			},
+			views = {
+				type = "array",
+				description = "Which angles to draw, tiled into one image. Defaults to iso alone. "
+					.. "Named: iso, corner, front, back, left, right, top, bottom. Or an object "
+					.. "{ yaw, pitch, name } in degrees for anything else.",
+				items = { type = { "string", "object" } },
+				maxItems = 9,
+			},
+			size = {
+				type = "integer",
+				description = "Pixels per view. Defaults to 512.",
+				minimum = 128,
+				maximum = 1024,
+			},
+			name = {
+				type = "string",
+				description = "File name, letters digits underscore hyphen. Defaults to a timestamp.",
+			},
+			maxParts = {
+				type = "integer",
+				description = `Stop collecting after this many parts. Defaults to {MAX_PARTS}.`,
+				minimum = 1,
+				maximum = MAX_PARTS,
+			},
+		},
+	},
+	tags = { title = "Render Build", readOnly = true },
+	timeoutMs = 60000,
+}
+
+function Tool.Run(arguments: {
+	root: string?,
+	views: { any }?,
+	size: number?,
+	name: string?,
+	maxParts: number?,
+}): Result
+	local root: Instance = workspace
+	if type(arguments.root) == "string" and arguments.root ~= "" then
+		local found, problem = Path.Resolve(arguments.root :: string)
+		if not found then
+			return { content = { { type = "text", text = problem :: string } }, isError = true }
+		end
+		root = found
+	end
+
+	local parts, count, capped = Build.Geometry(root, arguments.maxParts)
+	if count == 0 then
+		return {
+			content = {
+				{ type = "text", text = `{root:GetFullName()} has no parts in it, so there's nothing to draw` },
+			},
+			isError = true,
+		}
+	end
+
+	local views = arguments.views or { "iso" }
+	local note = if capped then ` (stopped at {count}, there are more)` else ""
+
+	return {
+		content = {
+			{ type = "text", text = `{count} part(s) under {root:GetFullName()}, {#views} view(s){note}` },
+		},
+		postProcess = {
+			kind = "scene",
+			name = arguments.name,
+			size = arguments.size,
+			views = views,
+			parts = parts,
+		},
+	}
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="36">
+        <Properties>
           <string name="Name">RunLuau</string>
           <string name="Source"><![CDATA[--!strict
 
@@ -4892,7 +5083,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="36">
+      <Item class="ModuleScript" referent="37">
         <Properties>
           <string name="Name">RunTimeline</string>
           <string name="Source"><![CDATA[--!strict
@@ -5224,7 +5415,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="37">
+      <Item class="ModuleScript" referent="38">
         <Properties>
           <string name="Name">SearchScripts</string>
           <string name="Source"><![CDATA[--!strict
@@ -5455,7 +5646,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="38">
+      <Item class="ModuleScript" referent="39">
         <Properties>
           <string name="Name">TimelinePart</string>
           <string name="Source"><![CDATA[--!strict
