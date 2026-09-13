@@ -137,16 +137,15 @@ local function arch(parent, name, frame, span, rise, depth, thick)
 end
 ```
 
-Wedge recipes that come up constantly (these assume the tall face is at +Z; if a `render_build`
-of one wedge shows the slope the other way, negate the Y rotations):
+Wedge recipes that come up constantly (a wedge's right angle is at the bottom of its -Z face):
 
-- spandrel — right angle at the top outer corner, hypotenuse on the arch line:
-  `frame * CFrame.new(s * span / 4, rise / 2, 0) * CFrame.Angles(0, -s * π/2, 0) * CFrame.Angles(π, 0, 0)`,
+- spandrel — right angle at the top outer corner, hypotenuse on the arch line, `s = -1` left,
+  `1` right: `frame * CFrame.new(s * span / 4, rise / 2, 0) * CFrame.Angles(0, s * π/2, 0) * CFrame.Angles(π, 0, 0)`,
   size `(depth, rise, span / 2)`
 - gable half — right angle at the bottom centre: size `(thick, rise, halfWidth)`, centre at
-  `x = ±halfWidth / 2`, `CFrame.Angles(0, ∓π/2, 0)`
-- a sloped cap on a buttress or sill, back against the wall: `CFrame.Angles(0, π, 0)` when the
-  wall is on the cap's -Z side
+  `x = s * halfWidth / 2`, `CFrame.Angles(0, s * π/2, 0)`
+- a sloped cap on a buttress or sill with the wall on the cap's -Z side: no rotation, the tall
+  face is already against the wall
 
 Overlap rules the problem list can't tell you:
 
@@ -207,17 +206,50 @@ Fog volumes and light-shaft emitters are `Transparency = 1` boxes that overlap e
 them when reading the overlap lines (and skip them yourself if you write your own check).
 
 **The picture** is for what numbers can't say: does the layout read, are the proportions right,
-is that shape what you pictured. It's an orthographic blockout at one scale across every panel —
-flat shading, a dark line on every edge, a badge number on each part matching the legend. Meshes
-and unions draw as their bounding box. Lights, decals and particles don't draw at all.
+is that shape what you pictured. Always look at it — every `apply_build` draws one, and
+`render_build` draws one without applying. Never substitute a Studio screenshot or a guess from
+reading the source back; the picture is the check, and a pass without looking at it isn't a pass.
 
-Look at it, note what's off in words ("the crates are too small for the room", "the stairs don't
-reach the ledge"), then go back to the source and change the derivation. Don't read a coordinate
-off the picture — you have the legend for that.
+## The renderer
 
-Default is one `iso` view. Add `"top"` when the question is footprint, `"front"` when it's height.
-Don't ask for many views by habit; more panels is more to reconcile, and the numbers already agree
-with themselves.
+The picture comes from VMCP's own renderer (`server/src/scene.ts`), not from Studio. The plugin
+collects every part's CFrame, size, shape, colour and transparency; the server rasterizes them
+itself — no camera, no playtest, no screenshot, and it works with Studio minimised. What it draws:
+
+- **Orthographic, one scale across every panel.** A part is the same size wherever it sits, so two
+  panels compare directly and "is the door as tall as the frame" is answered by looking.
+- **Flat shading with a dark line on every part edge.** "Is that one part or three" is the question
+  being asked most of the time, so edges are drawn even where faces are flush. Lit from the camera,
+  so no view is the unlit side.
+- **Real shapes** for box, ball, cylinder and wedge — the wedge is modelled as Roblox's (tall face
+  at -Z), so a wedge that looks backwards in the picture *is* backwards. Meshes and unions draw as
+  their bounding box. Transparency draws as alpha. Lights, decals, beams and particles don't draw.
+- **A badge number on each part** matching the legend line the tool printed, so anything you can
+  see you can grep for by name. Badges go off above 40 parts unless forced with `badges = true`.
+- **Views**: `iso` (default), `corner`, `front`, `back`, `left`, `right`, `top`, `bottom`, or
+  `{ yaw, pitch, name }` in degrees for anything else. Up to 9, tiled into one sheet, each panel
+  labelled. `size` is pixels per panel, 128–1024, default 512; the sheet caps at 3072 wide so
+  many panels means smaller ones.
+- The PNG lands in the server's `images/` state directory under `name` (or a timestamp) and is
+  inlined in the reply when small enough; the tool prints the path either way.
+
+Use it on purpose, not just because it arrived:
+
+- **Custom angles for the thing in question.** A doorway on the south face wants
+  `{ yaw = 0, pitch = 10, name = "door" }` with `root` narrowed to that facade, not the whole map
+  at iso. Narrow `root` is the main lever: 40 parts with badges tells you more than 1500 without.
+- **`front` / `left` for proportions, `top` for footprint, `iso` for whether it reads.** Add a
+  second view when a specific question needs it; don't ask for six by habit — more panels is more
+  to reconcile, and the numbers already agree with themselves.
+- **`render_build` before touching a region that exists**, and again after a pass that changed
+  something you can't measure (a silhouette, a prop's proportions) without re-applying.
+- **Wedges and rotated parts are exactly where the picture earns its keep** — the problem list
+  can't tell you a spandrel is rotated into the wall or a roof slab slopes the wrong way; the
+  picture can, in one glance.
+
+Look at it, note what's off in words ("the door leaf is half the width of the opening", "the
+stairs don't reach the ledge"), then go back to the source and change the derivation. Don't read a
+coordinate off the picture — you have the legend for that.
 
 ## Passes
 
@@ -271,6 +303,13 @@ apply_build { code = <the same source>, root = "Workspace.Arena2" }
 ```
 
 A missing last segment is created as a Model.
+
+## Leave `game.Lighting` alone
+
+Never touch anything under `game.Lighting` — ClockTime, Ambient, Bloom, ColorCorrection,
+Atmosphere, Sky, any of it — unless the user asks for it by name. A build is geometry under its
+root. Lights, beams and particle emitters *inside* the build are fine; they live under the root
+and get cleaned up with it. Lighting is place-wide state the user owns.
 
 ## What it covers
 
