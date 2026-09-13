@@ -330,53 +330,180 @@ end
 
 export type Geometry = { { [string]: any } }
 
-function Build.Geometry(root: Instance, maxParts: number?): (Geometry, number, boolean)
+local function describe(part: BasePart, index: number): { [string]: any }
+	local components = { part.CFrame:GetComponents() }
+	for at, value in components do
+		components[at] = round(value)
+	end
+
+	local size = part.Size
+	local color = part.Color
+	return {
+		i = index,
+		n = part.Name,
+		s = shapeOf(part),
+		m = components,
+		d = { round(size.X), round(size.Y), round(size.Z) },
+		c = { round(color.R), round(color.G), round(color.B) },
+		t = if part.Transparency > 0 then round(part.Transparency) else nil,
+	}
+end
+
+-- The parts to draw, and the list that says which drawn part is which. The badge number in the
+-- picture is this part's place in `found`, so a thing you can see has a path you can grep for.
+function Build.Geometry(root: Instance, maxParts: number?): (Geometry, { BasePart }, boolean)
 	local limit = maxParts or 1500
 	local parts: Geometry = {}
-	local skipped = 0
+	local found: { BasePart } = {}
+	local skipped = false
 
-	for _, descendant in root:GetDescendants() do
-		if not descendant:IsA("BasePart") then
-			continue
-		end
+	local function take(part: BasePart)
 		if #parts >= limit then
-			skipped += 1
-			continue
+			skipped = true
+			return
 		end
-
-		local components = { descendant.CFrame:GetComponents() }
-		for index, value in components do
-			components[index] = round(value)
-		end
-
-		local size = descendant.Size
-		local color = descendant.Color
-		table.insert(parts, {
-			n = descendant.Name,
-			s = shapeOf(descendant),
-			m = components,
-			d = { round(size.X), round(size.Y), round(size.Z) },
-			c = { round(color.R), round(color.G), round(color.B) },
-			t = if descendant.Transparency > 0 then round(descendant.Transparency) else nil,
-		})
+		table.insert(found, part)
+		table.insert(parts, describe(part, #found))
 	end
 
-	if root:IsA("BasePart") and #parts < limit then
-		local components = { root.CFrame:GetComponents() }
-		for index, value in components do
-			components[index] = round(value)
+	if root:IsA("BasePart") then
+		take(root)
+	end
+	for _, descendant in root:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			take(descendant)
 		end
-		table.insert(parts, {
-			n = root.Name,
-			s = shapeOf(root),
-			m = components,
-			d = { round(root.Size.X), round(root.Size.Y), round(root.Size.Z) },
-			c = { round(root.Color.R), round(root.Color.G), round(root.Color.B) },
-			t = if root.Transparency > 0 then round(root.Transparency) else nil,
-		})
 	end
 
-	return parts, #parts, skipped > 0
+	return parts, found, skipped
+end
+
+-- What's wrong with a build, in code rather than by eye.
+--
+-- A picture shows you a part in the wrong place; it can't tell you the rotation is 0.4 degrees off
+-- true, and that's the kind of thing build code produces and nobody notices. Each of these is a
+-- mistake that comes from generating geometry rather than placing it by hand.
+
+export type Problem = { part: BasePart, kind: string, detail: string }
+
+local NEAR_MISS_DEGREES = 5
+local SUPPORTED_GAP = 0.25
+local THIN = 0.1
+local OUTLIER_STUDS = 250
+
+local function degreesOffAxis(cframe: CFrame): number
+	local worst = 0
+	for _, direction in { cframe.RightVector, cframe.UpVector, cframe.LookVector } do
+		local nearest = math.max(math.abs(direction.X), math.abs(direction.Y), math.abs(direction.Z))
+		worst = math.max(worst, math.deg(math.acos(math.clamp(nearest, -1, 1))))
+	end
+	return worst
+end
+
+function Build.Problems(root: Instance, maxParts: number?, known: { BasePart }?): { Problem }
+	local parts: { BasePart } = known or ({} :: { BasePart })
+	if not known then
+		local _, walked = Build.Geometry(root, maxParts)
+		parts = walked
+	end
+	local problems: { Problem } = {}
+
+	local overlap = OverlapParams.new()
+	overlap.FilterType = Enum.RaycastFilterType.Include
+	overlap.FilterDescendantsInstances = (parts :: any) :: { Instance }
+	overlap.MaxParts = 4
+
+	local rays = RaycastParams.new()
+	rays.FilterType = Enum.RaycastFilterType.Exclude
+
+	local reportedOverlap: { [BasePart]: boolean } = {}
+	local stacked: { [string]: BasePart } = {}
+	local centre = Vector3.zero
+
+	for _, part in parts do
+		centre += part.Position
+	end
+	centre = if #parts > 0 then centre / #parts else Vector3.zero
+
+	for _, part in parts do
+		local size = part.Size
+
+		if math.min(size.X, size.Y, size.Z) < THIN then
+			table.insert(problems, {
+				part = part,
+				kind = "paper thin",
+				detail = `{size.X} x {size.Y} x {size.Z} -- probably a size that was computed to nothing`,
+			})
+		end
+
+		local tilt = degreesOffAxis(part.CFrame)
+		if tilt > 0.02 and tilt < NEAR_MISS_DEGREES then
+			table.insert(problems, {
+				part = part,
+				kind = "off axis",
+				detail = `rotated {string.format("%.2f", tilt)} degrees off square -- meant to be flat?`,
+			})
+		end
+
+		local key = `{part.Name}|{size}|{round(part.Position.X)},{round(part.Position.Y)},{round(part.Position.Z)}`
+		local twin = stacked[key]
+		if twin then
+			table.insert(problems, {
+				part = part,
+				kind = "duplicate",
+				detail = `same name, size and position as {twin:GetFullName()} -- build code run twice?`,
+			})
+		else
+			stacked[key] = part
+		end
+
+		local touching = workspace:GetPartsInPart(part, overlap)
+		local connected = false
+		for _, other in touching do
+			if other ~= part then
+				connected = true
+				if not reportedOverlap[part] and not reportedOverlap[other] then
+					reportedOverlap[part] = true
+					table.insert(problems, {
+						part = part,
+						kind = "overlapping",
+						detail = `sunk into {other:GetFullName()}`,
+					})
+				end
+				break
+			end
+		end
+
+		-- Only parts that touch nothing at all are worth checking for support: a wall welded to
+		-- its neighbour has nothing underneath it either, and that's not a mistake.
+		if not connected then
+			rays.FilterDescendantsInstances = { part }
+			local hit = workspace:Raycast(part.Position, Vector3.new(0, -(size.Y / 2 + 512), 0), rays)
+			if not hit then
+				table.insert(problems, { part = part, kind = "floating", detail = "nothing under it at all" })
+			else
+				local gap = hit.Distance - size.Y / 2
+				if gap > SUPPORTED_GAP then
+					table.insert(problems, {
+						part = part,
+						kind = "floating",
+						detail = `{string.format("%.2f", gap)} studs above {hit.Instance:GetFullName()}`,
+					})
+				end
+			end
+		end
+
+		local away = (part.Position - centre).Magnitude
+		if away > OUTLIER_STUDS then
+			table.insert(problems, {
+				part = part,
+				kind = "stranded",
+				detail = `{math.floor(away)} studs from the middle of the build`,
+			})
+		end
+	end
+
+	return problems
 end
 
 return Build

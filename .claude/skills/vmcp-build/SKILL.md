@@ -76,9 +76,42 @@ render_build -> look at what you actually made
    edit again
 ```
 
-Two things it shows that the code doesn't: a part that's rotated when you meant it flat, and a
-part floating where you meant it sitting on something. `top` catches footprint mistakes; `front`
-catches height ones.
+### Finding the part you're looking at
+
+Every part gets a number in the picture and a line in the tool's text output:
+
+```
+legend (the number in the picture):
+  #1 Floor            64x1x64 at (0, 0, 0)
+  #2 Walls.North      64x12x1 at (0, 6, -32)
+  #4 Props.Crate      4x4x4 at (10, 4, 8)
+```
+
+So a thing you can see is a name you can grep for in the `get_build` source — the numbers are not
+the `n1`, `n2` locals in that source, which are a different walk, but the **names** match. Badges
+are on up to 40 parts and off above that; force either way with `badges`.
+
+### What's wrong, without eyeballing it
+
+The same call checks the geometry and says so in words, which beats squinting at a picture:
+
+```
+3 thing(s) worth a look:
+  Walls.North -- off axis: rotated 0.40 degrees off square -- meant to be flat?
+  Props.Crate -- floating: 3.20 studs above Floor
+  Props.Barrel -- duplicate: same name, size and position as Props.Barrel -- build code run twice?
+```
+
+It looks for parts sunk into each other, parts floating with a gap under them, rotations that are
+a fraction off square (under 5 degrees — anything more reads as deliberate), parts thinner than
+0.1 studs, exact duplicates stacked on each other, and parts stranded hundreds of studs from
+everything else. `vmcp.Build.Problems(root)` is the same check from a snippet.
+
+A part welded flush against its neighbour isn't reported as floating — only parts touching nothing
+at all get the support check, or every wall in the build would be a false alarm.
+
+Use the picture for the things a check can't name: proportions, whether a layout reads, whether a
+shape is what you pictured. `top` catches footprint mistakes; `front` catches height ones.
 
 What it draws: boxes, spheres, cylinders and wedges, with colour and transparency. **Meshes and
 unions come through as their bounding box** — right for a blockout, and honest about what it knows.

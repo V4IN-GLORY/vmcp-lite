@@ -28,6 +28,8 @@ export interface ScenePart {
 	c: number[];
 	/** Transparency, 0-1. */
 	t?: number;
+	/** The number drawn on it, matching the legend the tool printed. */
+	i?: number;
 }
 
 export interface Scene {
@@ -35,6 +37,7 @@ export interface Scene {
 	name?: string;
 	size?: number;
 	views?: unknown[];
+	badges?: boolean;
 	parts?: ScenePart[];
 	note?: string;
 }
@@ -382,7 +385,14 @@ function fitScale(parts: ScenePart[], cameras: Camera[], bounds: Bounds, size: n
 	return (size * (1 - MARGIN * 2)) / (widest * 2);
 }
 
-function renderPanel(parts: ScenePart[], camera: Camera, bounds: Bounds, size: number, scale: number): Panel {
+function renderPanel(
+	parts: ScenePart[],
+	camera: Camera,
+	bounds: Bounds,
+	size: number,
+	scale: number,
+	badges: boolean,
+): Panel {
 	const surface = new Surface(size, size);
 	const depth = new Float32Array(size * size).fill(Infinity);
 	const panel: Panel = { surface, depth, size };
@@ -443,6 +453,29 @@ function renderPanel(parts: ScenePart[], camera: Camera, bounds: Bounds, size: n
 
 	for (const part of opaque) draw(part, true);
 	for (const { part } of clear) draw(part, false);
+
+	// Badges last and over everything, because a number hidden behind the part it names is worse
+	// than no number: you'd read it as the part in front.
+	if (badges) {
+		const scaleUp = Math.max(1, Math.round(size / 220));
+		for (const part of parts) {
+			if (typeof part.i !== "number") continue;
+			const [px = 0, py = 0, pz = 0] = part.m;
+			const at = project([px, py, pz]);
+			const text = String(part.i);
+			const width = text.length * 6 * scaleUp;
+			const height = 7 * scaleUp;
+			const left = Math.round(at[0] - width / 2);
+			const top = Math.round(at[1] - height / 2);
+
+			for (let y = top - scaleUp; y < top + height + scaleUp; y++) {
+				for (let x = left - scaleUp; x < left + width + scaleUp; x++) {
+					surface.blend(x, y, 10, 10, 12, 0.72);
+				}
+			}
+			label(surface, text, left, top, scaleUp);
+		}
+	}
 
 	return panel;
 }
@@ -545,7 +578,7 @@ export function renderScene(scene: Scene): Surface {
 	const sheet = new Surface(columns * panelSize, rows * panelSize);
 
 	views.forEach((view, index) => {
-		const panel = renderPanel(parts, cameras[index] as Camera, bounds, panelSize, scale);
+		const panel = renderPanel(parts, cameras[index] as Camera, bounds, panelSize, scale, scene.badges === true);
 		const left = (index % columns) * panelSize;
 		const top = Math.floor(index / columns) * panelSize;
 
