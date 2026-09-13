@@ -40,6 +40,12 @@ branches and the door behind the buttress still in it. Minimum per build, no mat
 one `apply_build`, at least two `render_build` calls at different locations/angles, and the
 phase-4 checklist written out. Bigger builds scale that up, never down.
 
+**A render only counts if the thing it is meant to prove is legible in it.** A whole-build,
+night-lit thumbnail cannot show which way a roof falls, whether trunks are vertical or whether a
+doorway is clear — and a build has shipped a valley roof and horizontal tree trunks past four such
+passes. Name what the panel proves, confirm you can see it, and take another panel if you cannot.
+Field notes at the end of this file (§1, §2, §7).
+
 **Accessibility is a requirement, not a nicety.** Unless the user says a space is sealed (a
 crypt, a decorative tower, a ruin with a collapsed stair), every interior space a player could
 see must be reachable on foot from outside and from every other interior space: a door or
@@ -630,3 +636,209 @@ comes back wrong.
 Limits: `get_build` `depth` 12, `maxNodes` 800; `apply_build` / `render_build` measure up to
 1500 parts. Always pass `root` — the default is the whole Workspace, which hits the cap on any
 real place and measures everything that isn't the build. Prefer a narrow `root` over a bigger cap.
+
+## Field notes — every one of these has already gone wrong once
+
+Written after a 1 500-part ruined cathedral shipped a **valley** where its nave roof should have
+been, and a forest of **horizontal logs** where its trunks should have been — with four clean render
+passes on the record and a QA line reading "0 unsupported, 0 paper thin". Each item below is: what it
+looked like, what actually caused it, and the rule that stops it. Read this before phase 2, and again
+before you tell the user the build is done.
+
+**The five rules, if you read nothing else:**
+
+1. A wrong rotation leaves the bounding box identical — so assert *direction* in the build's own QA,
+   not just support and spacing.
+2. A render only counts if the property it is meant to prove is legible in the panel. Whole-build,
+   night-lit thumbnails prove nothing about a roof.
+3. A floating report on a structural part is a real defect. Never close a build with one unexplained.
+4. Learn each helper's axis convention and never re-rotate it; composing two rotations is where the
+   sign gets lost.
+5. Always pass `root`, batch applies under ~20 KB, and never pair a big first apply with `clear`.
+
+### 1. The roof: a rotation sign made a gable into a valley
+
+```lua
+-- as written: the slab's local +X climbs OUTWARD, so the eave became the high end
+local cf = CFrame.new(midX, midY, zc) * CFrame.Angles(0, 0, side * pitch)
+-- as the geometry needs it: local +X climbs INWARD, toward the ridge
+local cf = CFrame.new(midX, midY, zc) * CFrame.Angles(0, 0, -side * pitch)
+```
+
+With `run = 13.5`, `rise = 9.7`, the shipped version put the tall end at `x = ±13.5, y = 40` and the
+low end at `x = 0, y = 30.3`: two slopes meeting in a valley in the middle of the nave, with the ridge
+cap hanging 7.7 studs above nothing. **Everything in the report passed** — bounds, group extents, part
+count, `unsupported: 0`, `paper thin: 0` — because a rotation about the part's own centre does not move
+its bounding box at all. This file already warns that "the report can't see a backwards roof slope";
+that warning is correct and it is not enough on its own. Only two things catch this:
+
+- a directional assertion in the build's own QA (see §3), and
+- a render panel in which the slope direction is actually visible (see §5).
+
+### 2. The trees: `rod` laid every trunk flat
+
+```lua
+-- rod() turns the cylinder's own X axis onto -Z (it exists for beams through a wall)
+col(parent, name .. "Trunk1", 1.15 * scale, h * 0.62, tilt * CFrame.new(0, h * 0.31, 0), bark)
+```
+
+The tree code called `rod` **and** added its own `CFrame.Angles(0, math.pi / 2, 0)`. Two 90° Y
+rotations compose to 180°, so every trunk came out horizontal at chest height with the roots below it
+and the crown boughs hanging in the air around it. The root helper already did the turn; the second
+one cancelled it.
+
+Rule: **know each helper's axis convention, and rotate a thing once.**
+
+| helper | the axis the length ends up on | use it for |
+| --- | --- | --- |
+| `box` | X, Y, Z exactly as given | walls, trim, slabs, plates, ribs |
+| `cyl` | local X, as you orient it | a fallen drum; anything you aim yourself |
+| `col` | +Y (up) | posts, columns, **tree trunks**, candle wax, hanging chains |
+| `rod` | the frame's −Z | axles through a wall, a sword grip along its blade |
+| `rodBetween(a, b)` | a → b, via `lookAt` | bones, limbs, anything joining two points |
+| `beamBetween(a, b)` | a → b | rafters, ties, anything spanning two named points |
+
+When a cylinder has to point somewhere no helper does, reach for `rodBetween`/`beamBetween` rather
+than stacking rotations. Two more of this family were found by sweeping *every* `cyl`/`col`/`rod`
+call rather than spot-fixing the two that showed: the wheel-window hub was a vertical post where it
+had to be an axle through the wall, and the soldier's ribs were rods poking fore-and-aft instead of
+bars crossing the chest. Sweep the helpers; don't fix the symptom.
+
+### 3. Put the assertion in the build, not in your head
+
+Anything with a right way up gets checked in the source and printed as a PASS/FAIL line, so the QA
+travels with the map instead of living in the transcript. Paste this shape into every build's QA
+function and grow it:
+
+```lua
+-- a rotation sign error is invisible to a bounding box, so check the things that have a right way up
+local planes, wrongPlane, trunks, looseTrunk = 0, 0, 0, 0
+for _, d in ipairs(parts) do
+	if string.find(d.Name, "^Slope") or string.find(d.Name, "^Lean%d") then
+		planes += 1
+		local axis = d.CFrame.XVector                    -- the slab's own long axis
+		local inward = if d.Position.X >= 0 then 1 else -1
+		-- climbing inboard (|x| falling) has to mean climbing up, whichever way the box is turned
+		if math.abs(axis.Y) < 0.2 or axis.Y * axis.X * inward > -0.1 then wrongPlane += 1 end
+	elseif string.find(d.Name, "Trunk") then
+		trunks += 1
+		if math.abs(d.CFrame.XVector.Y) < 0.97 then looseTrunk += 1 end   -- a trunk's axis points up
+	end
+end
+print(string.format("[build] QA  roof %d planes (%d inverted) | %d trunks (%d not vertical)",
+	planes, wrongPlane, trunks, looseTrunk))
+if wrongPlane > 0 or looseTrunk > 0 then print("[build] QA  ORIENTATION FAULT") end
+```
+
+Generalise it to every element whose direction carries meaning: roof planes and lean-tos, stairs and
+ramps (which way they rise), buttress stages (each one narrower than the one below), arch springing,
+wall normals, the raised end of a fallen beam, the barrel of a cannon, the blade of a sword. Decide
+the sign, assert the sign, print the result. Two lines of assertion is far cheaper than a rebuild.
+
+The same trick fixes the "is it supported" question that floods the problem list: a part is supported
+if something is under it, so assert the *intent* per group (rubble is 20–30% into the ground, trim is
+proud by `PROUD`, every layer is offset by `EPS`) rather than re-reading 900 overlap lines.
+
+### 4. Transport: the tools will quietly cut your source in half
+
+- **`apply_build` (and `render_build`) truncate large `code`.** At roughly 55 KB the chunk arrived cut
+  mid-line and Studio answered `Expected 'end' (to close 'do' at line N), got <eof>`. Because that call
+  also carried `clear = true`, the truncated code still deleted the old build first: the map was gone
+  *and* the error pointed at the new one. Rules: **batch at ≤ ~20 KB, one phase per batch; never pair a
+  first-time large apply with `clear`; when a syntax error names the last line of the file, suspect
+  truncation before you suspect your own syntax.**
+- **A phase batch must carry the helpers that sit between phases.** Mechanical splitting on "the first
+  line that starts with `phase(function(root)`" left `local function tree` behind (it lives *after*
+  the previous phase's `end)`), and the build died with `attempt to call a nil value` at the first
+  `tree(...)`. Splitting rule: a batch is [preamble and helpers] + [everything from the previous
+  phase's `end)` through the phase you want]. Text between phases belongs to the phase that follows it.
+- **Reading a long source back truncates as well.** A 1 462-line, 81 KB file came back as 64 000
+  characters *taken from the tail*, silently starting mid-file; splitting that produced a bogus header
+  and a syntax error in every batch. Read by line range (`(Get-Content f)[0..519]`), assert the last
+  line you got (`return BUILD`, or your real final line), and check the line count before trusting a
+  slice.
+- **`run_luau`: `return` your evidence, don't `print` it.** A snippet's `print` output is not
+  reliably part of the tool's returned text (it goes to the Studio output window — `get_logs` shows
+  it), while a `return`ed string is what you actually read. Build the QA summary and `return` it.
+- **`read` and `pwsh` output truncate long files**; `Get-Content -Raw` is not exempt. Same rules as
+  above.
+
+### 5. Tool behaviour that costs a call every time
+
+- **Omitting `root` on `render_build` / `apply_build` does not merely give a wider view — it
+  crashes.** The default root is `Workspace`, `Terrain` is a `BasePart`, and
+  `workspace:GetPartsInPart(terrain)` throws **`GetPartsInPart does not support Terrain`**, killing
+  the whole call before anything is drawn. Always pass `root = "Workspace.YourBuild"`. (This one is a
+  VMCP bug rather than a build bug: the part walk should skip `Terrain`. Until it does, the
+  workaround is unconditional.)
+- **`at` only honours a dotted path string.** `at = "Workspace.Build.Roof"` frames the roof;
+  `at = { x = 0, y = 33, z = 0 }` is ignored and you get the whole build back at whatever `radius`
+  you asked for. Four intended "close-ups" came back as four whole-map panels this way — and a valley
+  roof reads as a dark blob in every one of them. Pass paths, not tables.
+- **Every render returns the group summary + the full problem list + the full part legend** (~45–60 KB
+  at 1 500 parts). Batch up to ~9 views per call, pass `problems = false` and `badges = false` when
+  you only need the picture, and keep your own printed output to a line or two — the images attach
+  regardless of what you print.
+- **`Instance.new("DirectionalLight")` fails** (`Unable to create an Instance of type
+  "DirectionalLight"`). Moonlight has to be one very wide `SpotLight` (Range ≈ 460, Angle ≈ 115,
+  `Shadows = true`, `Face = Front`) on an invisible rig part with `CanQuery = false`, aimed at the
+  build with `CFrame.lookAt`. Create once, find by name on re-runs.
+
+### 6. Report triage — what to ignore, what to chase
+
+The problem list is the loudest thing the tool returns and it is mostly right. Triage it, never skim
+it:
+
+- **`floating: N studs above X` — always investigate.** Two of these were dismissed as
+  `MaxParts = 4` false positives and they were the roof bug in plain sight:
+  `Ridge2 floating 7.70 studs above SlopeE4` and `SlopeTorn2a floating 18.76 studs above Tie2`. On a
+  *structural* part this is a real defect; on a *decorative* one (a chain link between two links) it is
+  the checker's granularity. Rule: **no build is closed with an unexplained floating report.**
+- **`overlapping: sunk about N studs into Y` — usually intentional.** Masonry laps are how the build
+  is meant to fit: trim over wall, voussoir over voussoir (an arch whose pieces don't overlap has
+  slits), lintel into pier, steps into ground, rubble into grass, a bed under a fallen drum. Keep the
+  set finite and name it: if you cannot say which of those a report is, it is probably a mistake.
+- **`off axis: rotated N degrees off square`** — rubble, tilted graves, leaning stones and trees
+  *should* be off-axis; trim, sills, quoins and slabs should not. Check the part name before acting.
+- **`coplanar-flicker pairs`** — what matters is same-plane faces on parts that overlap on all three
+  axes. Steps narrowed by `i * 0.06` and dropped by `i * 0.07`, trim proud by `PROUD`, every layer
+  offset by `EPS`: that is what keeps the count at a handful instead of hundreds.
+- **Near-duplicate names** mean a phase ran twice. Every builder is idempotent for exactly this
+  reason; if you see duplicates, the name-based `ensure` was bypassed somewhere.
+
+### 7. Phase 4 is a claim you have to be able to cash
+
+"The render was done" is not "the geometry was checked". Both bugs above shipped on a build with four
+render passes on the record, because every panel was a whole-map, night-lit, ~200 px thumbnail where a
+gable and a valley are the same dark smudge.
+
+Before writing the pass line, **name the two or three properties that panel is supposed to prove, and
+say how each one is visible in it**:
+
+- roof: which way the slopes fall and where the ridge runs → a side elevation or the plan, close
+  enough that the ridge line and both slopes are distinct; state the direction you see.
+- trunks: vertical, rooted, crown above → one tree filling a good part of the frame.
+- access: the doorway is clear and nothing stands in the threshold → a view through the door.
+- scale: something character-sized next to it.
+
+If the panel cannot show it, the panel does not count and you take another one. Aim with a **path
+string** and a small `radius`, and remember that the renderer draws transparency as alpha, so a
+cutaway in the source is what makes interiors legible.
+
+Also: **night is a bad light for checking geometry.** A scene at `Brightness 2.6` with fog and a blue
+grade is nearly unreadable for shape. Do the geometry pass first (or check it before restoring night),
+and treat the night look as presentation on top of verified geometry.
+
+### 8. Working efficiently in a long build
+
+- Keep the source in **one file on disk** and build each phase batch from that file (read the ranges,
+  concatenate, send) instead of re-typing geometry into the tool call. Re-sending a 13 KB header seven
+  times per iteration is how a session runs out of room.
+- Make every phase **idempotent** (`ensure(parent, name, class)`) so a phase can be re-applied alone
+  after a fix, leaving the rest of the build untouched. Re-applying a phase must never stack a copy.
+- Fix, re-apply **only the phases you touched**, re-run the QA line — and when the fix was an
+  orientation change, re-render the single panel that proves it.
+- Log what each pass proved, in one line, in your reply. A build whose QA prints PASS/FAIL travels
+  with its own evidence; a build whose QA lives in the transcript does not.
+
+
