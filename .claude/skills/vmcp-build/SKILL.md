@@ -224,6 +224,9 @@ optional, not "looked fine":
   `ScaleRef` figure in frame — a player is 5 tall and 2 wide, and if it can't walk through
   a door, up a step, or under a beam, the number is wrong. Then group against group — a porch
   a third the height of the door it shelters, a tree taller than the tower.
+- **Hero props.** Each named prop has had its own three-angle close-up, has 20+ parts or a
+  mesh, a distinct material from its surroundings, and a physical mount. None is a box with a
+  cylinder on it.
 - **Particles.** Every emitter has a texture, size and transparency curve, lifetime, rate and
   speed set for what it is (fog, motes, embers, smoke). No default white sparkles anywhere.
 - **Orientation.** Wedges sloping the wrong way, a roof pitch that reads inverted from the back,
@@ -435,6 +438,31 @@ list. A window is the same with a sill band below.
 
 **Rubble and the ground.** Rocks, roots, fallen beams and leaning stones sit 20–30% into the
 ground on purpose; those overlap/floating lines are meant, say so.
+
+### Hero props — the things the prompt names
+
+Anything the prompt calls out by name (the bell, the altar, the soldier, the throne, the
+fountain) or that a player walks up to and stares at is a hero prop. It gets a detail budget
+and its own pass; a hero prop that's one box and a cylinder is the first thing the user sees
+and the thing they remember.
+
+- **Budget 20–60 parts** for a hero, built the same way as a building: a profile of stacked
+  rings/courses rather than one solid, a distinct role or two from the palette (a bell is
+  bronze with a dark iron yoke and a rope; an altar is a lighter stone with a cloth and a
+  candle rail), trim proud of the body, and a mount that connects it to the architecture
+  (yoke, bracket, chain, plinth) so it isn't floating in the room.
+- **Round or organic shapes** (a bell, a statue, a skull, a tree crown) are the one place
+  boxes struggle. In order: stacked cylinders of decreasing radius with `PROUD` overlaps
+  (a bell is 6–10 rings, wider at the lip, plus a crown and clapper); then an existing mesh
+  — check `ReplicatedStorage` / `ServerStorage` / the place for one before building, and
+  use `MeshPart` / `SpecialMesh` if the user has one; then ask. Asking is a one-liner:
+  "the bell is the focal point — do you have a mesh id for it, or should I build it from
+  ~40 parts?" Never ship the single-cylinder version silently.
+- **Its own render pass**: `{ at = <hero>, radius = <its size + 2>, clip = true }` from three
+  angles including a low one, with the `ScaleRef` next to it. The bell in the tower gets
+  looked at from the floor beneath it, because that's where the player is.
+- Hero props go last in the detail order (after interior props) so their pass isn't cut short
+  by the shell running long — but they are never skipped.
 
 ### Scale — a Roblox character is the ruler
 
