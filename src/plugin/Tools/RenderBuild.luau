@@ -41,7 +41,7 @@ Tool.Definition = {
 					.. "with at (an {x, y, z} or a dotted path to a part or model) and radius (studs "
 					.. "from at to the panel edge); that panel is centred and scaled on it instead of "
 					.. "the whole build. clip = true drops parts further than radius from at, so a "
-					.. "wall between the camera and the spot doesn't hide it. view = \"front\" picks "
+					.. 'wall between the camera and the spot doesn\'t hide it. view = "front" picks '
 					.. "a preset angle for a targeted view instead of yaw/pitch.",
 				items = { type = { "string", "object" } },
 				maxItems = 9,
@@ -58,7 +58,7 @@ Tool.Definition = {
 			},
 			badges = {
 				type = "boolean",
-				description = `Number each part in the picture. On by default up to {BADGE_LIMIT} parts.`,
+				description = `Number each part in the picture and list it in the legend. On by default when the panels show up to {BADGE_LIMIT} parts (clipped panels count only what's in frame).`,
 			},
 			problems = {
 				type = "boolean",
@@ -106,12 +106,17 @@ function Tool.Run(arguments: {
 	end
 
 	local views, missing = Build.ResolveViews(arguments.views or { "iso" })
-	local badges = if arguments.badges ~= nil then arguments.badges else count <= BADGE_LIMIT
+	local shown = Build.Shown(instances, views)
+	local shownCount = 0
+	for _ in shown do
+		shownCount += 1
+	end
+	local badges = if arguments.badges ~= nil then arguments.badges else shownCount <= BADGE_LIMIT
 	local note = if capped then `, stopped at {count} -- there are more` else ""
 	local problems = if arguments.problems ~= false then Build.Problems(root, arguments.maxParts, instances) else nil
 
 	local text = `{count} part(s) under {root:GetFullName()}, {#views} view(s){note}\n`
-		.. Build.Report(root, instances, badges, problems)
+		.. Build.Report(root, instances, if badges then shown else nil, problems)
 	for _, problem in missing do
 		text ..= `\nview target not found, drawing the whole build instead: {problem}`
 	end

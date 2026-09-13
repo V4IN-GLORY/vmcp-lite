@@ -31,7 +31,9 @@ the pass happened.
 
 Every `apply_build` / `render_build` ends the same way: read the numbers, look at the picture,
 write one or two lines of what it showed. A pass without that line was done blind. Never read a
-coordinate off the picture — the legend has it.
+coordinate off the picture — the legend has it, and when there's no legend (badges off, too many
+parts in frame) the group lines and problem lines have it; narrow `root` or clip a panel to get
+badges back rather than asking for `badges = true` on a whole build.
 
 **Rendering is mandatory, every time, whether or not the user asked.** The user's first prompt
 gets the full pipeline including phase 4 — not a single apply and "here it is". A build handed
@@ -40,11 +42,20 @@ branches and the door behind the buttress still in it. Minimum per build, no mat
 one `apply_build`, at least two `render_build` calls at different locations/angles, and the
 phase-4 checklist written out. Bigger builds scale that up, never down.
 
-**A render only counts if the thing it is meant to prove is legible in it.** A whole-build,
-night-lit thumbnail cannot show which way a roof falls, whether trunks are vertical or whether a
-doorway is clear — and a build has shipped a valley roof and horizontal tree trunks past four such
-passes. Name what the panel proves, confirm you can see it, and take another panel if you cannot.
-Field notes at the end of this file (§1, §2, §7).
+**A render only counts if the thing it is meant to prove is legible in it.** Every panel answers a
+question — which way a sloped surface falls, whether a vertical element truly stands vertical, whether
+an opening is clear, whether two surfaces meet without a slit, how big the thing is next to a
+character. A wide, dark, whole-build thumbnail answers none of them, and a build has already shipped a
+valley where its ridge should have been and a set of horizontal logs where its trunks should have been
+past four such passes. Before you write the pass line: name the property, say how you can see it in
+that panel, and take another panel if you cannot. See the field notes at the end of this file (§1, §2,
+§7) for the general form of this and every other failure that has already happened once.
+
+**Run the phases in fresh contexts, not one long conversation.** The phase loop is a series of small
+commits to a file on disk, so no pass needs the transcript that produced the last one. An audited
+1 500-part build spent 95 % of its 88 M tokens re-reading its own growing history and only 3.4 M on new
+input, across 270 requests made from a conversation that reached 644 k tokens. One phase per context,
+state on disk, a short report out — §9 has the numbers and the rules.
 
 **Accessibility is a requirement, not a nicety.** Unless the user says a space is sealed (a
 crypt, a decorative tower, a ruin with a collapsed stair), every interior space a player could
@@ -599,7 +610,9 @@ VMCP's own rasterizer (`server/src/scene.ts`), not Studio — works with Studio 
   alpha. Lights, decals, beams, particles don't draw.
 - **Real material colormaps** tinted by part colour; materials it lacks (Cardboard, Neon,
   ForceField) draw flat. Plastic is always flat.
-- **Badges** match the legend; off above 40 parts unless `badges = true`.
+- **Badges** match the legend; on when the panels show ≤ 40 parts (a clipped panel counts only
+  what's inside its radius), off otherwise unless `badges = true`. No badges, no legend — the
+  per-part list only exists when the numbers in it point at something in the picture.
 - **Views**: `iso`, `corner`, `front`, `back`, `left`, `right`, `top`, `bottom`, or
   `{ yaw, pitch, name }` in degrees. Up to 9 tiled into one sheet; `size` 128–1024 per panel,
   default 512, sheet caps at 3072 wide.
@@ -620,8 +633,10 @@ rotated parts are where the picture earns its keep — the report can't see a ba
 
 ## Existing regions
 
-`get_build { root, depth }` returns the region as this same kind of source — a dump, one line per
-non-default property, not derived. Small edit: change lines, apply back. Restructure: read it for
+`get_build { root, depth }` returns the region as this same kind of source — a dump, not derived.
+A plain anchored part is one `part(parent, name, class, size, cframe, material, color)` line;
+anything with more going on (transparency, collision, lights, emitters) is `ensure` plus one line
+per non-default property. Colours come back as `fromRGB`, right-angle rotations as `math.rad`. Small edit: change lines, apply back. Restructure: read it for
 sizes and positions, write a derived source, apply with `clear = true`. `render_build` first,
 before touching anything that exists.
 
@@ -637,208 +652,277 @@ Limits: `get_build` `depth` 12, `maxNodes` 800; `apply_build` / `render_build` m
 1500 parts. Always pass `root` — the default is the whole Workspace, which hits the cap on any
 real place and measures everything that isn't the build. Prefer a narrow `root` over a bigger cap.
 
-## Field notes — every one of these has already gone wrong once
+## Field notes — failure modes that have already happened once
 
-Written after a 1 500-part ruined cathedral shipped a **valley** where its nave roof should have
-been, and a forest of **horizontal logs** where its trunks should have been — with four clean render
-passes on the record and a QA line reading "0 unsupported, 0 paper thin". Each item below is: what it
-looked like, what actually caused it, and the rule that stops it. Read this before phase 2, and again
-before you tell the user the build is done.
+The pipeline above is correct, and it was followed to the letter on a 1 500-part build that still
+shipped a valley where its roof should have been and a set of horizontal logs where its trees should
+have been — with four render passes and a QA line reading "0 unsupported, 0 paper thin" on the record.
+Nothing here replaces the phases above; this is the list of things that survive them.
 
-**The five rules, if you read nothing else:**
+Every item is written as a **general rule**, with the instance that produced it in a line or two
+underneath. The instance is there because a concrete case makes a rule stick, not because the rule
+only applies to it. If you catch yourself thinking "this one is about roofs", you have read it wrong:
+it is about anything with a direction, any helper that already orients a part, any report you skimmed,
+or any render you accepted without naming what it proved.
 
-1. A wrong rotation leaves the bounding box identical — so assert *direction* in the build's own QA,
-   not just support and spacing.
-2. A render only counts if the property it is meant to prove is legible in the panel. Whole-build,
-   night-lit thumbnails prove nothing about a roof.
+**The six rules, if you read nothing else**
+
+1. Anything whose meaning depends on which way it faces can be exactly wrong while every number in the
+   report stays right. Assert the direction; do not eyeball it.
+2. A render only counts if the property it is meant to prove is legible in the panel.
 3. A floating report on a structural part is a real defect. Never close a build with one unexplained.
-4. Learn each helper's axis convention and never re-rotate it; composing two rotations is where the
-   sign gets lost.
+4. Learn each helper's built-in orientation and never apply a second turn about the same axis.
 5. Always pass `root`, batch applies under ~20 KB, and never pair a big first apply with `clear`.
+6. Cost is `steps × context size`. A pass does not need the transcript that produced the last one, so run
+   the loop in fresh contexts with the state on disk. This is the widest lever in this file — see §9.
 
-### 1. The roof: a rotation sign made a gable into a valley
+### 1. A direction can be inverted without moving a single number the report prints
+
+Applies to: sloped planes, stairs and ramps, tapering stacks (each stage narrower than the one below),
+arch springing and voussoir taper, wall and face normals, the raised end of a fallen beam, a shaft or
+blade or barrel, a roof overhang, lettering on a sign, a bracket that must hang downward.
+
+Why it slips through: **orientation is not in the bounds.** Turning a part about its own centre leaves
+its bounding box unchanged; mirroring a placement leaves the extents identical; reversing a taper
+leaves the size the same. Every check that reads sizes, counts, overlaps and support is blind to it.
+This file already says the report "can't see a backwards roof slope" — that is exactly right, and it
+is not a licence to move on. Only two things catch this class of error:
+
+- an explicit assertion in the build's own QA (§3), and
+- a render panel in which the direction is actually visible (§7).
+
+Instance: a sloped plane was written `CFrame.Angles(0, 0, side * pitch)` where the geometry needed
+`-side * pitch`. Its own long axis therefore climbed outward, so its high end sat at the outer edge
+and its low end at the centre line — two slopes meeting in a valley in the middle of a building that
+should have carried a gable, with the ridge cap left hanging above the gap. Bounds, group extents,
+part count, `unsupported: 0` and `paper thin: 0` all passed on that build.
+
+### 2. A helper that already orients a part must not be oriented again
+
+Applies to: anything with a length along one axis — posts and columns, trunks and branches, axles and
+pivots, chains and cables, rafters, ribs, limbs, barrelled props, beams spanning two points.
+
+Most builder sets bake a rotation in so callers can think in the part's own terms: a vertical-post
+helper turns a cylinder's length onto +Y, a "through the wall" helper turns it onto the wall normal, a
+"between two points" helper uses `lookAt`. That rotation is applied *after* the caller's frame, so
+adding another turn about the same axis **composes** with it rather than replacing it — and two
+quarter turns cancel into a half turn. The symptom is always "it came out lying down / pointing
+backwards / 180° from what I asked", and it usually drags the attached detail with it: roots, boughs,
+crowns, brackets, hands, blades.
+
+Rule: know each helper's axis convention, and rotate a thing once. Keep a table of your own helpers
+somewhere you will actually read it, and when something must point where no helper covers, reach for
+the between-two-points helper rather than stacking rotations.
+
+Instance: tree trunks were built with the through-the-wall helper *and* an extra quarter turn, so every
+trunk lay horizontally at chest height with its roots underneath and its crown boughs hanging in the
+air around it. Same class, found by sweeping rather than by luck: a wheel hub built with the
+vertical-post helper where it needed an axle along the wall normal, and a ribcage built from rods
+pointing the wrong way through the chest.
+
+Two habits that close the whole family: **sweep every call of the helper** rather than fixing only the
+element that happened to be noticed, and **grep by helper name** before calling the class fixed.
+
+### 3. Put the assertion in the build, not in the transcript
+
+If you can state an invariant in words, you can assert it in a line and print PASS/FAIL — and then the
+QA travels with the map instead of living in the conversation. Reviewing by eye at the end of a long
+session is precisely the step that fails, because by then the panel that would have shown it is twenty
+turns back.
+
+One check per invariant, each counting its own violations, one line of output each:
 
 ```lua
--- as written: the slab's local +X climbs OUTWARD, so the eave became the high end
-local cf = CFrame.new(midX, midY, zc) * CFrame.Angles(0, 0, side * pitch)
--- as the geometry needs it: local +X climbs INWARD, toward the ridge
-local cf = CFrame.new(midX, midY, zc) * CFrame.Angles(0, 0, -side * pitch)
-```
-
-With `run = 13.5`, `rise = 9.7`, the shipped version put the tall end at `x = ±13.5, y = 40` and the
-low end at `x = 0, y = 30.3`: two slopes meeting in a valley in the middle of the nave, with the ridge
-cap hanging 7.7 studs above nothing. **Everything in the report passed** — bounds, group extents, part
-count, `unsupported: 0`, `paper thin: 0` — because a rotation about the part's own centre does not move
-its bounding box at all. This file already warns that "the report can't see a backwards roof slope";
-that warning is correct and it is not enough on its own. Only two things catch this:
-
-- a directional assertion in the build's own QA (see §3), and
-- a render panel in which the slope direction is actually visible (see §5).
-
-### 2. The trees: `rod` laid every trunk flat
-
-```lua
--- rod() turns the cylinder's own X axis onto -Z (it exists for beams through a wall)
-col(parent, name .. "Trunk1", 1.15 * scale, h * 0.62, tilt * CFrame.new(0, h * 0.31, 0), bark)
-```
-
-The tree code called `rod` **and** added its own `CFrame.Angles(0, math.pi / 2, 0)`. Two 90° Y
-rotations compose to 180°, so every trunk came out horizontal at chest height with the roots below it
-and the crown boughs hanging in the air around it. The root helper already did the turn; the second
-one cancelled it.
-
-Rule: **know each helper's axis convention, and rotate a thing once.**
-
-| helper | the axis the length ends up on | use it for |
-| --- | --- | --- |
-| `box` | X, Y, Z exactly as given | walls, trim, slabs, plates, ribs |
-| `cyl` | local X, as you orient it | a fallen drum; anything you aim yourself |
-| `col` | +Y (up) | posts, columns, **tree trunks**, candle wax, hanging chains |
-| `rod` | the frame's −Z | axles through a wall, a sword grip along its blade |
-| `rodBetween(a, b)` | a → b, via `lookAt` | bones, limbs, anything joining two points |
-| `beamBetween(a, b)` | a → b | rafters, ties, anything spanning two named points |
-
-When a cylinder has to point somewhere no helper does, reach for `rodBetween`/`beamBetween` rather
-than stacking rotations. Two more of this family were found by sweeping *every* `cyl`/`col`/`rod`
-call rather than spot-fixing the two that showed: the wheel-window hub was a vertical post where it
-had to be an axle through the wall, and the soldier's ribs were rods poking fore-and-aft instead of
-bars crossing the chest. Sweep the helpers; don't fix the symptom.
-
-### 3. Put the assertion in the build, not in your head
-
-Anything with a right way up gets checked in the source and printed as a PASS/FAIL line, so the QA
-travels with the map instead of living in the transcript. Paste this shape into every build's QA
-function and grow it:
-
-```lua
--- a rotation sign error is invisible to a bounding box, so check the things that have a right way up
-local planes, wrongPlane, trunks, looseTrunk = 0, 0, 0, 0
-for _, d in ipairs(parts) do
-	if string.find(d.Name, "^Slope") or string.find(d.Name, "^Lean%d") then
-		planes += 1
-		local axis = d.CFrame.XVector                    -- the slab's own long axis
-		local inward = if d.Position.X >= 0 then 1 else -1
-		-- climbing inboard (|x| falling) has to mean climbing up, whichever way the box is turned
-		if math.abs(axis.Y) < 0.2 or axis.Y * axis.X * inward > -0.1 then wrongPlane += 1 end
-	elseif string.find(d.Name, "Trunk") then
-		trunks += 1
-		if math.abs(d.CFrame.XVector.Y) < 0.97 then looseTrunk += 1 end   -- a trunk's axis points up
+-- named(pattern) is your own filter over the build's parts; any list of BaseParts will do.
+local faults = 0
+local function check(label, list, holds)
+	local bad = 0
+	for _, d in ipairs(list) do
+		if not holds(d) then bad += 1 end
 	end
+	faults += bad
+	print(string.format("[build] QA  %-30s %4d checked, %d wrong", label, #list, bad))
 end
-print(string.format("[build] QA  roof %d planes (%d inverted) | %d trunks (%d not vertical)",
-	planes, wrongPlane, trunks, looseTrunk))
-if wrongPlane > 0 or looseTrunk > 0 then print("[build] QA  ORIENTATION FAULT") end
+
+check("sloped planes climb inboard", named("^Slope"), function(d)
+	local axis = d.CFrame.XVector                       -- the part's own long axis
+	local inward = if d.Position.X >= 0 then 1 else -1
+	-- moving toward the middle must mean moving up, whichever way the box is turned
+	return math.abs(axis.Y) > 0.2 and axis.Y * axis.X * inward < -0.1
+end)
+check("posts stand vertical", named("Post"), function(d)
+	return math.abs(d.CFrame.XVector.Y) > 0.97
+end)
+check("openings clear the threshold", named("^Step%d"), function(d)   -- no prop stands in a doorway
+	return true
+end)
+check("props are bedded, not floating", named("^Rubble"), function(d)
+	return d.Position.Y - d.Size.Y / 2 < 0.2
+end)
+if faults > 0 then print("[build] QA  FAULT -- see the lines above") end
 ```
 
-Generalise it to every element whose direction carries meaning: roof planes and lean-tos, stairs and
-ramps (which way they rise), buttress stages (each one narrower than the one below), arch springing,
-wall normals, the raised end of a fallen beam, the barrel of a cannon, the blade of a sword. Decide
-the sign, assert the sign, print the result. Two lines of assertion is far cheaper than a rebuild.
+Shape the list per build: every run of stairs (which way it rises), every ramp, every tapering stack
+(each stage smaller than the last), every opening (clear width and height at the threshold), every
+overhang (which side is longer), every prop resting on a surface (bedded by the intended fraction),
+every element whose function depends on facing a particular way. Assertions cost two lines; a rebuild
+costs the session.
 
-The same trick fixes the "is it supported" question that floods the problem list: a part is supported
-if something is under it, so assert the *intent* per group (rubble is 20–30% into the ground, trim is
-proud by `PROUD`, every layer is offset by `EPS`) rather than re-reading 900 overlap lines.
+The same idea replaces re-reading hundreds of overlap lines: state the *intent* — a prop is bedded a
+fifth to a third of its height into the ground, trim stands proud by the trim offset, every layer
+differs from the one beneath by the epsilon — and let the check confirm it, instead of arguing with
+the report about each pair.
 
-### 4. Transport: the tools will quietly cut your source in half
+### 4. Transport limits: batch the source, and never clear inside a big apply
 
-- **`apply_build` (and `render_build`) truncate large `code`.** At roughly 55 KB the chunk arrived cut
-  mid-line and Studio answered `Expected 'end' (to close 'do' at line N), got <eof>`. Because that call
-  also carried `clear = true`, the truncated code still deleted the old build first: the map was gone
-  *and* the error pointed at the new one. Rules: **batch at ≤ ~20 KB, one phase per batch; never pair a
-  first-time large apply with `clear`; when a syntax error names the last line of the file, suspect
-  truncation before you suspect your own syntax.**
-- **A phase batch must carry the helpers that sit between phases.** Mechanical splitting on "the first
-  line that starts with `phase(function(root)`" left `local function tree` behind (it lives *after*
-  the previous phase's `end)`), and the build died with `attempt to call a nil value` at the first
-  `tree(...)`. Splitting rule: a batch is [preamble and helpers] + [everything from the previous
-  phase's `end)` through the phase you want]. Text between phases belongs to the phase that follows it.
-- **Reading a long source back truncates as well.** A 1 462-line, 81 KB file came back as 64 000
-  characters *taken from the tail*, silently starting mid-file; splitting that produced a bogus header
-  and a syntax error in every batch. Read by line range (`(Get-Content f)[0..519]`), assert the last
-  line you got (`return BUILD`, or your real final line), and check the line count before trusting a
-  slice.
-- **`run_luau`: `return` your evidence, don't `print` it.** A snippet's `print` output is not
-  reliably part of the tool's returned text (it goes to the Studio output window — `get_logs` shows
-  it), while a `return`ed string is what you actually read. Build the QA summary and `return` it.
-- **`read` and `pwsh` output truncate long files**; `Get-Content -Raw` is not exempt. Same rules as
-  above.
+- **Large code arguments are truncated in transit.** A single apply of a whole build arrived cut
+  mid-line and Studio answered `Expected 'end' (to close 'do' at line N), got <eof>`. Batch instead —
+  one phase or one group per apply, comfortably under ~20 KB.
+- **Never pair a first-time large apply with a clearing flag.** The truncated chunk still ran far
+  enough to delete the previous build, so the map was gone *and* the error pointed at the new code.
+  Clear only in a small, verified apply.
+- **A syntax error naming the last line of the file is a truncation symptom**, not a missing `end` in
+  your logic. Measure the payload before hunting for the mistake in your own code.
+- **When a source is split mechanically, carry the text between sections with the following section.**
+  Helpers often sit between two phases; splitting on "the first line that starts a section" leaves them
+  behind, and the build dies later with `attempt to call a nil value` at the first call to one.
+- **Reading a long file back truncates as well**, sometimes silently and mid-file, which then produces
+  a bogus header and a syntax error in every batch built from it. Read by line range, assert the last
+  line and the total count, and only then trust a slice.
+- **`return` your evidence, do not print it.** A printed line from an executed snippet is not reliably
+  part of the tool's returned text (it lands in the Studio output window instead), so a snippet that
+  prints its answer reads as an empty result.
 
-### 5. Tool behaviour that costs a call every time
+### 5. Tool behaviour to design around
 
-- **Omitting `root` on `render_build` / `apply_build` does not merely give a wider view — it
-  crashes.** The default root is `Workspace`, `Terrain` is a `BasePart`, and
-  `workspace:GetPartsInPart(terrain)` throws **`GetPartsInPart does not support Terrain`**, killing
-  the whole call before anything is drawn. Always pass `root = "Workspace.YourBuild"`. (This one is a
-  VMCP bug rather than a build bug: the part walk should skip `Terrain`. Until it does, the
-  workaround is unconditional.)
-- **`at` only honours a dotted path string.** `at = "Workspace.Build.Roof"` frames the roof;
-  `at = { x = 0, y = 33, z = 0 }` is ignored and you get the whole build back at whatever `radius`
-  you asked for. Four intended "close-ups" came back as four whole-map panels this way — and a valley
-  roof reads as a dark blob in every one of them. Pass paths, not tables.
-- **Every render returns the group summary + the full problem list + the full part legend** (~45–60 KB
-  at 1 500 parts). Batch up to ~9 views per call, pass `problems = false` and `badges = false` when
-  you only need the picture, and keep your own printed output to a line or two — the images attach
-  regardless of what you print.
-- **`Instance.new("DirectionalLight")` fails** (`Unable to create an Instance of type
-  "DirectionalLight"`). Moonlight has to be one very wide `SpotLight` (Range ≈ 460, Angle ≈ 115,
-  `Shadows = true`, `Face = Front`) on an invisible rig part with `CanQuery = false`, aimed at the
-  build with `CFrame.lookAt`. Create once, find by name on re-runs.
+- **Always pass an explicit root.** The default root is the whole Workspace: it measures everything
+  that is not the build, blows the part cap on any real place, and — because Terrain is itself a part
+  — can fail outright with `GetPartsInPart does not support Terrain` before anything is drawn. Narrow
+  roots also make the report readable.
+- **A view target that is silently ignored looks exactly like a badly framed picture.** Views take a
+  dotted path for their target; a numeric coordinate table is accepted and ignored, so a "close-up"
+  quietly becomes another whole-build view. If a panel is not closer than the last one, it is not
+  closer — pass the path.
+- **Every render and apply returns a full report** (summary, every problem, every part). Batch as many
+  views per call as the tool allows, turn off problem-checking and part badges when you only need the
+  picture, and keep your own printed output to a line or two. Pictures attach regardless of what you
+  print.
+- **Not every class can be created from a script.** Some instances exist only as engine-owned or
+  editor-authored objects, and `Instance.new` fails with "Unable to create an Instance of type ...".
+  Find the creatable equivalent that carries the same effect and build that instead, with a stable name
+  so re-runs reuse it rather than stacking another.
+- **Long files truncate when read**, both through the file tool and through a shell's stdout. Assume
+  nothing about a slice you did not measure.
 
-### 6. Report triage — what to ignore, what to chase
+### 6. Triage the report instead of skimming it
 
-The problem list is the loudest thing the tool returns and it is mostly right. Triage it, never skim
-it:
+The problem list is the loudest thing the tools return, and it is mostly right. Read it as a
+classification exercise, and be able to say which class every entry falls into:
 
-- **`floating: N studs above X` — always investigate.** Two of these were dismissed as
-  `MaxParts = 4` false positives and they were the roof bug in plain sight:
-  `Ridge2 floating 7.70 studs above SlopeE4` and `SlopeTorn2a floating 18.76 studs above Tie2`. On a
-  *structural* part this is a real defect; on a *decorative* one (a chain link between two links) it is
-  the checker's granularity. Rule: **no build is closed with an unexplained floating report.**
-- **`overlapping: sunk about N studs into Y` — usually intentional.** Masonry laps are how the build
-  is meant to fit: trim over wall, voussoir over voussoir (an arch whose pieces don't overlap has
-  slits), lintel into pier, steps into ground, rubble into grass, a bed under a fallen drum. Keep the
-  set finite and name it: if you cannot say which of those a report is, it is probably a mistake.
-- **`off axis: rotated N degrees off square`** — rubble, tilted graves, leaning stones and trees
-  *should* be off-axis; trim, sills, quoins and slabs should not. Check the part name before acting.
-- **`coplanar-flicker pairs`** — what matters is same-plane faces on parts that overlap on all three
-  axes. Steps narrowed by `i * 0.06` and dropped by `i * 0.07`, trim proud by `PROUD`, every layer
-  offset by `EPS`: that is what keeps the count at a handful instead of hundreds.
-- **Near-duplicate names** mean a phase ran twice. Every builder is idempotent for exactly this
-  reason; if you see duplicates, the name-based `ensure` was bypassed somewhere.
+- **Overlap** — usually intentional. Interfacing parts are *supposed* to interpenetrate: trim over
+  wall, a ring over the piece it beds into, a lintel into its pier, steps into the ground, bedding
+  under a prop. Keep the accepted set finite and nameable for the build; an overlap you cannot name is
+  probably a mistake.
+- **Floating** — always investigate a *structural* part: it is the one entry that says the geometry is
+  not doing what it claims. Between two parts of the same assembly (link to link, chain to ring) it is
+  the checker's granularity. **No build is closed with an unexplained floating report.** On the build
+  behind these notes, two floating entries were written off as noise and were the roof bug in plain
+  sight.
+- **Off axis** — intended for organic or damaged elements (rubble, tilted stones, trees, debris), wrong
+  for designed-square ones (trim, sills, frames, plates). Decide per element, not per build.
+- **Coplanar faces** — a real risk only when two overlapping parts share a plane on all three axes. The
+  antidote is systematic (a trim offset, a layer epsilon, a per-step nudge) rather than a fix per pair.
+- **Near-duplicate names or identical positions** — a pass ran twice, or a name-based reuse helper was
+  bypassed. Fix the reuse, not the duplicates.
+- **Paper thin** — a dimension computed to nothing, usually a derived size that went to zero or
+  negative and was clamped. Find the arithmetic, not the part.
 
 ### 7. Phase 4 is a claim you have to be able to cash
 
-"The render was done" is not "the geometry was checked". Both bugs above shipped on a build with four
-render passes on the record, because every panel was a whole-map, night-lit, ~200 px thumbnail where a
-gable and a valley are the same dark smudge.
+"The render was done" is not "the geometry was checked". Before writing a pass line, **name the two or
+three properties that panel is supposed to prove, and say how each one is visible in it**:
 
-Before writing the pass line, **name the two or three properties that panel is supposed to prove, and
-say how each one is visible in it**:
+- a slope or ramp → which way it falls, and where the high edge runs;
+- a vertical element → that it stands vertical, is rooted, and carries what sits on it;
+- an opening → that the way through is clear, at the size a character needs;
+- a junction → that the two surfaces meet with no slit and no doubled face;
+- a prop on a surface → that it is bedded, not balanced on a corner or hovering;
+- scale → something character-sized standing beside it.
 
-- roof: which way the slopes fall and where the ridge runs → a side elevation or the plan, close
-  enough that the ridge line and both slopes are distinct; state the direction you see.
-- trunks: vertical, rooted, crown above → one tree filling a good part of the frame.
-- access: the doorway is clear and nothing stands in the threshold → a view through the door.
-- scale: something character-sized next to it.
+If the panel cannot show the property, the panel does not count and you take another one. Practical
+consequences: aim views with a path and a small radius; remember that a cutaway is made by transparency
+in the *source*, not by the camera; and treat a night look as presentation on top of verified geometry,
+because a dark scene with fog and a grade is nearly unreadable for shape. Check shape first, light it
+afterwards.
 
-If the panel cannot show it, the panel does not count and you take another one. Aim with a **path
-string** and a small `radius`, and remember that the renderer draws transparency as alpha, so a
-cutaway in the source is what makes interiors legible.
-
-Also: **night is a bad light for checking geometry.** A scene at `Brightness 2.6` with fog and a blue
-grade is nearly unreadable for shape. Do the geometry pass first (or check it before restoring night),
-and treat the night look as presentation on top of verified geometry.
+Two failure patterns to watch for in yourself: accepting a whole-build thumbnail as evidence about a
+detail, and quoting a number in the summary that you did not compute in that same pass.
 
 ### 8. Working efficiently in a long build
 
-- Keep the source in **one file on disk** and build each phase batch from that file (read the ranges,
-  concatenate, send) instead of re-typing geometry into the tool call. Re-sending a 13 KB header seven
-  times per iteration is how a session runs out of room.
-- Make every phase **idempotent** (`ensure(parent, name, class)`) so a phase can be re-applied alone
-  after a fix, leaving the rest of the build untouched. Re-applying a phase must never stack a copy.
-- Fix, re-apply **only the phases you touched**, re-run the QA line — and when the fix was an
-  orientation change, re-render the single panel that proves it.
-- Log what each pass proved, in one line, in your reply. A build whose QA prints PASS/FAIL travels
-  with its own evidence; a build whose QA lives in the transcript does not.
+- Keep the source in **one file on disk** and assemble each apply from that file (read the ranges,
+  concatenate, send) instead of re-typing geometry into tool calls. Re-sending a large preamble once
+  per iteration is how a session runs out of room.
+- Make every builder **idempotent and name-based**, so one group can be re-applied after a fix without
+  stacking a second copy and without touching anything else.
+- When you fix something, re-apply **only the sections you touched**, re-run the assertion line, and
+  re-render the single panel that proves the change.
+- **Log one line per pass** — what the numbers said, what the picture showed, what you changed. A build
+  whose QA prints PASS/FAIL carries its own evidence; a build whose QA lives in the transcript does not.
 
+### 9. The build loop must not live in one conversation
+
+The pipeline is a loop of small, independent commits to a file on disk. Nothing about pass 30 needs the
+transcript of pass 29 — and yet that is exactly what a single-session build pays for on every request.
+
+A real 1 500-part build, audited from its own session transcript (recipe at the end of this section):
+
+- reported total: **88.5 M tokens** across 270 requests
+- cached re-reads of the conversation: **84.4 M — 95 % of it**
+- genuinely new input: 3.4 M. Output plus reasoning: 1.0 M.
+- peak conversation size: **644 k tokens**
+- every tool result that ever reached the model, added together: **0.58 MB, about 145 k tokens**
+
+That last line overturns the intuition. **The reports were not the expense.** Every `apply_build` and
+`render_build` result ever shown to the model is 0.16 % of the session. The expense was carrying a
+644 k-token conversation through 270 requests, because the model-visible prefix is re-read on every
+single one of them.
+
+So cost scales as `steps × context size`, which is quadratic in the length of a build whenever the
+context grows with it. Capping that same session at 120 k tokens removes about 67 % of those reads; at
+60 k, about 83 %. That single lever is worth more than every other optimisation in this file combined,
+and unlike a geometry fix it is entirely within your control.
+
+1. **One phase per fresh context.** State belongs on disk and nowhere else: a phase should read only the
+   line ranges it needs, change the file, run its own assertions, and end by returning a short report —
+   not by accumulating. A long build is a *sequence* of short sessions. If the harness has subagents, one
+   detail group is a natural unit of delegation: fresh context in, file changed, half a page out.
+2. **Spend the context budget deliberately; never discover the ceiling.** Plan the hand-off at roughly
+   40 % of the window. A compaction you schedule costs the summary it writes; a compaction forced at the
+   limit costs a **full re-prefill of the entire conversation**. That is not hypothetical — the session
+   above crossed 1 M mid-build and paid 650 k then 636 k fresh input tokens to repair itself, 38 % of all
+   new input in the whole build, spent on conversation upkeep rather than on geometry.
+3. **Digest inside the runner; never let a raw report into the transcript.** A result that lands in
+   history is paid for again by every later step. The pattern that works: call the tool from inside the
+   code runner, reduce the result to counts and named faults, and print five lines. Transport limits (§4)
+   are the same problem seen from the other end.
+4. **Attachments are permanent.** Every image enters the prefix and is re-read by every subsequent
+   request, so a picture has a cost that outlives the pass it was taken for. Render the panel that answers
+   a question, prefer several small aimed views to one wide one, and downscale before attaching.
+5. **Stay append-only within a phase.** Editing, pruning or re-ordering history invalidates the cached
+   prefix and re-bills the whole context at full price — observed here as 170 k fresh tokens against a
+   564 k context, twice in a row.
+6. **The late defect is the expensive one.** A bug found in phase 4 is found, diagnosed and fixed at
+   maximum context, which is precisely when every step costs the most. The orientation assertions in §1
+   and §3 are therefore a cost control as much as a correctness one: front-loading invariants is far
+   cheaper than debugging at 600 k.
+
+**Auditing a session instead of guessing.** The harness writes a transcript to
+`~/.dsh/sessions/<slug>/<session-id>/session.v3.jsonl.zstd`. It is **multi-frame** zstd: a single-shot
+decompress returns only the first frame and looks like a 196-byte session, which is how this analysis
+nearly ended before it started. Split the buffer on the frame magic `28 b5 2f fd`, decompress each slice,
+concatenate, and parse the lines as JSON. Then sum the `cacheReadTokens` and `inputTokens` fields of
+every `usage` object and bucket them by request index. The shape tells you which lever you own: rising
+`cacheReadTokens` with flat `inputTokens` means you are paying for context length, while spiking
+`inputTokens` means you are invalidating the cache.
 

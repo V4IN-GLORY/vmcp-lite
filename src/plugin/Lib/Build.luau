@@ -92,6 +92,23 @@ local function num(value: number): string
 	return string.format("%.4g", value)
 end
 
+local function rgb(channel: number): string
+	return string.format("%d", math.floor(channel * 255 + 0.5))
+end
+
+-- Radians are five digits nobody typed; a whole number of degrees is what the source said.
+local function angle(radians: number): string
+	if radians == 0 then
+		return "0"
+	end
+	local degrees = math.deg(radians)
+	local whole = math.floor(degrees + 0.5)
+	if math.abs(degrees - whole) < 0.01 then
+		return `math.rad({whole})`
+	end
+	return num(radians)
+end
+
 -- Every value that can appear in the generated source, written the way you'd type it. Anything
 -- not here is skipped rather than guessed at, which is why the property list above is curated.
 local function literal(value: any): string?
@@ -112,7 +129,7 @@ local function literal(value: any): string?
 		return `Vector2.new({num(value.X)}, {num(value.Y)})`
 	end
 	if kind == "Color3" then
-		return `Color3.new({num(value.R)}, {num(value.G)}, {num(value.B)})`
+		return `Color3.fromRGB({rgb(value.R)}, {rgb(value.G)}, {rgb(value.B)})`
 	end
 	if kind == "UDim" then
 		return `UDim.new({num(value.Scale)}, {num(value.Offset)})`
@@ -136,7 +153,7 @@ local function literal(value: any): string?
 		if rx == 0 and ry == 0 and rz == 0 then
 			return origin
 		end
-		return `{origin} * CFrame.Angles({num(rx)}, {num(ry)}, {num(rz)})`
+		return `{origin} * CFrame.Angles({angle(rx)}, {angle(ry)}, {angle(rz)})`
 	end
 	return nil
 end
@@ -181,8 +198,20 @@ local function ensure(parent, name, class)
 	return found
 end
 
+-- An anchored part with nothing unusual about it, on one line.
+local function part(parent, name, class, size, cframe, material, color)
+	local found = ensure(parent, name, class)
+	found.Size, found.CFrame, found.Anchored = size, cframe, true
+	if material then found.Material = Enum.Material[material] end
+	if color then found.Color = color end
+	return found
+end
+
 return function(root)
 ]]
+
+-- A part whose only non-default properties are these collapses to one `part(...)` line.
+local PLAIN_PART: { [string]: boolean } = { Size = true, CFrame = true, Anchored = true, Material = true, Color = true }
 
 export type Options = {
 	depth: number?,
@@ -210,16 +239,14 @@ function Build.Dump(root: Instance, options: Options?): (string, number)
 		end
 		count += 1
 		local variable = `n{count}`
-
-		table.insert(
-			lines,
-			`\tlocal {variable} = ensure({parentVar}, {string.format("%q", instance.Name)}, {string.format(
-				"%q",
-				instance.ClassName
-			)})`
-		)
+		local nameAndClass =
+			`{parentVar}, {string.format("%q", instance.Name)}, {string.format("%q", instance.ClassName)}`
+		local tags: { string } = if wantTags then CollectionService:GetTags(instance) else {}
+		local attributes: { [string]: any } = if wantTags then instance:GetAttributes() else {}
 
 		local fresh = defaults(instance.ClassName)
+		local changed: { { name: string, value: any } } = {}
+		local plain = fresh ~= nil and instance:IsA("BasePart") and (instance :: BasePart).Anchored
 		for _, name in propertiesFor(instance) do
 			local ok, value = pcall(function()
 				return (instance :: any)[name]
@@ -235,25 +262,46 @@ function Build.Dump(root: Instance, options: Options?): (string, number)
 					continue
 				end
 			end
-			local written = literal(value)
-			if written then
-				table.insert(lines, `\t{variable}.{name} = {written}`)
+			if not PLAIN_PART[name] then
+				plain = false
+			end
+			table.insert(changed, { name = name, value = value })
+		end
+
+		-- The local only exists if a later line refers to it: children, a property line, a tag.
+		local referenced = (depth < depthLimit and #instance:GetChildren() > 0)
+			or not plain
+			or #tags > 0
+			or next(attributes) ~= nil
+		local declare = if referenced then `local {variable} = ` else ""
+
+		if plain then
+			local basePart = instance :: BasePart
+			local material = basePart.Material
+			local materialName = if material == Enum.Material.Plastic then "nil" else string.format("%q", material.Name)
+			local color = if basePart.Color == (fresh :: BasePart).Color then "nil" else literal(basePart.Color)
+			table.insert(
+				lines,
+				`\t{declare}part({nameAndClass}, {literal(basePart.Size)}, {literal(basePart.CFrame)}, {materialName}, {color})`
+			)
+		else
+			table.insert(lines, `\t{declare}ensure({nameAndClass})`)
+			for _, entry in changed do
+				local written = literal(entry.value)
+				if written then
+					table.insert(lines, `\t{variable}.{entry.name} = {written}`)
+				end
 			end
 		end
 
-		if wantTags then
-			for name, value in instance:GetAttributes() do
-				local written = literal(value)
-				if written then
-					table.insert(lines, `\t{variable}:SetAttribute({string.format("%q", name)}, {written})`)
-				end
+		for name, value in attributes do
+			local written = literal(value)
+			if written then
+				table.insert(lines, `\t{variable}:SetAttribute({string.format("%q", name)}, {written})`)
 			end
-			for _, tag in CollectionService:GetTags(instance) do
-				table.insert(
-					lines,
-					`\tgame:GetService("CollectionService"):AddTag({variable}, {string.format("%q", tag)})`
-				)
-			end
+		end
+		for _, tag in tags do
+			table.insert(lines, `\tgame:GetService("CollectionService"):AddTag({variable}, {string.format("%q", tag)})`)
 		end
 
 		if fresh then
@@ -456,6 +504,32 @@ function Build.ResolveViews(views: { any }): ({ any }, { string })
 	return resolved, missing
 end
 
+-- The parts a set of views can actually show: everything, unless every panel is clipped to a
+-- radius, in which case only what's inside one of them. Drives whether badges make sense and
+-- which parts the legend bothers listing.
+function Build.Shown(parts: { BasePart }, views: { any }): { [BasePart]: boolean }
+	local shown: { [BasePart]: boolean } = {}
+	local clipped = {}
+	for _, view in views do
+		if type(view) ~= "table" or view.clip ~= true or type(view.at) ~= "table" or type(view.radius) ~= "number" then
+			for _, part in parts do
+				shown[part] = true
+			end
+			return shown
+		end
+		table.insert(clipped, { at = Vector3.new(view.at[1], view.at[2], view.at[3]), radius = view.radius })
+	end
+	for _, part in parts do
+		for _, view in clipped do
+			if (part.Position - view.at).Magnitude <= view.radius then
+				shown[part] = true
+				break
+			end
+		end
+	end
+	return shown
+end
+
 function Build.Problems(root: Instance, maxParts: number?, known: { BasePart }?): { Problem }
 	local parts: { BasePart } = known or ({} :: { BasePart })
 	if not known then
@@ -577,7 +651,9 @@ end
 
 local function span(min: Vector3, max: Vector3): string
 	local size = max - min
-	return `{fmt(size.X)}x{fmt(size.Y)}x{fmt(size.Z)} spanning x {fmt(min.X)}..{fmt(max.X)}, y {fmt(min.Y)}..{fmt(max.Y)}, z {fmt(min.Z)}..{fmt(max.Z)}`
+	return `{fmt(size.X)}x{fmt(size.Y)}x{fmt(size.Z)} spanning x {fmt(min.X)}..{fmt(max.X)}, y {fmt(min.Y)}..{fmt(max.Y)}, z {fmt(
+		min.Z
+	)}..{fmt(max.Z)}`
 end
 
 local function shorten(instance: Instance, root: Instance): string
@@ -601,7 +677,14 @@ local function grow(extent: Extent?, min: Vector3, max: Vector3): Extent
 	return extent
 end
 
-function Build.Report(root: Instance, parts: { BasePart }, badges: boolean, problems: { Problem }?): string
+-- `legend` is the set of parts that carry a badge in the picture; nil means no badges, and then
+-- no per-part list either -- on a big build that list is most of the reply and points at nothing.
+function Build.Report(
+	root: Instance,
+	parts: { BasePart },
+	legend: { [BasePart]: boolean }?,
+	problems: { Problem }?
+): string
 	local lines = {}
 
 	local whole: Extent? = nil
@@ -645,11 +728,18 @@ function Build.Report(root: Instance, parts: { BasePart }, badges: boolean, prob
 		end
 	end
 
-	table.insert(lines, "")
-	table.insert(lines, if badges then "legend (the number in the picture):" else "parts:")
-	for index, part in parts do
-		local size = part.Size
-		table.insert(lines, `  #{index} {shorten(part, root)}  {fmt(size.X)}x{fmt(size.Y)}x{fmt(size.Z)} at {v3(part.Position)}`)
+	if legend then
+		table.insert(lines, "")
+		table.insert(lines, "legend (the number in the picture):")
+		for index, part in parts do
+			if legend[part] then
+				local size = part.Size
+				table.insert(
+					lines,
+					`  #{index} {shorten(part, root)}  {fmt(size.X)}x{fmt(size.Y)}x{fmt(size.Z)} at {v3(part.Position)}`
+				)
+			end
+		end
 	end
 
 	return table.concat(lines, "\n")

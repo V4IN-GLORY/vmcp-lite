@@ -82,7 +82,7 @@ Tool.Definition = {
 			},
 			badges = {
 				type = "boolean",
-				description = `Number each part in the picture. On by default up to {BADGE_LIMIT} parts.`,
+				description = `Number each part in the picture and list it in the legend. On by default when the panels show up to {BADGE_LIMIT} parts (clipped panels count only what's in frame).`,
 			},
 		},
 		-- One of code or file; the server turns file into code before it gets here.
@@ -145,7 +145,10 @@ function Tool.Run(arguments: {
 
 	local lines = {}
 	if ok then
-		table.insert(lines, `applied: {#root:GetDescendants()} instance(s) under {root:GetFullName()}, {count} of them parts`)
+		table.insert(
+			lines,
+			`applied: {#root:GetDescendants()} instance(s) under {root:GetFullName()}, {count} of them parts`
+		)
 	else
 		-- The failure line comes first and the report still follows: whatever ran before the
 		-- error is in the place now, and knowing what that looks like is how you fix the code.
@@ -161,10 +164,23 @@ function Tool.Run(arguments: {
 		return { content = { { type = "text", text = table.concat(lines, "\n") } }, isError = not ok }
 	end
 
-	local badges = if arguments.badges ~= nil then arguments.badges else count <= BADGE_LIMIT
 	local render = arguments.render ~= false
-	table.insert(lines, Build.Report(root, instances, badges and render, Build.Problems(root, MAX_PARTS, instances)))
 	local views, missing = Build.ResolveViews(arguments.views or { "iso" })
+	local shown = Build.Shown(instances, views)
+	local shownCount = 0
+	for _ in shown do
+		shownCount += 1
+	end
+	local badges = if arguments.badges ~= nil then arguments.badges else shownCount <= BADGE_LIMIT
+	table.insert(
+		lines,
+		Build.Report(
+			root,
+			instances,
+			if badges and render then shown else nil,
+			Build.Problems(root, MAX_PARTS, instances)
+		)
+	)
 	for _, problem in missing do
 		table.insert(lines, `view target not found, drawing the whole build instead: {problem}`)
 	end
