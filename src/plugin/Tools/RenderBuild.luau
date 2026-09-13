@@ -105,12 +105,11 @@ function Tool.Run(arguments: {
 	local note = if capped then `, stopped at {count} -- there are more` else ""
 	local problems = if arguments.problems ~= false then Build.Problems(root, arguments.maxParts, instances) else nil
 
-	local text = `{count} part(s) under {root:GetFullName()}, {#views} view(s){note}
-`
+	local text = `{count} part(s) under {root:GetFullName()}, {#views} view(s){note}\n`
 		.. Build.Report(root, instances, badges, problems)
 
 	return {
-		content = { { type = "text", text = table.concat(lines, "\n") } },
+		content = { { type = "text", text = text } },
 		postProcess = {
 			kind = "scene",
 			name = arguments.name,

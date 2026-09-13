@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { config, log } from "./config.js";
-import type { ToolResult } from "./protocol.js";
+import type { ToolResult, ToolResultContent } from "./protocol.js";
 import { encodePng, rasterize, type Recording } from "./image.js";
 import { renderScene, type Scene } from "./scene.js";
 
@@ -32,10 +32,19 @@ function pngPath(directive: Directive): string {
 	return join(dir, `${name}.png`);
 }
 
-/** Returns a line to append to the tool's own output, or undefined if there was nothing to do. */
-export function runPostProcess(directive: Directive): string | undefined {
+// Past this the image is more of the reply than the words are, and the file on disk is the better
+// way to look at it.
+const INLINE_LIMIT = 1_500_000;
+
+interface Outcome {
+	text: string;
+	png?: Buffer;
+}
+
+/** Writes the image and returns a line to append to the tool's own output, plus the bytes. */
+function finish(directive: Directive): Outcome {
 	if (directive.kind !== "png" && directive.kind !== "scene") {
-		return `[vmcp doesn't know how to finish a "${String(directive.kind)}" job]`;
+		return { text: `[vmcp doesn't know how to finish a "${String(directive.kind)}" job]` };
 	}
 
 	try {
@@ -44,24 +53,37 @@ export function runPostProcess(directive: Directive): string | undefined {
 				? renderScene(directive as unknown as Scene)
 				: rasterize(directive as unknown as Recording);
 		const path = pngPath(directive);
-		writeFileSync(path, encodePng(surface));
+		const png = encodePng(surface);
+		writeFileSync(path, png);
 		log(`wrote ${path}`);
-		return `[wrote the image to ${path}]`;
+		return { text: `[wrote the image to ${path}]`, png };
 	} catch (err) {
-		return `[couldn't write the image: ${(err as Error).message}]`;
+		return { text: `[couldn't write the image: ${(err as Error).message}]` };
 	}
+}
+
+/** Returns a line to append to the tool's own output. */
+export function runPostProcess(directive: Directive): string {
+	return finish(directive).text;
 }
 
 /**
  * Every path a tool result can take back out of the plugin goes through here, so a Canvas
  * recording gets written whether the MCP client called the tool or another context did through
  * `tool/invoke`. The directive itself never travels on — it was addressed to this server.
+ *
+ * The picture rides back inline as well as being written, so the model that asked for it sees it
+ * in the same reply as the numbers it goes with -- a second call to open the file is a turn spent,
+ * and worse, a picture read on its own is a picture read without the legend.
  */
 export function settle(result: ToolResult): ToolResult {
 	const { postProcess, ...rest } = result;
 	if (!postProcess) return result;
 
-	const outcome = runPostProcess(postProcess);
-	if (!outcome) return rest;
-	return { ...rest, content: [...rest.content, { type: "text", text: outcome }] };
+	const outcome = finish(postProcess);
+	const content: ToolResultContent[] = [...rest.content, { type: "text", text: outcome.text }];
+	if (outcome.png && outcome.png.length <= INLINE_LIMIT) {
+		content.push({ type: "image", data: outcome.png.toString("base64"), mimeType: "image/png" });
+	}
+	return { ...rest, content };
 }

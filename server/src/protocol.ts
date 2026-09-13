@@ -90,10 +90,10 @@ export interface ToolCallParams {
 	arguments: unknown;
 }
 
-export interface ToolResultContent {
-	type: "text";
-	text: string;
-}
+export type ToolResultContent =
+	| { type: "text"; text: string }
+	// Only the server makes these, when it finishes a `postProcess` job -- the plugin sends text.
+	| { type: "image"; data: string; mimeType: string };
 
 // A type alias, not an interface: only aliases get the implicit index signature
 // the MCP SDK's CallToolResult needs.
