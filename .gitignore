@@ -13,3 +13,7 @@ server/dist/
 
 # luau-lsp type definitions, downloaded not authored
 globalTypes.d.luau
+
+# root package (npx github: install)
+/node_modules/
+/package-lock.json
