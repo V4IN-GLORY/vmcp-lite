@@ -224,6 +224,9 @@ optional, not "looked fine":
   `ScaleRef` figure in frame — a player is 5 tall and 2 wide, and if it can't walk through
   a door, up a step, or under a beam, the number is wrong. Then group against group — a porch
   a third the height of the door it shelters, a tree taller than the tower.
+- **Prop placement.** Every prop on a surface is fully inside its footprint, bottom on the
+  top face, sized like the real thing beside the ScaleRef. Nothing overhangs an edge, nothing
+  hovers beside the thing it's meant to be on. Small props are clustered, not lined up.
 - **Hero props.** Each named prop has had its own three-angle close-up, has 20+ parts or a
   mesh, a distinct material from its surroundings, and a physical mount. None is a box with a
   cylinder on it.
@@ -435,6 +438,31 @@ pier each side (full height), lintel box across the top (deeper than `T` by `PRO
 outside), and a block from the lintel to the wall top. Write it once as `openingWall(frame,
 length, openings)` and every wall with holes is one call. Opening sizes come from the access
 list. A window is the same with a sill band below.
+
+**Placing props on things.** A candle hanging half off the back edge of the altar, a lantern
+in mid-air beside the table, a book sunk into the shelf — all the same bug: the prop's position
+was typed instead of derived from the surface it sits on. Props go on surfaces through one
+helper that reads the surface:
+
+```lua
+-- u, v in -1..1 across the surface's top, kept inside by `margin`; the prop's bottom lands on the top face.
+local function placeOn(surface: BasePart, size: Vector3, u: number, v: number, margin: number?)
+	local m = margin or 0.3
+	local x = u * (surface.Size.X / 2 - size.X / 2 - m)
+	local z = v * (surface.Size.Z / 2 - size.Z / 2 - m)
+	return surface.CFrame * CFrame.new(x, surface.Size.Y / 2 + size.Y / 2, z)
+end
+```
+
+The rules that fall out of it: a prop's whole footprint is inside the surface with a margin,
+never overhanging; its bottom is exactly the surface's top; it rotates with the surface; and
+its size is small next to the surface — a candle is 0.3 wide and 1–1.5 tall on a 3-stud altar,
+not a third of the altar's width. Groups of small props (candles, cups, bottles) cluster at a
+`u, v` near one end or corner, not in a line along the back edge. A wall-mounted prop uses the
+same idea against the wall's face (`PROUD` off it, at eye height ~4.5).
+
+A candle is a thin cylinder or box in a wax colour, a 0.15–0.25 Neon flame on top, and a
+`PointLight` (Range 6–10, warm) inside the flame — not a Neon block the size of the candle.
 
 **Rubble and the ground.** Rocks, roots, fallen beams and leaning stones sit 20–30% into the
 ground on purpose; those overlap/floating lines are meant, say so.
