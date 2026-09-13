@@ -108,7 +108,7 @@ local function pointedArch(parent: Instance, name: string, frame: CFrame, span: 
 	local step = (math.pi / 3) / n                           -- each arc runs from its foot (180) to the apex (120)
 	local seg = 2 * r * math.sin(step / 2) + PROUD
 	local limit = maxY or math.huge
-	local rad = r - thick / 2
+	local rad = r + thick / 2                                -- ring sits outside the curve; the opening is the full pointed arch
 	local size = Vector3.new(thick, seg, depth)
 	for i = 1, n do
 		local a = 2 * math.pi / 3 + (i - 0.5) * step
