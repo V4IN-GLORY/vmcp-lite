@@ -91,6 +91,23 @@ drifts from it, either fix the build or update the block, never leave them disag
    }
    ```
    Helpers take a role (`P.wall`), never a raw material.
+
+   **The bland test.** Stand inside any room and look at one wall: you must see at least three
+   roles from the palette without turning your head, and at least one of them must be warm
+   (wood, brass, terracotta, a warm-lit stone). One rough grey material on floor, walls,
+   columns and ceiling is the failure mode — it reads as a cave whatever the modelling did.
+   What every interior gets, minimum:
+   - floor ≠ wall (different material *and* lightness), with a border band or flagstone grid
+     in a third role
+   - a plinth / dado band on the lowest 2–3 studs of every wall, and a cornice or string
+     course near the top
+   - columns in a different material or shade from the wall they stand by, with base and
+     capital blocks in the trim role
+   - ceiling structure (beams, rafters, vault ribs) in the beam role, not the wall role
+   - one warm accent per room: wood pews, a brass lantern, a red banner, a wooden door
+   Spread the palette's colours across lightness: at least one dark role (RGB values ~40–70),
+   one mid (~90–130) and one light (~150–190). Six materials at the same grey are one
+   material.
 5. **Variety, lightly.** Repeated things can share one helper; a little size and rotation
    jitter in a normal range (a tree is 8–14 studs, not 2–40) is enough. Don't spend passes on
    hand-shaped variants unless the prompt is about them (a ruin, a forest). Identical is fine
@@ -213,11 +230,12 @@ optional, not "looked fine":
   a rotated roof box sloping into the wall. The renderer models wedges as Roblox does — a wedge that
   looks backwards is backwards.
 - **Silhouette.** The back reads as well as the front; no blank face the design didn't intend.
-- **Material placement.** Trim reads as trim from 30 studs; no one material is a grey lump
-  across most of a panel; the plinth is the same height on every wall; the palette table's
-  comments match what's actually on each surface.
-- **Seams.** Coplanar faces where a quoin sits flush instead of 0.3 proud; four full-length
-  walls crossing at corners instead of two long and two short.
+- **Material placement.** Run the bland test on every room and every exterior face: three
+  roles visible from one standing spot, one of them warm, floor ≠ wall, plinth and cornice
+  present, columns not the wall's material. No panel is more than ~60% one material. The
+  palette table's comments match what's actually on each surface.
+- **Seams.** The coplanar check printed nothing. Quoins and trim are `PROUD`, four walls are
+  two long and two short.
 
 Fix in the source, re-apply, re-render only the panels that showed the problem. Done when every
 checklist item has its line and every panel reads.
@@ -373,6 +391,41 @@ the renderer draws them fine. So:
 - Stacked slabs (step on step, course on course) are fine when the top of one is exactly the
   bottom of the next — that's a join. It's when two *tops* coincide that it flickers.
 - A cap cylinder on a slab is 0.02 thinner than the slab.
+- **Mechanical check, not eyeballing.** After every apply, run this in `run_luau` on the root
+  and fix every line it prints. Two axis-aligned parts that overlap in volume and share a face
+  plane are the ones that flicker; the renderer will not show it, the engine will:
+  ```lua
+  local parts = {}
+  for _, p in root:GetDescendants() do
+  	if p:IsA("BasePart") and p.Transparency < 1 then
+  		local o = p.CFrame.Rotation
+  		local aligned = math.abs(o.XVector.X) > 0.999 or math.abs(o.XVector.Y) > 0.999 or math.abs(o.XVector.Z) > 0.999
+  		if aligned then
+  			local h = p.CFrame:VectorToWorldSpace(p.Size / 2)
+  			h = Vector3.new(math.abs(h.X), math.abs(h.Y), math.abs(h.Z))
+  			table.insert(parts, { p = p, lo = p.Position - h, hi = p.Position + h })
+  		end
+  	end
+  end
+  local E = 0.02
+  for i = 1, #parts do
+  	for j = i + 1, #parts do
+  		local a, b = parts[i], parts[j]
+  		local overlapX = a.lo.X < b.hi.X - E and b.lo.X < a.hi.X - E
+  		local overlapY = a.lo.Y < b.hi.Y - E and b.lo.Y < a.hi.Y - E
+  		local overlapZ = a.lo.Z < b.hi.Z - E and b.lo.Z < a.hi.Z - E
+  		for _, axis in { "X", "Y", "Z" } do
+  			local rest = (axis == "X" and overlapY and overlapZ) or (axis == "Y" and overlapX and overlapZ) or (axis == "Z" and overlapX and overlapY)
+  			if rest and (math.abs(a.lo[axis] - b.lo[axis]) < E or math.abs(a.hi[axis] - b.hi[axis]) < E) then
+  				print(`coplanar {axis}: {a.p:GetFullName()} / {b.p:GetFullName()}`)
+  			end
+  		end
+  	end
+  end
+  ```
+  Stacked slabs (top of one = bottom of the next) don't print because they don't overlap in
+  volume. Anything that does print is a real flicker: push one part `PROUD` out, or shrink it
+  by `2 * E` on that axis, or delete the one that's fully hidden.
 
 **Openings.** There is no hole tool. An opening is the wall built as fill pieces around the gap:
 pier each side (full height), lintel box across the top (deeper than `T` by `PROUD` on the
