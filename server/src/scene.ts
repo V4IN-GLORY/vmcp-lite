@@ -388,7 +388,7 @@ function fitScale(parts: ScenePart[], cameras: Camera[], bounds: Bounds, size: n
 function renderPanel(
 	parts: ScenePart[],
 	camera: Camera,
-	bounds: Bounds,
+	center: V3,
 	size: number,
 	scale: number,
 	badges: boolean,
@@ -404,7 +404,7 @@ function renderPanel(
 	// Orthographic: a part is the same size wherever it sits, which is what makes two panels
 	// comparable.
 	const project = (world: V3): V3 => {
-		const v = sub(world, bounds.center);
+		const v = sub(world, center);
 		return [size / 2 + dot(v, camera.right) * scale, size / 2 - dot(v, camera.up) * scale, dot(v, camera.forward)];
 	};
 
@@ -418,7 +418,7 @@ function renderPanel(
 			continue;
 		}
 		const [px = 0, py = 0, pz = 0] = part.m;
-		clear.push({ part, depth: dot(sub([px, py, pz], bounds.center), camera.forward) });
+		clear.push({ part, depth: dot(sub([px, py, pz], center), camera.forward) });
 	}
 	// Back to front, because a see-through part blends with whatever is behind it and never
 	// writes depth -- two of them in the wrong order look wrong in a way you'd blame on the build.
@@ -538,28 +538,60 @@ function label(surface: Surface, text: string, left: number, top: number, scale:
 	}
 }
 
-function viewsOf(raw: unknown[] | undefined): { name: string; yaw: number; pitch: number }[] {
+interface View {
+	name: string;
+	yaw: number;
+	pitch: number;
+	/** World point the panel is centred on. Missing means the middle of the whole build. */
+	at?: V3;
+	/** Studs from `at` to the panel edge. Missing means the shared whole-build scale. */
+	radius?: number;
+	/** Drop parts whose centre is further than `radius` from `at`, so what's in front doesn't hide it. */
+	clip: boolean;
+}
+
+function isV3(value: unknown): value is V3 {
+	return Array.isArray(value) && value.length === 3 && value.every((n) => typeof n === "number");
+}
+
+function viewsOf(raw: unknown[] | undefined): View[] {
 	const asked = Array.isArray(raw) && raw.length > 0 ? raw : ["iso"];
-	const out: { name: string; yaw: number; pitch: number }[] = [];
+	const out: View[] = [];
 
 	for (const entry of asked.slice(0, 9)) {
 		if (typeof entry === "string") {
 			const preset = PRESETS[entry.toLowerCase()];
-			if (preset) out.push({ name: entry, yaw: preset[0], pitch: preset[1] });
+			if (preset) out.push({ name: entry, yaw: preset[0], pitch: preset[1], clip: false });
 			continue;
 		}
 		if (entry && typeof entry === "object") {
-			const spec = entry as { yaw?: number; pitch?: number; name?: string };
-			if (typeof spec.yaw === "number") {
-				out.push({
-					name: spec.name ?? `${Math.round(spec.yaw)}-${Math.round(spec.pitch ?? 0)}`,
-					yaw: spec.yaw,
-					pitch: spec.pitch ?? 20,
-				});
-			}
+			const spec = entry as {
+				yaw?: number;
+				pitch?: number;
+				name?: string;
+				view?: string;
+				at?: unknown;
+				radius?: number;
+				clip?: boolean;
+			};
+			// A preset name plus a target: { view = "front", at = {...}, radius = 10 }.
+			const preset = typeof spec.view === "string" ? PRESETS[spec.view.toLowerCase()] : undefined;
+			const yaw = typeof spec.yaw === "number" ? spec.yaw : preset?.[0];
+			if (typeof yaw !== "number") continue;
+			const pitch = typeof spec.pitch === "number" ? spec.pitch : (preset?.[1] ?? 20);
+			const at = isV3(spec.at) ? spec.at : undefined;
+			const radius = typeof spec.radius === "number" && spec.radius > 0 ? spec.radius : undefined;
+			out.push({
+				name: spec.name ?? spec.view ?? `${Math.round(yaw)}-${Math.round(pitch)}`,
+				yaw,
+				pitch,
+				at,
+				radius,
+				clip: spec.clip === true && at !== undefined && radius !== undefined,
+			});
 		}
 	}
-	return out.length > 0 ? out : [{ name: "iso", yaw: 45, pitch: 30 }];
+	return out.length > 0 ? out : [{ name: "iso", yaw: 45, pitch: 30, clip: false }];
 }
 
 /** Renders every requested view into one image, tiled. */
@@ -578,7 +610,18 @@ export function renderScene(scene: Scene): Surface {
 	const sheet = new Surface(columns * panelSize, rows * panelSize);
 
 	views.forEach((view, index) => {
-		const panel = renderPanel(parts, cameras[index] as Camera, bounds, panelSize, scale, scene.badges === true);
+		// A targeted view gets its own centre and scale: the point of it is to fill the panel with
+		// the thing in question, and the whole-build scale would leave it a speck in the corner.
+		const center = view.at ?? bounds.center;
+		const viewScale = view.radius ? (panelSize * (1 - MARGIN * 2)) / (view.radius * 2) : scale;
+		const shown = view.clip
+			? parts.filter((part) => {
+					const [px = 0, py = 0, pz = 0] = part.m;
+					const v = sub([px, py, pz], center);
+					return Math.hypot(v[0], v[1], v[2]) <= (view.radius as number);
+				})
+			: parts;
+		const panel = renderPanel(shown, cameras[index] as Camera, center, panelSize, viewScale, scene.badges === true);
 		const left = (index % columns) * panelSize;
 		const top = Math.floor(index / columns) * panelSize;
 

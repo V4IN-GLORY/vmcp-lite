@@ -37,7 +37,12 @@ Tool.Definition = {
 				type = "array",
 				description = "Which angles to draw, tiled into one image. Defaults to iso alone. "
 					.. "Named: iso, corner, front, back, left, right, top, bottom. Or an object "
-					.. "{ yaw, pitch, name } in degrees for anything else.",
+					.. "{ yaw, pitch, name } in degrees for anything else. Aim a view at one spot "
+					.. "with at (an {x, y, z} or a dotted path to a part or model) and radius (studs "
+					.. "from at to the panel edge); that panel is centred and scaled on it instead of "
+					.. "the whole build. clip = true drops parts further than radius from at, so a "
+					.. "wall between the camera and the spot doesn't hide it. view = \"front\" picks "
+					.. "a preset angle for a targeted view instead of yaw/pitch.",
 				items = { type = { "string", "object" } },
 				maxItems = 9,
 			},
@@ -100,13 +105,16 @@ function Tool.Run(arguments: {
 		}
 	end
 
-	local views = arguments.views or { "iso" }
+	local views, missing = Build.ResolveViews(arguments.views or { "iso" })
 	local badges = if arguments.badges ~= nil then arguments.badges else count <= BADGE_LIMIT
 	local note = if capped then `, stopped at {count} -- there are more` else ""
 	local problems = if arguments.problems ~= false then Build.Problems(root, arguments.maxParts, instances) else nil
 
 	local text = `{count} part(s) under {root:GetFullName()}, {#views} view(s){note}\n`
 		.. Build.Report(root, instances, badges, problems)
+	for _, problem in missing do
+		text ..= `\nview target not found, drawing the whole build instead: {problem}`
+	end
 
 	return {
 		content = { { type = "text", text = text } },

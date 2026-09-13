@@ -51,7 +51,10 @@ Tool.Definition = {
 			views = {
 				type = "array",
 				description = "Angles to draw, tiled into one image. Defaults to iso. Named: iso, "
-					.. "corner, front, back, left, right, top, bottom; or { yaw, pitch, name } in degrees.",
+					.. "corner, front, back, left, right, top, bottom; or { yaw, pitch, name } in degrees. "
+					.. "Add at ({x, y, z} or a dotted path to a part or model) and radius (studs) to "
+					.. "centre and scale a panel on one spot; clip = true hides parts further than "
+					.. "radius from it.",
 				items = { type = { "string", "object" } },
 				maxItems = 9,
 			},
@@ -153,6 +156,10 @@ function Tool.Run(arguments: {
 	local badges = if arguments.badges ~= nil then arguments.badges else count <= BADGE_LIMIT
 	local render = arguments.render ~= false
 	table.insert(lines, Build.Report(root, instances, badges and render, Build.Problems(root, MAX_PARTS, instances)))
+	local views, missing = Build.ResolveViews(arguments.views or { "iso" })
+	for _, problem in missing do
+		table.insert(lines, `view target not found, drawing the whole build instead: {problem}`)
+	end
 
 	return {
 		content = { { type = "text", text = table.concat(lines, "\n") } },
@@ -162,7 +169,7 @@ function Tool.Run(arguments: {
 				kind = "scene",
 				name = arguments.name,
 				size = arguments.size,
-				views = arguments.views or { "iso" },
+				views = views,
 				badges = badges,
 				parts = parts,
 			}

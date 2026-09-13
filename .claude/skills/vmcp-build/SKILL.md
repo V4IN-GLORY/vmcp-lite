@@ -268,6 +268,20 @@ itself — no camera, no playtest, no screenshot, and it works with Studio minim
   `{ yaw, pitch, name }` in degrees for anything else. Up to 9, tiled into one sheet, each panel
   labelled. `size` is pixels per panel, 128–1024, default 512; the sheet caps at 3072 wide so
   many panels means smaller ones.
+- **Targeted views**: add `at` and `radius` to a view object to centre and scale that panel on
+  one spot instead of the whole build. `at` is `{x, y, z}` or a dotted path to a part or model
+  (its pivot is used); `radius` is studs from `at` to the panel edge. `clip = true` drops parts
+  whose centre is further than `radius` from `at`, so a wall between the camera and the spot
+  doesn't hide it. `view = "front"` picks a preset angle in place of `yaw`/`pitch`:
+  ```
+  render_build { root = "Workspace.Chapel", views = [
+    "iso",
+    { view = "front", at = "Workspace.Chapel.Shell.Door", radius = 8, clip = true, name = "door" },
+    { yaw = 30, pitch = 15, at = {12, 4, -20}, radius = 6, name = "sill" },
+  ] }
+  ```
+  A targeted panel has its own scale, so it doesn't compare 1:1 with the whole-build panels
+  next to it — that's the trade for being able to see the thing at all.
 - The PNG lands in the server's `images/` state directory under `name` (or a timestamp) and is
   inlined in the reply when small enough; the tool prints the path either way.
 
@@ -276,6 +290,10 @@ Use it on purpose, not just because it arrived:
 - **Custom angles for the thing in question.** A doorway on the south face wants
   `{ yaw = 0, pitch = 10, name = "door" }` with `root` narrowed to that facade, not the whole map
   at iso. Narrow `root` is the main lever: 40 parts with badges tells you more than 1500 without.
+- **Aim at the problem, don't re-render the whole thing.** When the report says part 37 is sunk
+  into part 12, or the last picture showed a gap you can't place, the next render is
+  `{ at = <that part's path>, radius = <a few studs>, clip = true }` from two angles — not the
+  same iso again hoping it reads better this time. Same angle twice tells you nothing new.
 - **`front` / `left` for proportions, `top` for footprint, `iso` for whether it reads.** Add a
   second view when a specific question needs it; don't ask for six by habit — more panels is more
   to reconcile, and the numbers already agree with themselves.

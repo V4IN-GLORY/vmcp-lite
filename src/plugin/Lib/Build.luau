@@ -13,6 +13,8 @@
 
 local CollectionService = game:GetService("CollectionService")
 
+local Path = require(script.Parent.Parent.Path)
+
 local Build = {}
 
 -- Properties worth capturing, by the class that owns them. An instance takes every entry it IsA,
@@ -425,6 +427,29 @@ local function degreesOffAxis(cframe: CFrame): number
 		worst = math.max(worst, math.deg(math.acos(math.clamp(nearest, -1, 1))))
 	end
 	return worst
+end
+
+-- A view's `at` can be a dotted path as well as {x, y, z}; the renderer only knows numbers, so
+-- resolve paths to the instance's pivot here. Returns the views to send and any paths that didn't
+-- resolve, so the tool can say so instead of silently drawing the whole build.
+function Build.ResolveViews(views: { any }): ({ any }, { string })
+	local resolved = {}
+	local missing = {}
+	for _, view in views do
+		if type(view) == "table" and type(view.at) == "string" then
+			local found, problem = Path.Resolve(view.at)
+			if found and (found:IsA("BasePart") or found:IsA("Model")) then
+				local position = if found:IsA("Model") then found:GetPivot().Position else (found :: BasePart).Position
+				local copy = table.clone(view)
+				copy.at = { position.X, position.Y, position.Z }
+				view = copy
+			else
+				table.insert(missing, problem or `"{view.at}" isn't a part or model`)
+			end
+		end
+		table.insert(resolved, view)
+	end
+	return resolved, missing
 end
 
 function Build.Problems(root: Instance, maxParts: number?, known: { BasePart }?): { Problem }
