@@ -24,6 +24,10 @@ export function loadOrCreateToken(): string {
 	return token;
 }
 
+export function currentToken(): string {
+	return token;
+}
+
 export function isValidToken(candidate: unknown): boolean {
 	if (typeof candidate !== "string" || candidate.length !== token.length) return false;
 	return timingSafeEqual(Buffer.from(candidate), Buffer.from(token));

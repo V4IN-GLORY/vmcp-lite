@@ -54,3 +54,11 @@ subfolder; `server/package.json` is kept for the dev scripts only.
 ## Release flow
 
 Push to `main`. That's it — the next Claude startup rebuilds and reinstalls the plugin.
+
+## Several Claude sessions at once
+
+Every Claude session (VS Code, a terminal, `claude mcp list`) spawns its own VMCP process, but
+only one can bind port 8791. The rest connect to it as `role: "proxy"` over the same bridge
+socket and forward `tools/list` / `tools/call` (`server/src/proxy.ts`). When the primary exits,
+each proxy retries the bind and the first one becomes primary. Same idea as chrrxs's
+"proxy mode", which polls for the port every 5s; VMCP uses the socket close as the trigger.

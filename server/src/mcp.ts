@@ -21,43 +21,37 @@ const RETRY_KEY_DESCRIPTION =
 	"Optional. An id you choose for this attempt. Reuse the same value when retrying " +
 	"after a timeout and the first result is returned instead of the work running twice.";
 
-export async function startMcp(registry: SessionRegistry): Promise<Server> {
+/**
+ * What the stdio MCP server needs from whoever owns the tools. The primary process serves it
+ * from its registry; a proxy process serves it over a socket to the primary (see proxy.ts).
+ */
+export interface ToolService {
+	list(): Tool[] | Promise<Tool[]>;
+	call(name: string, args: Record<string, unknown>, onProgress?: (update: ProgressUpdate) => void): Promise<CallToolResult>;
+	/** Fires whenever the tool list may have changed. */
+	onChanged(listener: () => void): void;
+	offChanged(listener: () => void): void;
+}
+
+export function localService(registry: SessionRegistry): ToolService {
+	const retries = new RetryCache();
+	return {
+		list: () => registry.list().map(advertise),
+		call: (name, args, onProgress) => callLocal(registry, retries, name, args, onProgress),
+		onChanged: (listener) => void registry.on("changed", listener),
+		offChanged: (listener) => void registry.off("changed", listener),
+	};
+}
+
+export async function startMcp(service: ToolService): Promise<Server> {
 	const server = new Server(
 		{ name: "vmcp", version: "0.1.0" },
 		{ capabilities: { tools: { listChanged: true } } },
 	);
-	const retries = new RetryCache();
 
-	server.setRequestHandler(ListToolsRequestSchema, async () => ({
-		tools: registry.list().map(advertise),
-	}));
+	server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: await service.list() }));
 
 	server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToolResult> => {
-		const exposed = registry.resolve(request.params.name);
-		if (!exposed) {
-			return errorResult(`No tool named "${request.params.name}" is registered.`);
-		}
-
-		const session = exposed.session;
-		if (!session?.isOpen) {
-			return errorResult(
-				`"${exposed.placeName}" is not connected, so ${exposed.tool.name} can't run. ` +
-					"Open that place in Roblox Studio with the VMCP plugin enabled.",
-			);
-		}
-
-		const args = (request.params.arguments ?? {}) as Record<string, unknown>;
-		const { target, problem } = routeFor(session, args);
-		if (!target) return errorResult(problem ?? "nowhere to run that");
-		const cacheKey = retryKeyFor(exposed, args);
-		if (cacheKey) {
-			const cached = retries.get(cacheKey);
-			if (cached) {
-				log(`returning the cached result for ${exposed.tool.name} (${String(args[RETRY_KEY])})`);
-				return cached;
-			}
-		}
-
 		const progressToken = request.params._meta?.progressToken;
 		const onProgress =
 			progressToken === undefined
@@ -67,18 +61,10 @@ export async function startMcp(registry: SessionRegistry): Promise<Server> {
 							.notification({ method: "notifications/progress", params: { progressToken, ...update } })
 							.catch(() => {});
 					};
-
-		try {
-			const result = withRevisionNotice(settle(await target.call(exposed.tool.name, args, onProgress)), session);
-			// Only a real reply is cached â€” a timeout is exactly what's worth retrying.
-			if (cacheKey) retries.set(cacheKey, result);
-			return result;
-		} catch (err) {
-			return errorResult((err as Error).message);
-		}
+		return service.call(request.params.name, (request.params.arguments ?? {}) as Record<string, unknown>, onProgress);
 	});
 
-	registry.on("changed", () => {
+	service.onChanged(() => {
 		server.notification({ method: "notifications/tools/list_changed" }).catch(() => {
 			// the client may not be connected yet; the next tools/list picks it up
 		});
@@ -87,6 +73,45 @@ export async function startMcp(registry: SessionRegistry): Promise<Server> {
 	await server.connect(new StdioServerTransport());
 	log("MCP stdio transport ready");
 	return server;
+}
+
+async function callLocal(
+	registry: SessionRegistry,
+	retries: RetryCache,
+	name: string,
+	args: Record<string, unknown>,
+	onProgress?: (update: ProgressUpdate) => void,
+): Promise<CallToolResult> {
+	const exposed = registry.resolve(name);
+	if (!exposed) return errorResult(`No tool named "${name}" is registered.`);
+
+	const session = exposed.session;
+	if (!session?.isOpen) {
+		return errorResult(
+			`"${exposed.placeName}" is not connected, so ${exposed.tool.name} can't run. ` +
+				"Open that place in Roblox Studio with the VMCP plugin enabled.",
+		);
+	}
+
+	const { target, problem } = routeFor(session, args);
+	if (!target) return errorResult(problem ?? "nowhere to run that");
+	const cacheKey = retryKeyFor(exposed, args);
+	if (cacheKey) {
+		const cached = retries.get(cacheKey);
+		if (cached) {
+			log(`returning the cached result for ${exposed.tool.name} (${String(args[RETRY_KEY])})`);
+			return cached;
+		}
+	}
+
+	try {
+		const result = withRevisionNotice(settle(await target.call(exposed.tool.name, args, onProgress)), session);
+		// Only a real reply is cached — a timeout is exactly what's worth retrying.
+		if (cacheKey) retries.set(cacheKey, result);
+		return result;
+	} catch (err) {
+		return errorResult((err as Error).message);
+	}
 }
 
 /**

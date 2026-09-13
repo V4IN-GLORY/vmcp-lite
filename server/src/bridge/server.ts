@@ -19,39 +19,38 @@ import {
 import { runPostProcess, settle } from "../postprocess.js";
 import { rojoMap, type ScriptHash } from "../rojo.js";
 import { routeFor, ownerOf } from "./routing.js";
-import { Session } from "./session.js";
+import { Session, type ProgressUpdate } from "./session.js";
 import type { SessionRegistry } from "./registry.js";
+import type { ToolService } from "../mcp.js";
 
 const HANDSHAKE_TIMEOUT_MS = 5_000;
 
-export function startBridge(registry: SessionRegistry): WebSocketServer {
-	const wss = new WebSocketServer({
-		host: config.host,
-		port: config.port,
-		maxPayload: config.maxMessageBytes,
-		// A webpage can open a socket to localhost; a Studio plugin never sends an Origin.
-		verifyClient: (info: { origin?: string }) => info.origin === undefined,
+/** Resolves once listening; rejects with the bind error (EADDRINUSE when another VMCP owns the port). */
+export function startBridge(registry: SessionRegistry, service: ToolService): Promise<WebSocketServer> {
+	return new Promise((resolve, reject) => {
+		const wss = new WebSocketServer({
+			host: config.host,
+			port: config.port,
+			maxPayload: config.maxMessageBytes,
+			// A webpage can open a socket to localhost; a Studio plugin never sends an Origin.
+			verifyClient: (info: { origin?: string }) => info.origin === undefined,
+		});
+
+		wss.once("error", reject);
+		wss.on("listening", () => {
+			log(`bridge listening on ws://${config.host}:${config.port}`);
+			wss.removeListener("error", reject);
+			wss.on("error", (err) => log("bridge error:", err.message));
+			resolve(wss);
+		});
+
+		wss.on("connection", (socket, request) => attach(socket, request, registry, service));
 	});
-
-	wss.on("listening", () => log(`bridge listening on ws://${config.host}:${config.port}`));
-
-	wss.on("error", (err: NodeJS.ErrnoException) => {
-		if (err.code === "EADDRINUSE") {
-			log(
-				`port ${config.port} is already in use — another VMCP server is running.`,
-				"Close it, or set VMCP_PORT for this one.",
-			);
-			process.exit(1);
-		}
-		log("bridge error:", err.message);
-	});
-
-	wss.on("connection", (socket, request) => attach(socket, request, registry));
-	return wss;
 }
 
-function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegistry): void {
+function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegistry, service: ToolService): void {
 	let session: Session | undefined;
+	let proxied = false;
 
 	const handshakeTimer = setTimeout(() => {
 		reject(socket, "no session/hello within the handshake window");
@@ -66,9 +65,20 @@ function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegist
 			return;
 		}
 
+		if (proxied) {
+			handleProxy(socket, msg, service);
+			return;
+		}
+
 		if (!session) {
 			clearTimeout(handshakeTimer);
-			session = handleHello(socket, msg, registry, request);
+			const hello = handleHello(socket, msg, registry, request);
+			if (hello === "proxy") {
+				proxied = true;
+				attachProxy(socket, service);
+			} else {
+				session = hello;
+			}
 			return;
 		}
 
@@ -178,7 +188,7 @@ function handleHello(
 	msg: IncomingMessage,
 	registry: SessionRegistry,
 	request: HttpRequest,
-): Session | undefined {
+): Session | "proxy" | undefined {
 	if (isResponse(msg) || msg.method !== "session/hello") {
 		reject(socket, "the first message must be session/hello");
 		return undefined;
@@ -203,6 +213,13 @@ function handleHello(
 		replyError(socket, msg, VmcpErrorCode.UnsupportedVersion, detail);
 		reject(socket, detail);
 		return undefined;
+	}
+
+	// Another VMCP process that lost the race for the port. It forwards its MCP client's
+	// requests here rather than owning any Studio session.
+	if (params.role === "proxy") {
+		replyOk(socket, msg, { protocolVersion: PROTOCOL_VERSION });
+		return "proxy";
 	}
 
 	let tools;
@@ -352,6 +369,32 @@ async function invokeTool(
 	} catch (err) {
 		replyError(socket, msg, VmcpErrorCode.InternalError, (err as Error).message);
 	}
+}
+
+function attachProxy(socket: WebSocket, service: ToolService): void {
+	const changed = () => socket.send(JSON.stringify({ jsonrpc: "2.0", method: "proxy/changed" }));
+	service.onChanged(changed);
+	socket.on("close", () => service.offChanged(changed));
+	log("a proxy attached");
+}
+
+/** The MCP surface, over the socket, for a proxy. Progress goes back tagged with the request id. */
+async function handleProxy(socket: WebSocket, msg: IncomingMessage, service: ToolService): Promise<void> {
+	if (isResponse(msg)) return;
+	const request = msg as JsonRpcRequest<{ name?: string; arguments?: Record<string, unknown> }>;
+
+	if (request.method === "proxy/list") {
+		replyOk(socket, request, { tools: await service.list() });
+		return;
+	}
+	if (request.method === "proxy/call" && request.id !== undefined) {
+		const { name, arguments: args } = request.params ?? {};
+		const onProgress = (update: ProgressUpdate) =>
+			socket.send(JSON.stringify({ jsonrpc: "2.0", method: "proxy/progress", params: { id: request.id, ...update } }));
+		replyOk(socket, request, { result: await service.call(String(name), args ?? {}, onProgress) });
+		return;
+	}
+	replyError(socket, msg, VmcpErrorCode.MethodNotFound, `unknown method "${request.method}"`);
 }
 
 function replyOk(socket: WebSocket, msg: IncomingMessage, extra: Record<string, unknown> = {}): void {

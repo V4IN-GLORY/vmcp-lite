@@ -48,7 +48,7 @@ export interface ToolDefinition {
  * "client" session per test client. Only the edit session owns the tool list; the others exist so
  * a call that names a live context has a real DataModel to run in.
  */
-export type SessionRole = "plugin" | "server" | "client";
+export type SessionRole = "plugin" | "server" | "client" | "proxy";
 
 export interface HelloParams {
 	token: string;
