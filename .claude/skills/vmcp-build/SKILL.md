@@ -18,9 +18,17 @@ The loop, one tool call per pass:
 ```
 write the whole build as one source
 apply_build { code, root }       -> runs it, measures it, lists what's wrong, draws it
-edit the source from the numbers
+read the numbers, then LOOK at the picture and say what's off in words
+render_build { root = <the group in question>, views = [...] }  -> a closer look when the whole-build iso can't answer it
+edit the source from the numbers and what you saw
 apply_build again                 -> only what changed moves
 ```
+
+The picture is not optional and not decorative. It comes from VMCP's own renderer (see "The
+renderer" below), it is the only way you will ever see what you built, and a pass where you didn't
+open it and write down what you saw is a pass you did blind. Before every edit, state in one or
+two lines what the picture showed — "roof slabs sit above the wall tops but the gable is open at
+the apex", "trees are identical copies" — and let that drive the edit alongside the problem list.
 
 ## The source
 
@@ -290,6 +298,13 @@ that's wrong makes every detail wrong.
 Later passes: edit the source, re-apply. Because `ensure` updates by name, a pass that changes one
 group's numbers moves only that group. Keep the full source in your working memory across passes;
 it's the build.
+
+Every pass ends the same way: read the report, look at the picture, write what you saw. When a
+pass detailed one group (the facade, the interior, the trees), follow it with a `render_build`
+narrowed to that group with a view chosen for the question — `front` for a facade, `top` for a
+cemetery layout, `{ yaw, pitch }` aimed at a doorway — so the badges are on and the thing fills
+the panel. The whole-map iso is for composition; it can't tell you a door leaf is half the width
+of its frame or a spandrel is rotated into the wall, and those are the bugs that survive.
 
 A detailed build is big — a 150-stud map with a real building on it runs to 800+ lines, and that
 does not fit in one reply. Don't try. Do it as passes that each fit: shell → openings and roof →
