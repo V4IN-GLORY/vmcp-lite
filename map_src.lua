@@ -506,7 +506,7 @@ phase(function(root)
 
 	-- the wheel window: hub, two rings, eight spokes, all in the west opening
 	local wheelAt = CFrame.new(0, 21.8, BODY_Z0 + WALL / 2)   -- centred in the upper wall's arched opening
-	col(shell, "WheelHub", 0.9, WALL + 0.9, wheelAt, P.trim)
+	rod(shell, "WheelHub", 0.9, WALL + 0.9, wheelAt, P.trim)  -- an axle through the wall, not a post
 	for i = 1, 8 do
 		local a = (i - 1) * math.pi / 4
 		box(shell, "WheelSpoke" .. i, Vector3.new(0.42, 8.2, WALL + 0.5),
@@ -704,13 +704,15 @@ phase(function(root)
 	local function naveSlope(side, bay)
 		local zc = NAVE_Z0 + (bay - 0.5) * BAY
 		local midX, midY = side * run / 2, (EAVE_Y + RIDGE) / 2
-		local cf = CFrame.new(midX, midY, zc) * CFrame.Angles(0, 0, side * pitch)
+		-- the slab's local +X has to run UP the slope, and the ridge is inboard of the eave, so
+		-- the tilt flips sign with the side (the first version had this backwards: a valley)
+		local cf = CFrame.new(midX, midY, zc) * CFrame.Angles(0, 0, -side * pitch)
 		box(roof, string.format("Slope%s%d", if side > 0 then "E" else "W", bay),
 			Vector3.new(len + PROUD, 0.9, BAY + 0.2), cf, P.roof)
 		for k = -1, 1, 2 do   -- two rafters under each slab
 			box(roof, string.format("Rafter%s%d%s", if side > 0 then "E" else "W", bay, if k > 0 then "b" else "a"),
 				Vector3.new(len - 1.5, 0.5, 0.6),
-				CFrame.new(midX, midY - 0.7, zc + k * (BAY / 2 - 0.4)) * CFrame.Angles(0, 0, side * pitch), P.beam)
+				CFrame.new(midX, midY - 0.62, zc + k * (BAY / 2 - 0.4)) * CFrame.Angles(0, 0, -side * pitch), P.beam)
 		end
 	end
 	for bay = 1, BAYS do
@@ -727,7 +729,7 @@ phase(function(root)
 					box(roof, string.format("SlopeTorn%d%s", bay, if k == 1 then "a" else "b"),
 						Vector3.new(segLen, 0.9, BAY + 0.2),
 						CFrame.new(s * mid * math.cos(pitch), RIDGE - mid * math.sin(pitch), zc)
-							* CFrame.Angles(0, 0, s * pitch), P.roof)
+							* CFrame.Angles(0, 0, -s * pitch), P.roof)
 				end
 			end
 		end
@@ -754,7 +756,7 @@ phase(function(root)
 				local n = math.max(1, math.floor((z1 - z0) / 4))
 				for k = 1, n do
 					box(roof, string.format("LeanRaft%d%d%d", side, i, k), Vector3.new(aLen - 1, 0.4, 0.5),
-						CFrame.new(midX, midY - 0.6, z0 + (k - 0.5) * (z1 - z0) / n) * CFrame.Angles(0, 0, -s * aPitch), P.beam)
+						CFrame.new(midX, midY - 0.52, z0 + (k - 0.5) * (z1 - z0) / n) * CFrame.Angles(0, 0, -s * aPitch), P.beam)
 				end
 			end
 		end
@@ -863,8 +865,10 @@ local function tree(parent, name, x, z, scale, kind, lean)
 	local bark, leaf = P.bark, P.leaf
 	local h = (10 + jitAbs(4)) * scale
 	local tilt = CFrame.new(x, 0, z) * CFrame.Angles(jit(0.05) + lean * 0.5, jit(3.1), jit(0.05) + lean)
-	rod(parent, name .. "Trunk1", 1.15 * scale, h * 0.62, tilt * CFrame.new(0, h * 0.31, 0) * CFrame.Angles(0, math.pi / 2, 0), bark)
-	rod(parent, name .. "Trunk2", 0.85 * scale, h * 0.55, tilt * CFrame.new(jit(0.5), h * 0.82, jit(0.5)) * CFrame.Angles(0, math.pi / 2, 0), bark)
+	-- trunks are vertical posts: `col` turns the cylinder's own X axis onto Y, where `rod`
+	-- would lay it flat (that mistake made every tree a horizontal log at chest height)
+	col(parent, name .. "Trunk1", 1.15 * scale, h * 0.62, tilt * CFrame.new(0, h * 0.31, 0), bark)
+	col(parent, name .. "Trunk2", 0.85 * scale, h * 0.55, tilt * CFrame.new(jit(0.5), h * 0.82, jit(0.5)), bark)
 	for i = 1, 5 do
 		local a = i * 1.256
 		local r = 1.5 * scale
@@ -1125,8 +1129,9 @@ phase(function(root)
 		local w = 1.55 - i * 0.12
 		local y = -i * 0.34 + 0.7
 		for _, sx in ipairs({ 1, -1 }) do
-			rod(props, string.format("Rib%d%s", i, if sx > 0 then "a" else "b"), 0.09, w,
-				chest * CFrame.new(sx * w / 2, y, -0.35) * CFrame.Angles(0, 0, math.rad(90) + sx * 0.25), bone)
+			-- a rib runs across the chest from the spine outward; as a rod it pointed fore-and-aft
+			box(props, string.format("Rib%d%s", i, if sx > 0 then "a" else "b"), Vector3.new(w, 0.17, 0.17),
+				chest * CFrame.new(sx * w / 2, y, -0.35) * CFrame.Angles(0, 0, sx * 0.22), bone)
 		end
 	end
 	box(props, "Sternum", Vector3.new(0.34, 1.5, 0.26), chest * CFrame.new(0, -0.35, -0.7), bone)
@@ -1137,7 +1142,7 @@ phase(function(root)
 	box(props, "Blade", Vector3.new(0.34, 0.12, 7.4), bladeCF, iron)
 	box(props, "BladeTip", Vector3.new(0.24, 0.12, 0.6), bladeCF * CFrame.new(0, 0, 3.9), iron)
 	box(props, "Guard", Vector3.new(1.5, 0.24, 0.24), bladeCF * CFrame.new(0, 0, -3.8), P.brass)
-	rod(props, "Grip", 0.17, 1.1, bladeCF * CFrame.new(0, 0, -4.5) * CFrame.Angles(0, math.pi / 2, 0), leather)
+	rod(props, "Grip", 0.17, 1.1, bladeCF * CFrame.new(0, 0, -4.5), leather)
 	box(props, "Pommel", Vector3.new(0.4, 0.4, 0.4), bladeCF * CFrame.new(0, 0, -5.2), P.brass)
 	-- armour: a shoulder plate still buckled on, the breastplate undone and hanging open
 	box(props, "PauldronTop", Vector3.new(1.3, 0.4, 1.5), chest * CFrame.new(0.95, 1.0, -0.2) * CFrame.Angles(0, 0, -0.3), iron)
@@ -1216,9 +1221,9 @@ end
 
 local function candle(parent, name, at, h, lit)
 	local wax = P.bone
-	rod(parent, name .. "Wax", 0.16, h, at, wax)
+	col(parent, name .. "Wax", 0.16, h, at, wax)
 	if lit then
-		flame(parent, name .. "Flame", at * CFrame.new(0, 0, -(h / 2 + 0.28)) * CFrame.Angles(0, math.pi / 2, 0), 0.3, 9, 1.6)
+		flame(parent, name .. "Flame", at * CFrame.new(0, h / 2 + 0.3, 0), 0.3, 9, 1.6)
 	end
 end
 
@@ -1238,12 +1243,16 @@ phase(function(root)
 	local cath = model(root, "Cathedral")
 	local inside = model(cath, "Interior")
 	-- ---- hanging lanterns, wall sconces, altar candles ---------------------------------
-	local hang = { { -5.4, -10.5, 15.6 }, { 4.6, -1.5, 14.4 }, { -3.2, 9.5, 15.2 } }
+	-- hung under the tie beams (z -8, 0, 8) and long enough to actually meet them, so nothing
+	-- dangles from nothing
+	local hang = { { -5.4, -8, 15.6 }, { 4.6, 0, 14.4 }, { -3.2, 8, 15.2 } }
 	for i, h in ipairs(hang) do
 		local at = CFrame.new(h[1], h[3], h[2])
-		rod(inside, string.format("Chain%d", i), 0.1, 3.6, at * CFrame.new(0, 1.8, 0), P.iron)
+		local len = 18.7 - h[3]
+		col(inside, string.format("Chain%d", i), 0.1, len, at * CFrame.new(0, len / 2, 0), P.iron)
 		for k = 1, 4 do
-			box(inside, string.format("Chain%dLink%d", i, k), Vector3.new(0.3, 0.1, 0.1), at * CFrame.new(0, 0.6 + k * 0.6, 0) * CFrame.Angles(0, 0, k * 0.8), P.iron)
+			box(inside, string.format("Chain%dLink%d", i, k), Vector3.new(0.3, 0.1, 0.1),
+				at * CFrame.new(0, (k - 0.5) * len / 4, 0) * CFrame.Angles(0, 0, k * 0.8), P.iron)
 		end
 		lantern(inside, string.format("Lantern%d", i), at * CFrame.new(0, -0.4, 0), 1)
 		flame(inside, string.format("Lantern%dGlow", i), at * CFrame.new(0, -0.35, 0), 0.42, 15, 2.2)
@@ -1443,6 +1452,26 @@ local function qa(root)
 	if #dupes > 0 then print("[RuinedCathedral] QA  near-duplicate names: " .. table.concat(dupes, ", ")) end
 	if #unsupported > 0 then print("[RuinedCathedral] QA  nothing under: " .. table.concat(unsupported, ", ")) end
 	if #thin > 0 then print("[RuinedCathedral] QA  paper thin: " .. table.concat(thin, ", ")) end
+	-- a sign error in a rotation leaves the bounding box untouched, so the two things with a
+	-- right way up get checked by hand: roof slabs must run from the ridge (x near 0, high) down
+	-- to the eave (|x| large, low), and every trunk's own axis must point up
+	local slopes, wrongSlope, trunks, loose = 0, 0, 0, 0
+	for _, d in ipairs(parts) do
+		if string.find(d.Name, "^Slope") or string.find(d.Name, "^Lean%d") then
+			slopes += 1
+			-- a roof plane is right when its height climbs toward the middle of the building:
+			-- going inboard (|x| down) must mean going up, whichever way the box is turned
+			local axis = d.CFrame.XVector
+			local inward = if d.Position.X >= 0 then 1 else -1
+			if math.abs(axis.Y) < 0.2 or axis.Y * axis.X * inward > -0.1 then wrongSlope += 1 end
+		elseif string.find(d.Name, "Trunk") then
+			trunks += 1
+			if math.abs(d.CFrame.XVector.Y) < 0.97 then loose += 1 end
+		end
+	end
+	print(string.format("[RuinedCathedral] QA  roof %d slopes (%d ridge end wrong) | %d trunks (%d not vertical)",
+		slopes, wrongSlope, trunks, loose))
+	if wrongSlope > 0 or loose > 0 then print("[RuinedCathedral] QA  ORIENTATION FAULT") end
 	if #coplanar == 0 and #dupes == 0 and #unsupported == 0 and #thin == 0 then
 		print("[RuinedCathedral] QA  no flicker, no duplicates, nothing floating: clean")
 	end
