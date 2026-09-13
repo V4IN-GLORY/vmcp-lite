@@ -20,7 +20,7 @@ function pluginsFolder(): string {
  * hot-reloads a changed local plugin file; a brand-new file needs a Studio restart.
  */
 export function installBundledPlugin(): void {
-	const source = join(dirname(fileURLToPath(import.meta.url)), "..", ASSET);
+	const source = join(dirname(fileURLToPath(import.meta.url)), "..", "..", ASSET);
 	if (!existsSync(source)) {
 		log(`no bundled ${ASSET} at ${source} — run \`npm run build:plugin\` first`);
 		return;

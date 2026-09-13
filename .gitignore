@@ -13,4 +13,3 @@ server/dist/
 
 # luau-lsp type definitions, downloaded not authored
 globalTypes.d.luau
-server/VMCP.rbxmx

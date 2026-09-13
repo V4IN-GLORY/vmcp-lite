@@ -734,6 +734,7 @@ local Bridge = require(script.Parent.Bridge)
 
 local Env = {
 	Anim = require(script.Parent.Lib.Anim),
+	Audit = require(script.Parent.Lib.Audit),
 	Bench = require(script.Parent.Lib.Bench),
 	Build = require(script.Parent.Lib.Build),
 	Canvas = require(script.Parent.Lib.Canvas),
@@ -1665,6 +1666,145 @@ return Anim
       </Item>
       <Item class="ModuleScript" referent="12">
         <Properties>
+          <string name="Name">Audit</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Collects the code a model needs to review the game's remotes for real.
+--
+-- The hard part of a security pass isn't the reasoning -- a model can spot a missing ownership
+-- check or a client-authoritative grant on sight. The hard part is putting the *right* code in
+-- front of it: out of a whole game, which scripts actually handle remotes, and which remote does
+-- each one serve. That's what this does. It finds every server-side remote binding, traces the
+-- variable back to the remote it belongs to, and returns the full source of each handling script
+-- so the model reads the real thing -- requires, validation helpers, the lot -- not a sliced window.
+--
+-- It reads Script.Source, so it only works on the plugin/server side of a Studio session. It does
+-- no grading of its own on purpose: the point is that the model reviews the code, decides which
+-- remotes are exploitable, and hands those to Exploit to abuse. This just gathers.
+
+local Audit = {}
+
+export type Handler = {
+	script: string,
+	remotes: { string }, -- remote names this script binds a server handler for
+	source: string,
+}
+
+export type Surface = {
+	handlers: { Handler },
+	remotes: { { name: string, path: string, class: string } },
+	-- Remotes with no server-side binding found in any readable script: client-only, or dispatched
+	-- through a table the tracer can't follow. Worth a manual look.
+	orphans: { string },
+}
+
+local MAX_SOURCE = 24000
+
+-- The remote a handler serves, read back from the code. Handlers bind through a variable
+-- (`combat.OnServerEvent:Connect`), so find the variable, then find where it was assigned from a
+-- remote by name. Returns nil when the source doesn't say plainly enough to trust.
+local function remoteName(source: string, var: string): string?
+	for _, pattern in
+		{
+			`local%s+${var}%s*=%s*[^\n]-[:.]WaitForChild%s*%(%s*["'](.-)["']`,
+			`${var}%s*=%s*[^\n]-[:.]WaitForChild%s*%(%s*["'](.-)["']`,
+			`local%s+${var}%s*=%s*[%w%.%[%]"']-%.([%w_]+)%s*[\n;]`,
+			`${var}%s*=%s*[%w%.%[%]"']-%.([%w_]+)%s*[\n;]`,
+		}
+	do
+		local name = string.match(source, pattern)
+		if name then
+			return name
+		end
+	end
+	return nil
+end
+
+-- Gather every RemoteEvent/RemoteFunction and every script that binds a server handler, with the
+-- handler's full source, so a model can review the real code.
+function Audit.Surface(root: Instance?): Surface
+	local scope = root or game
+
+	local remotes: { { name: string, path: string, class: string } } = {}
+	local bound: { [string]: boolean } = {}
+	for _, instance in scope:GetDescendants() do
+		if instance:IsA("RemoteEvent") or instance:IsA("UnreliableRemoteEvent") or instance:IsA("RemoteFunction") then
+			table.insert(remotes, { name = instance.Name, path = instance:GetFullName(), class = instance.ClassName })
+		end
+	end
+
+	local handlers: { Handler } = {}
+	for _, instance in scope:GetDescendants() do
+		if not instance:IsA("LuaSourceContainer") then
+			continue
+		end
+		local ok, source = pcall(function()
+			return (instance :: any).Source
+		end)
+		if not ok or type(source) ~= "string" or not string.find(source, "OnServer", 1, true) then
+			continue
+		end
+
+		local names: { string } = {}
+		local seen: { [string]: boolean } = {}
+		for var in source:gmatch("([%w_]+)%.OnServer[EI]") do
+			local name = remoteName(source, var) or var
+			if not seen[name] then
+				seen[name] = true
+				bound[name] = true
+				table.insert(names, name)
+			end
+		end
+
+		if #names > 0 then
+			table.insert(handlers, {
+				script = instance:GetFullName(),
+				remotes = names,
+				source = if #source > MAX_SOURCE
+					then source:sub(1, MAX_SOURCE) .. "\n-- ...(truncated, read the script directly for the rest)"
+					else source,
+			})
+		end
+	end
+
+	local orphans: { string } = {}
+	for _, remote in remotes do
+		if not bound[remote.name] then
+			table.insert(orphans, remote.path)
+		end
+	end
+
+	return { handlers = handlers, remotes = remotes, orphans = orphans }
+end
+
+-- The surface as text, for a model to read and review. No verdicts -- that's the reader's job.
+function Audit.Render(surface: Surface): string
+	local lines = {
+		`{#surface.remotes} remote(s), {#surface.handlers} handling script(s). Review each handler `
+			.. "below for exploitable remotes -- missing type/ownership/rate checks, client-authoritative "
+			.. "state, anything a client could abuse -- then hand the ones you flag to Exploit.AbuseAll.",
+		"",
+	}
+	for _, handler in surface.handlers do
+		table.insert(lines, `=== {handler.script}  (binds: {table.concat(handler.remotes, ", ")}) ===`)
+		table.insert(lines, handler.source)
+		table.insert(lines, "")
+	end
+	if #surface.orphans > 0 then
+		table.insert(lines, `no server handler found for (client-only or dynamically dispatched -- look manually):`)
+		for _, path in surface.orphans do
+			table.insert(lines, `  {path}`)
+		end
+	end
+	return table.concat(lines, "\n")
+end
+
+return Audit
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="13">
+        <Properties>
           <string name="Name">Bench</string>
           <string name="Source"><![CDATA[--!strict
 --!optimize 2
@@ -1800,7 +1940,7 @@ return Bench
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="13">
+      <Item class="ModuleScript" referent="14">
         <Properties>
           <string name="Name">Build</string>
           <string name="Source"><![CDATA[--!strict
@@ -2195,6 +2335,33 @@ local NEAR_MISS_DEGREES = 5
 local SUPPORTED_GAP = 0.25
 local THIN = 0.1
 local OUTLIER_STUDS = 250
+-- Two parts sharing a face are touching, not sunk in; a build made of flush boxes would otherwise
+-- report every wall against its floor.
+local FLUSH = 0.05
+
+-- World-space box around a part, rotation and all. Rotated parts get a box bigger than they are,
+-- which makes the depth below an estimate -- still a number you can subtract from a position.
+local function aabb(part: BasePart): (Vector3, Vector3)
+	local cframe = part.CFrame
+	local half = part.Size / 2
+	local right, up, look = cframe.RightVector, cframe.UpVector, cframe.LookVector
+	local extent = Vector3.new(
+		math.abs(right.X) * half.X + math.abs(up.X) * half.Y + math.abs(look.X) * half.Z,
+		math.abs(right.Y) * half.X + math.abs(up.Y) * half.Y + math.abs(look.Y) * half.Z,
+		math.abs(right.Z) * half.X + math.abs(up.Z) * half.Y + math.abs(look.Z) * half.Z
+	)
+	return cframe.Position - extent, cframe.Position + extent
+end
+
+-- How far one box is sunk into another and along which axis the shortest way out is.
+local function penetration(a: BasePart, b: BasePart): (number, string)
+	local aMin, aMax = aabb(a)
+	local bMin, bMax = aabb(b)
+	local overlap = aMax:Min(bMax) - aMin:Max(bMin)
+	local depth = math.min(overlap.X, overlap.Y, overlap.Z)
+	local axis = if depth == overlap.X then "X" elseif depth == overlap.Y then "Y" else "Z"
+	return depth, axis
+end
 
 local function degreesOffAxis(cframe: CFrame): number
 	local worst = 0
@@ -2265,17 +2432,18 @@ function Build.Problems(root: Instance, maxParts: number?, known: { BasePart }?)
 		local touching = workspace:GetPartsInPart(part, overlap)
 		local connected = false
 		for _, other in touching do
-			if other ~= part then
-				connected = true
-				if not reportedOverlap[part] and not reportedOverlap[other] then
-					reportedOverlap[part] = true
-					table.insert(problems, {
-						part = part,
-						kind = "overlapping",
-						detail = `sunk into {other:GetFullName()}`,
-					})
-				end
-				break
+			if other == part then
+				continue
+			end
+			connected = true
+			local depth, axis = penetration(part, other)
+			if depth > FLUSH and not reportedOverlap[part] and not reportedOverlap[other] then
+				reportedOverlap[part] = true
+				table.insert(problems, {
+					part = part,
+					kind = "overlapping",
+					detail = `sunk about {string.format("%.2f", depth)} studs into {other:GetFullName()} along {axis}`,
+				})
 			end
 		end
 
@@ -2311,11 +2479,103 @@ function Build.Problems(root: Instance, maxParts: number?, known: { BasePart }?)
 	return problems
 end
 
+-- The build as numbers: where it sits, how big each top-level group is, what's wrong, and which
+-- badge is which part. This is the part of a render that survives being read -- a picture can't be
+-- held in your head next to the code, a list of extents can.
+
+local function fmt(value: number): string
+	return string.format(if value % 1 == 0 then "%d" else "%.1f", value)
+end
+
+local function v3(value: Vector3): string
+	return `({fmt(value.X)}, {fmt(value.Y)}, {fmt(value.Z)})`
+end
+
+local function span(min: Vector3, max: Vector3): string
+	local size = max - min
+	return `{fmt(size.X)}x{fmt(size.Y)}x{fmt(size.Z)} spanning x {fmt(min.X)}..{fmt(max.X)}, y {fmt(min.Y)}..{fmt(max.Y)}, z {fmt(min.Z)}..{fmt(max.Z)}`
+end
+
+local function shorten(instance: Instance, root: Instance): string
+	local full = instance:GetFullName()
+	local prefix = `{root:GetFullName()}.`
+	if string.sub(full, 1, #prefix) == prefix then
+		return string.sub(full, #prefix + 1)
+	end
+	return full
+end
+
+type Extent = { min: Vector3, max: Vector3, count: number }
+
+local function grow(extent: Extent?, min: Vector3, max: Vector3): Extent
+	if not extent then
+		return { min = min, max = max, count = 1 }
+	end
+	extent.min = extent.min:Min(min)
+	extent.max = extent.max:Max(max)
+	extent.count += 1
+	return extent
+end
+
+function Build.Report(root: Instance, parts: { BasePart }, badges: boolean, problems: { Problem }?): string
+	local lines = {}
+
+	local whole: Extent? = nil
+	local groups: { [Instance]: Extent } = {}
+	local order: { Instance } = {}
+	for _, part in parts do
+		local min, max = aabb(part)
+		whole = grow(whole, min, max)
+		-- The group is whichever child of the root this part lives under -- a loose part is its own.
+		local top: Instance = part
+		while top.Parent ~= root and top.Parent ~= nil do
+			top = top.Parent :: Instance
+		end
+		if not groups[top] then
+			table.insert(order, top)
+		end
+		groups[top] = grow(groups[top], min, max)
+	end
+
+	if whole then
+		table.insert(lines, `bounds: {span(whole.min, whole.max)}`)
+	end
+	if #order > 1 then
+		table.insert(lines, "groups (direct children of the root):")
+		for _, top in order do
+			local extent = groups[top]
+			local plural = if extent.count == 1 then "part" else "parts"
+			table.insert(lines, `  {top.Name}  {extent.count} {plural}, {span(extent.min, extent.max)}`)
+		end
+	end
+
+	if problems then
+		table.insert(lines, "")
+		if #problems == 0 then
+			table.insert(lines, "nothing looks wrong with the geometry")
+		else
+			table.insert(lines, `{#problems} thing(s) worth a look:`)
+			for _, problem in problems do
+				table.insert(lines, `  {shorten(problem.part, root)} -- {problem.kind}: {problem.detail}`)
+			end
+		end
+	end
+
+	table.insert(lines, "")
+	table.insert(lines, if badges then "legend (the number in the picture):" else "parts:")
+	for index, part in parts do
+		local size = part.Size
+		table.insert(lines, `  #{index} {shorten(part, root)}  {fmt(size.X)}x{fmt(size.Y)}x{fmt(size.Z)} at {v3(part.Position)}`)
+	end
+
+	return table.concat(lines, "\n")
+end
+
 return Build
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="14">
+      <Item class="ModuleScript" referent="15">
         <Properties>
           <string name="Name">Canvas</string>
           <string name="Source"><![CDATA[--!strict
@@ -2424,7 +2684,7 @@ return Canvas
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="15">
+      <Item class="ModuleScript" referent="16">
         <Properties>
           <string name="Name">Exploit</string>
           <string name="Source"><![CDATA[--!strict
@@ -2458,6 +2718,10 @@ local Exploit = {}
 export type Report = Bench.Report
 
 local HUGE_STRING = string.rep("A", 10000)
+
+-- Matches Audit's severity words, so a target's static severity can break ties when two remotes are
+-- equally abusable dynamically.
+local RANK: { [string]: number } = { high = 3, medium = 2, low = 1 }
 
 -- The values that break handlers with nothing to go on. Ordered roughly by how often they find
 -- something: nil and the wrong type first, then the numeric edges, then the ones that only matter
@@ -2613,7 +2877,10 @@ function Exploit.FuzzAll(root: Instance, arity: number?): (string, number)
 	return `fired junk at {touched} remote(s):\n{table.concat(lines, "\n")}`, touched
 end
 
-export type Variant = { label: string, args: { any }, count: number }
+-- `suspicious` marks a variant the server *ought* to reject -- a wrong type, a missing argument,
+-- somebody else's Instance. The unchanged real call isn't suspicious, so it's the baseline that
+-- tells you the handler works at all before you read anything into what the broken ones did.
+export type Variant = { label: string, args: { any }, count: number, suspicious: boolean }
 
 local function copy(args: { any }, count: number): { any }
 	local out = table.create(count)
@@ -2684,7 +2951,8 @@ end
 function Exploit.Variants(args: { any }, count: number?): { Variant }
 	local width = count or #args
 	local instances = pool()
-	local variants: { Variant } = { { label = "unchanged", args = copy(args, width), count = width } }
+	local variants: { Variant } =
+		{ { label = "unchanged", args = copy(args, width), count = width, suspicious = false } }
 
 	for index = 1, width do
 		local original = args[index]
@@ -2692,51 +2960,191 @@ function Exploit.Variants(args: { any }, count: number?): { Variant }
 
 		local dropped = copy(args, width)
 		dropped[index] = nil
-		table.insert(variants, { label = `{label}: nil`, args = dropped, count = width })
+		table.insert(variants, { label = `{label}: nil`, args = dropped, count = width, suspicious = true })
 
 		for _, attack in attacks(original, instances) do
 			local changed = copy(args, width)
 			changed[index] = attack.value
-			table.insert(variants, { label = `{label}: {attack.label}`, args = changed, count = width })
+			table.insert(
+				variants,
+				{ label = `{label}: {attack.label}`, args = changed, count = width, suspicious = true }
+			)
 		end
 	end
 
-	table.insert(variants, { label = "no arguments at all", args = {}, count = 0 })
+	table.insert(variants, { label = "no arguments at all", args = {}, count = 0, suspicious = true })
 	if width > 0 then
 		local extra = copy(args, width)
 		extra[width + 1] = junk()
-		table.insert(variants, { label = "one extra argument", args = extra, count = width + 1 })
+		table.insert(variants, { label = "one extra argument", args = extra, count = width + 1, suspicious = true })
 	end
 
 	return variants
 end
 
-export type Attempt = { label: string, ok: boolean, detail: string }
+-- `verdict` is the reading, not the raw result. A handler that *throws* on a broken argument is
+-- doing its job; the leads are the broken ones it *accepted*. So:
+--   "rejected"  -- suspicious variant threw. Good. The check fired.
+--   "served"    -- RemoteFunction handed back a value for a variant it should have refused. This is
+--                  the confirmed one: you can see it did the wrong thing from the client alone.
+--   "accepted"  -- RemoteEvent took a variant with no complaint. Nothing comes back, so this is a
+--                  lead, not proof -- pair it with a server state read to see what it did.
+--   "baseline"  -- the unchanged real call. Context, not a finding.
+export type Attempt = { label: string, ok: boolean, detail: string, verdict: string }
 
--- Fires every variant once and says what came back. This is the tailored half: the arguments are
+local function verdictOf(variant: Variant, ok: boolean, answered: boolean): string
+	if not variant.suspicious then
+		return "baseline"
+	end
+	if not ok then
+		return "rejected"
+	end
+	return if answered then "served" else "accepted"
+end
+
+-- Fires every variant once and judges what came back. This is the tailored half: the arguments are
 -- the game's own, so the handler gets far enough in to be interesting.
---
--- A RemoteFunction answers directly -- an error is the handler throwing, and a returned value is
--- what it was willing to give you. A RemoteEvent gives the caller nothing at all, so the only way
--- to see what it did is the server's own logs and state, which a timeline collects anyway.
 function Exploit.Tailor(remote: Instance, args: { any }, count: number?): ({ Attempt }?, string?)
 	local problem = guard(remote)
 	if problem then
 		return nil, problem
 	end
 
-	local answers = remote:IsA("RemoteFunction")
+	local isFunction = remote:IsA("RemoteFunction")
 	local attempts: { Attempt } = {}
 	for _, variant in Exploit.Variants(args, count) do
 		local ok, produced = fire(remote, variant.args, variant.count)
+		local answered = isFunction and ok and produced ~= nil
 		local detail = if not ok
 			then tostring(produced)
-			elseif answers then `returned {Serialize.Render(produced)}`
+			elseif isFunction then `returned {Serialize.Render(produced)}`
 			else "sent"
-		table.insert(attempts, { label = variant.label, ok = ok, detail = detail })
+		table.insert(attempts, {
+			label = variant.label,
+			ok = ok,
+			detail = detail,
+			verdict = verdictOf(variant, ok, answered),
+		})
 		task.wait()
 	end
 	return attempts, nil
+end
+
+export type Verdict = {
+	remote: string,
+	abusable: boolean,
+	served: number,
+	accepted: number,
+	rejected: number,
+	attempts: { Attempt },
+}
+
+-- Tailor plus the one-line reading: is this remote abusable from the client, and how. "Abusable"
+-- means at least one variant the server should have refused went through -- served (proven) or
+-- accepted (lead). A remote that rejected everything suspicious is one that validates.
+function Exploit.Abuse(remote: Instance, args: { any }, count: number?): (Verdict?, string?)
+	local attempts, problem = Exploit.Tailor(remote, args, count)
+	if not attempts then
+		return nil, problem
+	end
+	local served, accepted, rejected = 0, 0, 0
+	for _, attempt in attempts do
+		if attempt.verdict == "served" then
+			served += 1
+		elseif attempt.verdict == "accepted" then
+			accepted += 1
+		elseif attempt.verdict == "rejected" then
+			rejected += 1
+		end
+	end
+	return {
+		remote = remote:GetFullName(),
+		abusable = served > 0 or accepted > 0,
+		served = served,
+		accepted = accepted,
+		rejected = rejected,
+		attempts = attempts,
+	},
+		nil
+end
+
+export type Target = { remote: string, args: { any }?, count: number?, severity: string?, kind: string? }
+
+-- The client end of the loop: take the harsh remotes Audit picked (crossed through ctx with their
+-- captured arguments), abuse each, and rank the ones that actually broke to the top. Served beats
+-- accepted beats nothing; Audit's severity breaks ties. This is the single call that turns "the
+-- code looks exploitable here" into "and from the client it is, like this".
+function Exploit.AbuseAll(targets: { Target }): string
+	if type(targets) ~= "table" or #targets == 0 then
+		return "no targets -- run Audit.Scan on the server first and cross Audit.Harsh (with each remote's captured args) through ctx"
+	end
+
+	type Row = { verdict: Verdict, target: Target }
+	local rows: { Row } = {}
+	local skipped: { string } = {}
+
+	for _, target in targets do
+		local resolved = Path.Resolve(target.remote)
+		if not resolved then
+			table.insert(skipped, `{target.remote}: not in this DataModel`)
+			continue
+		end
+		local args, count = Portable.RestoreArgs(target.args or {})
+		local verdict, problem = Exploit.Abuse(resolved, args, count)
+		if not verdict then
+			table.insert(skipped, `{target.remote}: {problem}`)
+			continue
+		end
+		table.insert(rows, { verdict = verdict, target = target })
+	end
+
+	local function score(row: Row): number
+		return row.verdict.served * 1000 + row.verdict.accepted * 10 + (RANK[row.target.severity or ""] or 0)
+	end
+	table.sort(rows, function(a, b)
+		return score(a) > score(b)
+	end)
+
+	local lines: { string } = {}
+	for _, row in rows do
+		local v = row.verdict
+		local tag = if v.served > 0
+			then "ABUSABLE (served)"
+			elseif v.accepted > 0 then "abusable (accepted, check state)"
+			else "held up"
+		local from = if row.target.kind then ` [{row.target.severity or "?"}: {row.target.kind}]` else ""
+		table.insert(
+			lines,
+			`  {tag}{from} {v.remote} -- {v.served} served, {v.accepted} accepted silently, {v.rejected} rejected`
+		)
+		for _, attempt in v.attempts do
+			if attempt.verdict == "served" or attempt.verdict == "accepted" then
+				table.insert(lines, `      {attempt.verdict}: {attempt.label} -> {attempt.detail}`)
+			end
+		end
+	end
+	for _, note in skipped do
+		table.insert(lines, `  skipped {note}`)
+	end
+
+	if #lines == 0 then
+		return "nothing to report"
+	end
+	return `abused {#rows} target(s), worst first:\n{table.concat(lines, "\n")}`
+end
+
+-- Fire one exact payload many times and count what stuck. The impact step: once a variant is known
+-- to go through (a huge grant amount, another player's part), hammer it and pair it with a server
+-- read before/after to turn "accepted" into "gave me 5,000,000 cash" or "deleted their base".
+function Exploit.Repeat(remote: Instance, args: { any }, count: number?, times: number?): (Report?, string?)
+	local problem = guard(remote)
+	if problem then
+		return nil, problem
+	end
+	local width = count or #args
+	return Bench.Run(function()
+		fire(remote, args, width)
+	end, { times = times or 200, perFrame = 20 }), nil
 end
 
 -- The whole loop in one call: shapes captured on the server (Remotes.Shapes, crossed through ctx),
@@ -2762,8 +3170,8 @@ function Exploit.FromTraffic(shapes: { any }): string
 
 		local interesting = {}
 		for _, attempt in attempts do
-			if not attempt.ok or string.find(attempt.detail, "returned", 1, true) then
-				table.insert(interesting, `    {attempt.label} -> {attempt.detail}`)
+			if attempt.verdict == "served" or attempt.verdict == "accepted" then
+				table.insert(interesting, `    {attempt.verdict}: {attempt.label} -> {attempt.detail}`)
 			end
 		end
 
@@ -2774,7 +3182,7 @@ function Exploit.FromTraffic(shapes: { any }): string
 		if #interesting > 0 then
 			table.insert(lines, table.concat(interesting, "\n"))
 		else
-			table.insert(lines, "    every variant was accepted silently -- check the server's state and logs")
+			table.insert(lines, "    every suspicious variant was rejected -- this one validates")
 		end
 	end
 
@@ -2787,7 +3195,7 @@ return Exploit
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="16">
+      <Item class="ModuleScript" referent="17">
         <Properties>
           <string name="Name">Remotes</string>
           <string name="Source"><![CDATA[--!strict
@@ -3024,7 +3432,7 @@ return Remotes
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="17">
+      <Item class="ModuleScript" referent="18">
         <Properties>
           <string name="Name">Rig</string>
           <string name="Source"><![CDATA[--!strict
@@ -3162,7 +3570,7 @@ return Rig
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="18">
+      <Item class="ModuleScript" referent="19">
         <Properties>
           <string name="Name">Style</string>
           <string name="Source"><![CDATA[--!strict
@@ -3239,11 +3647,11 @@ return Style
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="19">
+    <Item class="Folder" referent="20">
       <Properties>
         <string name="Name">Log</string>
       </Properties>
-      <Item class="ModuleScript" referent="20">
+      <Item class="ModuleScript" referent="21">
         <Properties>
           <string name="Name">Buffer</string>
           <string name="Source"><![CDATA[--!strict
@@ -3328,7 +3736,7 @@ return Buffer
         </Properties>
       </Item>
     </Item>
-    <Item class="ModuleScript" referent="21">
+    <Item class="ModuleScript" referent="22">
       <Properties>
         <string name="Name">Panel</string>
         <string name="Source"><![CDATA[--!strict
@@ -3696,7 +4104,7 @@ end
 return Panel
 ]]></string>
       </Properties>
-      <Item class="ModuleScript" referent="22">
+      <Item class="ModuleScript" referent="23">
         <Properties>
           <string name="Name">Style</string>
           <string name="Source"><![CDATA[--!strict
@@ -3983,7 +4391,7 @@ return Style
         </Properties>
       </Item>
     </Item>
-    <Item class="ModuleScript" referent="23">
+    <Item class="ModuleScript" referent="24">
       <Properties>
         <string name="Name">Path</string>
         <string name="Source"><![CDATA[--!strict
@@ -4024,11 +4432,11 @@ return Path
 ]]></string>
       </Properties>
     </Item>
-    <Item class="Folder" referent="24">
+    <Item class="Folder" referent="25">
       <Properties>
         <string name="Name">Playtest</string>
       </Properties>
-      <Item class="ModuleScript" referent="25">
+      <Item class="ModuleScript" referent="26">
         <Properties>
           <string name="Name">Session</string>
           <string name="Source"><![CDATA[--!strict
@@ -4105,11 +4513,11 @@ return Session
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="26">
+    <Item class="Folder" referent="27">
       <Properties>
         <string name="Name">Timeline</string>
       </Properties>
-      <Item class="ModuleScript" referent="27">
+      <Item class="ModuleScript" referent="28">
         <Properties>
           <string name="Name">Runtime</string>
           <string name="Source"><![CDATA[--!strict
@@ -4392,11 +4800,190 @@ return Runtime
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="28">
+    <Item class="Folder" referent="29">
       <Properties>
         <string name="Name">Tools</string>
       </Properties>
-      <Item class="ModuleScript" referent="29">
+      <Item class="ModuleScript" referent="30">
+        <Properties>
+          <string name="Name">ApplyBuild</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- One pass of the build loop in one call: run the code, measure what it made, say what's wrong,
+-- draw it. The code is the thing being iterated on -- it's the only description of the build that
+-- holds every part at once -- so everything this returns is meant to be read next to the source
+-- and turned into an edit to it.
+
+local Build = require(script.Parent.Parent.Lib.Build)
+local Path = require(script.Parent.Parent.Path)
+
+local BADGE_LIMIT = 40
+local MAX_PARTS = 1500
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+	postProcess: { [string]: any }?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "apply_build",
+	description = "Runs build code against a root, then checks the geometry and draws it -- one "
+		.. "call per pass of the write, check, fix loop. The code is the `return function(root)` "
+		.. "shape get_build produces, and it should hold the whole build: a build lives in its "
+		.. "source, not in a picture, so keep the full source and edit it between passes rather "
+		.. "than placing parts one call at a time. What comes back is numbers first -- bounds, "
+		.. "the extent of each top-level group, and a problem list with the depth and axis of "
+		.. "every overlap, gaps under floating parts, near-square rotations, duplicates and "
+		.. "strays -- then a legend and one blockout picture. Fix from the numbers; use the "
+		.. "picture for proportions and whether the layout reads.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			code = {
+				type = "string",
+				description = "Luau source ending in `return function(root) ... end`. `ensure(parent, "
+					.. "name, class)` inside it updates by name, so re-applying moves only what changed.",
+			},
+			root = {
+				type = "string",
+				description = 'Dotted path, like "Workspace.Arena". If the last segment is missing a '
+					.. "Model with that name is made under its parent. Defaults to Workspace.",
+			},
+			clear = {
+				type = "boolean",
+				description = "Destroy everything under the root before applying, so renamed or "
+					.. "removed parts don't linger. Off by default.",
+			},
+			views = {
+				type = "array",
+				description = "Angles to draw, tiled into one image. Defaults to iso. Named: iso, "
+					.. "corner, front, back, left, right, top, bottom; or { yaw, pitch, name } in degrees.",
+				items = { type = { "string", "object" } },
+				maxItems = 9,
+			},
+			size = {
+				type = "integer",
+				description = "Pixels per view. Defaults to 512.",
+				minimum = 128,
+				maximum = 1024,
+			},
+			name = {
+				type = "string",
+				description = "Image file name, letters digits underscore hyphen. Defaults to a timestamp.",
+			},
+			render = {
+				type = "boolean",
+				description = "Draw the picture. On by default; off saves the image when only the "
+					.. "numbers are needed.",
+			},
+			badges = {
+				type = "boolean",
+				description = `Number each part in the picture. On by default up to {BADGE_LIMIT} parts.`,
+			},
+		},
+		required = { "code" },
+	},
+	tags = { title = "Apply Build", destructive = true },
+	timeoutMs = 60000,
+}
+
+local function resolveOrCreate(path: string): (Instance?, string?)
+	local found, problem = Path.Resolve(path)
+	if found then
+		return found, nil
+	end
+	local parentPath, name = string.match(path, "^(.*)%.([^%.]+)$")
+	if not parentPath then
+		return nil, problem
+	end
+	local parent = Path.Resolve(parentPath :: string)
+	if not parent then
+		return nil, problem
+	end
+	local model = Instance.new("Model")
+	model.Name = name :: string
+	model.Parent = parent
+	return model, nil
+end
+
+function Tool.Run(arguments: {
+	code: string?,
+	root: string?,
+	clear: boolean?,
+	views: { any }?,
+	size: number?,
+	name: string?,
+	render: boolean?,
+	badges: boolean?,
+}): Result
+	local code = arguments.code
+	if type(code) ~= "string" or code == "" then
+		return { content = { { type = "text", text = "code must be a non-empty string" } }, isError = true }
+	end
+
+	local root: Instance = workspace
+	if type(arguments.root) == "string" and arguments.root ~= "" then
+		local found, problem = resolveOrCreate(arguments.root :: string)
+		if not found then
+			return { content = { { type = "text", text = problem :: string } }, isError = true }
+		end
+		root = found
+	end
+
+	if arguments.clear then
+		root:ClearAllChildren()
+	end
+
+	local ok, failure = Build.Apply(code, root)
+	local parts, instances, capped = Build.Geometry(root, MAX_PARTS)
+	local count = #instances
+
+	local lines = {}
+	if ok then
+		table.insert(lines, `applied: {#root:GetDescendants()} instance(s) under {root:GetFullName()}, {count} of them parts`)
+	else
+		-- The failure line comes first and the report still follows: whatever ran before the
+		-- error is in the place now, and knowing what that looks like is how you fix the code.
+		table.insert(lines, `error: {failure}`)
+		table.insert(lines, `{count} part(s) under {root:GetFullName()} after the partial run`)
+	end
+	if capped then
+		table.insert(lines, `stopped measuring at {count} parts -- there are more`)
+	end
+
+	if count == 0 then
+		table.insert(lines, "no parts to check or draw")
+		return { content = { { type = "text", text = table.concat(lines, "\n") } }, isError = not ok }
+	end
+
+	local badges = if arguments.badges ~= nil then arguments.badges else count <= BADGE_LIMIT
+	local render = arguments.render ~= false
+	table.insert(lines, Build.Report(root, instances, badges and render, Build.Problems(root, MAX_PARTS, instances)))
+
+	return {
+		content = { { type = "text", text = table.concat(lines, "\n") } },
+		isError = not ok,
+		postProcess = if render
+			then {
+				kind = "scene",
+				name = arguments.name,
+				size = arguments.size,
+				views = arguments.views or { "iso" },
+				badges = badges,
+				parts = parts,
+			}
+			else nil,
+	}
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="31">
         <Properties>
           <string name="Name">GetBuild</string>
           <string name="Source"><![CDATA[--!strict
@@ -4477,7 +5064,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="30">
+      <Item class="ModuleScript" referent="32">
         <Properties>
           <string name="Name">GetLogs</string>
           <string name="Source"><![CDATA[--!strict
@@ -4581,7 +5168,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="31">
+      <Item class="ModuleScript" referent="33">
         <Properties>
           <string name="Name">GetTree</string>
           <string name="Source"><![CDATA[--!strict
@@ -4715,7 +5302,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="32">
+      <Item class="ModuleScript" referent="34">
         <Properties>
           <string name="Name">Peer</string>
           <string name="Source"><![CDATA[--!strict
@@ -4772,7 +5359,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="33">
+      <Item class="ModuleScript" referent="35">
         <Properties>
           <string name="Name">Playtest</string>
           <string name="Source"><![CDATA[--!strict
@@ -4868,7 +5455,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="34">
+      <Item class="ModuleScript" referent="36">
         <Properties>
           <string name="Name">Print</string>
           <string name="Source"><![CDATA[--!strict
@@ -4967,7 +5554,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="35">
+      <Item class="ModuleScript" referent="37">
         <Properties>
           <string name="Name">RenderBuild</string>
           <string name="Source"><![CDATA[--!strict
@@ -5043,19 +5630,6 @@ Tool.Definition = {
 	timeoutMs = 60000,
 }
 
-local function shorten(part: Instance, root: Instance): string
-	local full = part:GetFullName()
-	local prefix = `{root:GetFullName()}.`
-	if string.sub(full, 1, #prefix) == prefix then
-		return string.sub(full, #prefix + 1)
-	end
-	return full
-end
-
-local function round(value: number): string
-	return string.format(if value % 1 == 0 then "%d" else "%.1f", value)
-end
-
 function Tool.Run(arguments: {
 	root: string?,
 	views: { any }?,
@@ -5088,35 +5662,13 @@ function Tool.Run(arguments: {
 	local views = arguments.views or { "iso" }
 	local badges = if arguments.badges ~= nil then arguments.badges else count <= BADGE_LIMIT
 	local note = if capped then `, stopped at {count} -- there are more` else ""
+	local problems = if arguments.problems ~= false then Build.Problems(root, arguments.maxParts, instances) else nil
 
-	local lines = { `{count} part(s) under {root:GetFullName()}, {#views} view(s){note}`, "" }
-
-	table.insert(lines, if badges then "legend (the number in the picture):" else "parts:")
-	for index, part in instances do
-		local size = part.Size
-		local at = part.Position
-		table.insert(
-			lines,
-			`  #{index} {shorten(part, root)}  {round(size.X)}x{round(size.Y)}x{round(size.Z)}`
-				.. ` at ({round(at.X)}, {round(at.Y)}, {round(at.Z)})`
-		)
-	end
-
-	if arguments.problems ~= false then
-		local found = Build.Problems(root, arguments.maxParts, instances)
-		table.insert(lines, "")
-		if #found == 0 then
-			table.insert(lines, "nothing looks wrong with the geometry")
-		else
-			table.insert(lines, `{#found} thing(s) worth a look:`)
-			for _, problem in found do
-				table.insert(lines, `  {shorten(problem.part, root)} -- {problem.kind}: {problem.detail}`)
-			end
-		end
-	end
+	local text = `{count} part(s) under {root:GetFullName()}, {#views} view(s){note}\n`
+		.. Build.Report(root, instances, badges, problems)
 
 	return {
-		content = { { type = "text", text = table.concat(lines, "\n") } },
+		content = { { type = "text", text = text } },
 		postProcess = {
 			kind = "scene",
 			name = arguments.name,
@@ -5132,7 +5684,66 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="36">
+      <Item class="ModuleScript" referent="38">
+        <Properties>
+          <string name="Name">ReviewRemotes</string>
+          <string name="Source"><![CDATA[--!strict
+
+local Audit = require(script.Parent.Parent.Lib.Audit)
+local Path = require(script.Parent.Parent.Path)
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "review_remotes",
+	description = "Hands you the code to security-review the game's remotes. Finds every "
+		.. "RemoteEvent/RemoteFunction and the server scripts that handle them, traces which "
+		.. "remote each handler serves, and returns those scripts' full source -- so you read "
+		.. "the real handlers, not a summary. Review each for exploitable holes (missing type or "
+		.. "ownership or range checks, client-authoritative currency/damage, no rate limit, "
+		.. "loadstring, client-steered DataStore writes), then abuse the ones you flag from a "
+		.. "client with run_timeline + vmcp.Exploit.AbuseAll. Reads Studio's current source, so "
+		.. "run it against the edit session or a live server, not a real client.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			root = {
+				type = "string",
+				description = 'Dotted path to scan under, like "ServerScriptService". Defaults to '
+					.. "game. Narrow it when the game is large and you know where the remotes live.",
+			},
+		},
+	},
+	tags = { title = "Review Remotes", readOnly = true, idempotent = true },
+}
+
+function Tool.Run(arguments: { root: string? }): Result
+	local root: Instance? = nil
+	if arguments.root then
+		local found, problem = Path.Resolve(arguments.root)
+		if not found then
+			return { content = { { type = "text", text = problem :: string } }, isError = true }
+		end
+		root = found
+	end
+
+	local surface = Audit.Surface(root)
+	if #surface.handlers == 0 and #surface.remotes == 0 then
+		return { content = { { type = "text", text = "no remotes found under that root" } } }
+	end
+	return { content = { { type = "text", text = Audit.Render(surface) } } }
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="39">
         <Properties>
           <string name="Name">RunLuau</string>
           <string name="Source"><![CDATA[--!strict
@@ -5265,7 +5876,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="37">
+      <Item class="ModuleScript" referent="40">
         <Properties>
           <string name="Name">RunTimeline</string>
           <string name="Source"><![CDATA[--!strict
@@ -5295,7 +5906,7 @@ Tool.Definition = {
 		.. 'anywhere else, or ctx:Await("thing", 2) to wait for it rather than hope. Every event '
 		.. "also gets vmcp: vmcp.Tool calls any other VMCP tool in any context, vmcp.Game.Require "
 		.. "reads a live module's real state, vmcp.Remotes watches remote traffic, vmcp.Exploit "
-		.. "replays the game's own remote traffic with its arguments broken, vmcp.Bench times a "
+		.. "replays the game's own remote traffic with its arguments broken and abuses remotes you flag, vmcp.Bench times a "
 		.. "function under load. Client events also "
 		.. "get input, for real keys and clicks. Starts its own playtest if one isn't already open.",
 	inputSchema = {
@@ -5597,7 +6208,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="38">
+      <Item class="ModuleScript" referent="41">
         <Properties>
           <string name="Name">SearchScripts</string>
           <string name="Source"><![CDATA[--!strict
@@ -5828,7 +6439,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="39">
+      <Item class="ModuleScript" referent="42">
         <Properties>
           <string name="Name">TimelinePart</string>
           <string name="Source"><![CDATA[--!strict
