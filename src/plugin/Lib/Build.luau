@@ -719,7 +719,7 @@ function Build.Report(
 	if problems then
 		table.insert(lines, "")
 		if #problems == 0 then
-			table.insert(lines, "nothing looks wrong with the geometry")
+			table.insert(lines, "no problems found")
 		else
 			table.insert(lines, `{#problems} thing(s) worth a look:`)
 			for _, problem in problems do

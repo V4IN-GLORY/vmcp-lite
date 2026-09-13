@@ -11,6 +11,31 @@ local Path = require(script.Parent.Parent.Path)
 local BADGE_LIMIT = 40
 local MAX_PARTS = 1500
 
+-- Problem lines from the last apply, per root. Intentional ones (rubble sunk into the ground)
+-- would otherwise be printed again on every pass for the rest of the build.
+local remembered: { [Instance]: { [string]: boolean } } = setmetatable({}, { __mode = "k" }) :: any
+
+local function newProblems(root: Instance, problems: { Build.Problem }): ({ Build.Problem }, number, number)
+	local seen: { [string]: boolean } = remembered[root] or {}
+	local current: { [string]: boolean } = {}
+	local fresh = {}
+	for _, problem in problems do
+		local key = `{problem.part:GetFullName()} -- {problem.kind}: {problem.detail}`
+		current[key] = true
+		if not seen[key] then
+			table.insert(fresh, problem)
+		end
+	end
+	local resolved = 0
+	for key in seen do
+		if not current[key] then
+			resolved += 1
+		end
+	end
+	remembered[root] = current
+	return fresh, #problems - #fresh, resolved
+end
+
 type Result = {
 	content: { { type: "text", text: string } },
 	isError: boolean?,
@@ -172,15 +197,14 @@ function Tool.Run(arguments: {
 		shownCount += 1
 	end
 	local badges = if arguments.badges ~= nil then arguments.badges else shownCount <= BADGE_LIMIT
-	table.insert(
-		lines,
-		Build.Report(
-			root,
-			instances,
-			if badges and render then shown else nil,
-			Build.Problems(root, MAX_PARTS, instances)
-		)
-	)
+	local problems, unchanged, resolved = newProblems(root, Build.Problems(root, MAX_PARTS, instances))
+	table.insert(lines, Build.Report(root, instances, if badges and render then shown else nil, problems))
+	if unchanged > 0 then
+		table.insert(lines, `{unchanged} from the last apply still there, not repeated`)
+	end
+	if resolved > 0 then
+		table.insert(lines, `{resolved} from the last apply gone`)
+	end
 	for _, problem in missing do
 		table.insert(lines, `view target not found, drawing the whole build instead: {problem}`)
 	end

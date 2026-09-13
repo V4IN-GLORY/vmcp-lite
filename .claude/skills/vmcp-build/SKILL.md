@@ -583,6 +583,11 @@ legend: #1 Shell.Floor 40x1x30 at (0, -0.5, 0) ...
 <the picture>
 ```
 
+`apply_build` only lists problems that are new since the last apply of that root, then says how
+many earlier ones are still there and how many went away. A line you've already judged intentional
+doesn't come back; a line that reappears means the number changed. `render_build` always lists
+everything.
+
 **Bounds and groups** are the build's 3D identity — a `Props` group at `y 2..6` on a floor whose
 top is 0 is two studs high, no picture needed. **Problems** carry the number to fix with:
 
