@@ -124,9 +124,12 @@ Each pass, exactly:
    pulls a role from `P`.
 2. `apply_build`. Read the report. Every new problem line is either fixed or written down as
    intentional with the reason (rubble sits 20–30% in the ground on purpose).
-3. `render_build` narrowed to that group — one call, several panels, never a single view.
-   Pick the 2–4 spots in the group that matter (each opening, each join to a neighbour, the
-   top edge, the far side) and give each spot at least two angles that don't share an axis:
+3. `render_build` narrowed to that group — several panels, never a single view, and the
+   panels together cover **100% of the group**. List the group's spots before you render:
+   every opening, every join to a neighbouring group, every face of the group (front, back,
+   both sides, top, underside if a player can see it), every corner. Every spot gets at least
+   two angles that don't share an axis. A 9-panel sheet is the cap per call, so a big group
+   is two or three calls, not fewer spots:
    ```
    render_build { root = "Workspace.Chapel.Shell", views = [
      "front",                                                                  -- the whole group, proportions
@@ -139,7 +142,9 @@ Each pass, exactly:
    ```
    A facade from `front` only can't show a slab floating off the wall top; the same spot from a
    quarter angle and a low angle can. Narrow `root` is the main lever — 40 parts with badges
-   tells you more than 1500 without.
+   tells you more than 1500 without. Before moving on, write the coverage line: "Shell: door
+   (2 angles), 4 windows (2 each), roof (top + 2 low), all 4 faces, back corner — nothing
+   unseen". If you can name a part of the group no panel showed, render it.
 4. Write down what the picture shows that's wrong, in words: "door leaf is half the opening
    width", "gap between roof slab 2 and 3", "stairs stop 2 studs short of the ledge".
 5. For each, find the derivation that produced it — nearly always a typed number that should
@@ -168,9 +173,10 @@ render_build { root = <whole build>, size = 768, views = [
 ] }
 ```
 
-Then a second call of targeted panels, `clip = true`, one per place two groups meet: roof on
-wall, porch on facade, stair on ledge, props against walls, tower on nave. Aim `at` the join,
-`radius` a few studs.
+Then targeted panels, `clip = true`, one per place two groups meet: roof on wall, porch on
+facade, stair on ledge, props against walls, tower on nave. Aim `at` the join, `radius` a few
+studs, two angles each. As many calls as it takes — the sweep is done when every face of every
+group and every join has been in at least two panels, and you've written that coverage line.
 
 **4b. The cutaway.** The renderer draws transparency as alpha, so give the source an
 `INSPECT` flag that sets the roof group and one long wall to `Transparency = 0.75` when true.
