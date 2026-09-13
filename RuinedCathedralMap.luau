@@ -106,7 +106,7 @@ end
 local function pointedArch(parent: Instance, name: string, frame: CFrame, span: number, depth: number, thick: number, n: number, role, maxY: number?)
 	local r = span
 	local step = (math.pi / 3) / n                           -- each arc runs from its foot (180) to the apex (120)
-	local seg = 2 * r * math.sin(step / 2) + PROUD
+	local seg = 2 * r * math.sin(step / 2) + thick * math.tan(step / 2) + 0.1   -- chord + the V-notch the outer edge opens between neighbours
 	local limit = maxY or math.huge
 	local rad = r + thick / 2                                -- ring sits outside the curve; the opening is the full pointed arch
 	local size = Vector3.new(thick, seg, depth)
@@ -188,9 +188,9 @@ local function bayWall(parent: Instance, name: string, frame: CFrame, bayLen: nu
 			end
 			if o.impost then
 				imposts[i - 1] = imposts[i - 1] or {}
-				imposts[i - 1].right, imposts[i - 1].y = lo + 0.3, spring
+				imposts[i - 1].right, imposts[i - 1].y = lo + 0.12, spring
 				imposts[i] = imposts[i] or {}
-				imposts[i].left, imposts[i].y = hi - 0.3, spring
+				imposts[i].left, imposts[i].y = hi - 0.12, spring
 			end
 			y = o.sill + h
 		end

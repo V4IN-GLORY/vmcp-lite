@@ -375,10 +375,10 @@ local function arch(parent, name, frame, span, rise, depth, thick, n)
 	local cy = rise - r                                                -- arc centre sits below the springing line
 	local a0 = math.acos((span / 2) / r)                               -- angle at the right foot
 	local step = (math.pi - 2 * a0) / n
-	local seg = 2 * r * math.sin(step / 2) + PROUD                     -- chord length, plus overlap
+	local seg = 2 * r * math.sin(step / 2) + thick * math.tan(step / 2) + 0.1   -- chord + the V-notch the outer edge opens, + a hair
 	for i = 1, n do
 		local a = a0 + (i - 0.5) * step
-		local cf = frame * CFrame.new(0, cy, 0) * CFrame.Angles(0, 0, a) * CFrame.new(r - thick / 2, 0, 0)
+		local cf = frame * CFrame.new(0, cy, 0) * CFrame.Angles(0, 0, a) * CFrame.new(r + thick / 2, 0, 0)   -- ring OUTSIDE the curve
 		box(parent, `{name}{i}`, Vector3.new(thick, seg, depth), cf, P.trim)
 	end
 end
@@ -388,6 +388,35 @@ end
 opening; the wall fill above them (a box from the apex to the wall top plus a box each side
 from the springing line up) is rectangular and tucks `PROUD` behind the arch's back face so
 the curve is what you see. A keystone is one voussoir made taller and `PROUD` prouder.
+
+Three things the ring gets wrong, in order of how often:
+
+- **Which side of the curve the ring is on.** `r` is the *opening*. The ring's centreline is
+  `r + thick/2`, outside it. Put it at `r - thick/2` and the opening shrinks by `thick` while
+  every dependent piece (spandrel slabs, glass head slabs, imposts) is still computed for the
+  full arch — the corners between ring and fill are open sky. Compute `r`, `thick` and the outer
+  radius `r + thick` once and hand them down; nothing re-derives them.
+- **Overlap is not `PROUD`.** Two rotated boxes meeting on the curve open a V-notch on the outer
+  edge `thick * tan(step/2)` wide per side. `PROUD` (0.2) covers it only for `step ≤ ~6°`. With
+  4–5 voussoirs per side (`step` 12–15°) and a 2-stud ring the notch is 0.4–0.5 studs: from inside
+  the building every segment end sticks out as a dark sliver over the recessed spandrel. Overlap
+  = `thick * tan(step/2) + 0.1`, always. The inner corners then bite into the opening by
+  `sqrt(r² + (seg/2)²) - r`; keep that under 0.15 by adding voussoirs, not by shrinking overlap.
+- **Pointed arcs centre on the opposite foot** and sweep 120°–180°. The apex is `r·sin(60°)`
+  above the springing line; print that against the measured apex the first time and never
+  trust the eye for it (an arc centred on its own foot rises *above* the foot and reads as a
+  horseshoe).
+
+A proud member shows every one of its corners. A rotated proud part therefore has to be small,
+or have its corners inside the silhouette of an un-proud neighbour. Check one arch from *inside*
+and at a quarter angle, not just front-on: front-on hides both the notches and the gap.
+
+**Imposts, capitals, string courses: projection is small.** A capital that overhangs the pier by
+more than ~0.15 of the pier's width, or a band deeper than `PROUD` past the wall face, reads as a
+shelf bolted on, not stone. Impost: `PROUD` proud of each face, 0.1–0.15 into the opening, 0.5–0.7
+tall; never longer than the pier plus that. String courses the same depth as the ring so the two
+read as one system. If a band has to run across an opening's ring, stop it `0.1` short of the ring
+instead of crossing it.
 
 **No gaps.** A wall is continuous from floor to roof and from corner to corner. A roof closes.
 The rule that makes this true by construction:
@@ -480,6 +509,65 @@ found. Give the ground a `Grounds` group: shallow earth banks against the walls 
 (bedded 1-stud boxes, a few degrees of yaw), moss tufts clustered at the wall feet, stones shed
 from the walls within a few studs of them, a dressed block or two lying where a parapet fell.
 Twenty to forty parts, seeded, never a grid.
+
+**Material variety is by role, not by part.** One wall material over a 60-stud nave is a
+blockout with a texture. Vary at three levels and stop there:
+
+- *Two or three wall variants*, assigned per structural class: piers and quoins in the dressed
+  variant (Limestone, lighter), infill panels in the rubble variant (Cobblestone or Slate, 8–12
+  RGB darker), plinth in the darkest. The eye reads the construction — dressed stone where the
+  load is — before it reads the texture.
+- *Per-part colour jitter of ±4–6 RGB* on the infill role only (seeded, from `rng`), never on
+  trim, never on anything with a straight run (bands, copings, floor slabs) — those show the
+  seam.
+- *Replaced stones*: 2–4 boxes per wall panel in a contrasting variant, flush with the panel
+  minus `R`, named, seeded. Reads as repair and weathering. Not on piers.
+
+Wood gets two shades (structural dark, furniture 15 RGB lighter); iron one; floor slabs 2 tones
+alternating by `(ix + iz) % 2` with a 0.02 height stagger so no two share a plane.
+
+**Accent pieces are a fixed vocabulary, placed by rule.** Add from this list, in this order,
+until the walls stop looking like slabs — then stop:
+
+1. Plinth band around every exterior wall (proud `PROUD`, 2–2.5 tall, darkest variant).
+2. Pier bases (one slab 0.4 tall, 0.2 wider each side) and caps (impost, above). Every pier.
+3. Quoins on every external corner: alternating long/short trim boxes, `PROUD` proud, 1.2 tall.
+4. String course at the springing line on the outside, at the aisle-eave line inside.
+5. Corbels under every wall plate and under any beam that meets a wall: 0.5 cube, trim, `PROUD`
+   under the plate, one per rafter.
+6. Coping on every wall top that's exposed: 0.4 tall, `PROUD` each side, ruin-broken where the
+   top is broken.
+7. Iron only where iron does a job: hinges and a strap on doors, a bracket under every lantern,
+   tie bars across the nave at the wall plate (0.15 posts) — 3–6 pieces per building total.
+
+Each of these is a helper called from the wall data, not hand-placed. Anything not on the list
+(shields, statues, gargoyles) is a prop and is capped at three per building.
+
+**Debug flags print in QA.** `INSPECT`, `SCALE_REF`, and any cutaway or transparency toggle must
+default `false` in the file and be printed on the QA line (`flags INSPECT=false SCALE_REF=false`).
+A stale flag then shows up in Output, not in the user's screenshot.
+
+**Ruin comes from one table.** Wall tops per bay, which roof runs survive, which rafters, which
+windows keep glass: all read from one `ruin` table keyed by bay. Never hand-place a broken edge.
+Jitter the broken ends of paired planes (the two roof slopes, the two aisle walls) by ±1 so they
+don't stop on one line.
+
+**Floating and buried props.** Small props go on with `placeOn` and `size.Y = 0` (they sit, not
+hover). Pews, seats, chests overlap their feet 0.05 into the floor rather than sitting on it
+exactly. Nothing is placed by typing a Y.
+
+**Coplanar offenders, by class.** These pairs came back coplanar on every build until the offset
+was designed in; put the offset in the helper, not the fix: sill band vs recessed fill (band is
+proud, fill is recessed R); gable courses vs coping; glass vs mullion vs transom (stack depths
+0.05 apart); lantern post vs cap; path slabs (each its own top plane, 0.02 stagger); shaft bases
+on plinths; pilasters on tombs; pier caps vs impost band. The mechanical check (E = 0.02, key
+`pos, size, XVector` for duplicates) is the gate; a render is not.
+
+**When targeted render panels are ignored** (`at`/`radius`/`clip`/`view` have no effect, every
+panel is the whole build), the VMCP server is stale — an old process owns the plugin. Don't spend
+turns tuning panel params. Workaround: `run_luau` clones every part within `radius` of the point
+into `Workspace.ClipX.Parts`, render that root, destroy `ClipX` after. Tell the user the server
+needs a restart.
 
 **Placing props on things.** A candle hanging half off the back edge of the altar, a lantern
 in mid-air beside the table, a book sunk into the shelf — all the same bug: the prop's position
