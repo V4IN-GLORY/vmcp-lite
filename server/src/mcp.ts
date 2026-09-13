@@ -105,7 +105,7 @@ async function callLocal(
 	}
 
 	try {
-		const result = withRevisionNotice(settle(await target.call(exposed.tool.name, args, onProgress)), session);
+		const result = withRevisionNotice(await settle(await target.call(exposed.tool.name, args, onProgress)), session);
 		// Only a real reply is cached — a timeout is exactly what's worth retrying.
 		if (cacheKey) retries.set(cacheKey, result);
 		return result;

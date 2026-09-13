@@ -122,7 +122,7 @@ function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegist
 				replyError(socket, msg, VmcpErrorCode.InvalidParams, "post/process needs a directive");
 				return;
 			}
-			replyOk(socket, msg, { outcome: runPostProcess(directive) });
+			void runPostProcess(directive).then((outcome) => replyOk(socket, msg, { outcome }));
 			return;
 		}
 
@@ -364,7 +364,7 @@ async function invokeTool(
 	try {
 		// Through the same finishing pass as a direct MCP call, so a snippet that draws a Canvas
 		// gets the PNG written whichever side asked for the tool.
-		const result = settle(await target.call(params.name, { ...args, __depth: depth + 1 }));
+		const result = await settle(await target.call(params.name, { ...args, __depth: depth + 1 }));
 		replyOk(socket, msg, { result });
 	} catch (err) {
 		replyError(socket, msg, VmcpErrorCode.InternalError, (err as Error).message);

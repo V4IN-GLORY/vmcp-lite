@@ -3,7 +3,8 @@ import { join, resolve } from "node:path";
 import { config, log } from "./config.js";
 import type { ToolResult, ToolResultContent } from "./protocol.js";
 import { encodePng, rasterize, type Recording } from "./image.js";
-import { renderScene, type Scene } from "./scene.js";
+import { materialsOf, renderScene, type Scene } from "./scene.js";
+import { loadMaterials } from "./materials.js";
 
 /**
  * The one place the relay acts on a result instead of passing it along.
@@ -42,16 +43,19 @@ interface Outcome {
 }
 
 /** Writes the image and returns a line to append to the tool's own output, plus the bytes. */
-function finish(directive: Directive): Outcome {
+async function finish(directive: Directive): Promise<Outcome> {
 	if (directive.kind !== "png" && directive.kind !== "scene") {
 		return { text: `[vmcp doesn't know how to finish a "${String(directive.kind)}" job]` };
 	}
 
 	try {
-		const surface =
-			directive.kind === "scene"
-				? renderScene(directive as unknown as Scene)
-				: rasterize(directive as unknown as Recording);
+		let surface;
+		if (directive.kind === "scene") {
+			const scene = directive as unknown as Scene;
+			surface = renderScene(scene, await loadMaterials(materialsOf(scene)));
+		} else {
+			surface = rasterize(directive as unknown as Recording);
+		}
 		const path = pngPath(directive);
 		const png = encodePng(surface);
 		writeFileSync(path, png);
@@ -63,8 +67,8 @@ function finish(directive: Directive): Outcome {
 }
 
 /** Returns a line to append to the tool's own output. */
-export function runPostProcess(directive: Directive): string {
-	return finish(directive).text;
+export async function runPostProcess(directive: Directive): Promise<string> {
+	return (await finish(directive)).text;
 }
 
 /**
@@ -76,11 +80,11 @@ export function runPostProcess(directive: Directive): string {
  * in the same reply as the numbers it goes with -- a second call to open the file is a turn spent,
  * and worse, a picture read on its own is a picture read without the legend.
  */
-export function settle(result: ToolResult): ToolResult {
+export async function settle(result: ToolResult): Promise<ToolResult> {
 	const { postProcess, ...rest } = result;
 	if (!postProcess) return result;
 
-	const outcome = finish(postProcess);
+	const outcome = await finish(postProcess);
 	const content: ToolResultContent[] = [...rest.content, { type: "text", text: outcome.text }];
 	if (outcome.png && outcome.png.length <= INLINE_LIMIT) {
 		content.push({ type: "image", data: outcome.png.toString("base64"), mimeType: "image/png" });

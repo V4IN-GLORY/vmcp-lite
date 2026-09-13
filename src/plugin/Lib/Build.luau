@@ -340,6 +340,7 @@ local function describe(part: BasePart, index: number): { [string]: any }
 
 	local size = part.Size
 	local color = part.Color
+	local material = part.Material
 	return {
 		i = index,
 		n = part.Name,
@@ -348,6 +349,7 @@ local function describe(part: BasePart, index: number): { [string]: any }
 		d = { round(size.X), round(size.Y), round(size.Z) },
 		c = { round(color.R), round(color.G), round(color.B) },
 		t = if part.Transparency > 0 then round(part.Transparency) else nil,
+		k = if material == Enum.Material.Plastic or material == Enum.Material.SmoothPlastic then nil else material.Name,
 	}
 end
 

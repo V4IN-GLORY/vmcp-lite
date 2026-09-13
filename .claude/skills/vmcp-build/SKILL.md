@@ -268,6 +268,10 @@ itself — no camera, no playtest, no screenshot, and it works with Studio minim
 - **Real shapes** for box, ball, cylinder and wedge — the wedge is modelled as Roblox's (tall face
   at -Z), so a wedge that looks backwards in the picture *is* backwards. Meshes and unions draw as
   their bounding box. Transparency draws as alpha. Lights, decals, beams and particles don't draw.
+- **Roblox's real material colormaps**, tinted by the part colour like the engine does, so brick
+  reads as brick and planks as planks. Fetched once per material from the MaximumADHD/Roblox-Materials
+  mirror into `~/.vmcp/materials/`; a material it doesn't have (Cardboard, Neon, ForceField...)
+  draws flat in the part colour. Plastic is always flat.
 - **A badge number on each part** matching the legend line the tool printed, so anything you can
   see you can grep for by name. Badges go off above 40 parts unless forced with `badges = true`.
 - **Views**: `iso` (default), `corner`, `front`, `back`, `left`, `right`, `top`, `bottom`, or

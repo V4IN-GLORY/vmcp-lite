@@ -1,4 +1,5 @@
 import { Surface } from "./image.js";
+import { STUDS_PER_TILE, type Texture } from "./materials.js";
 
 /**
  * Draws a build as a picture, outside Roblox.
@@ -28,6 +29,8 @@ export interface ScenePart {
 	c: number[];
 	/** Transparency, 0-1. */
 	t?: number;
+	/** Material name, when it isn't plastic. Drawn with Roblox's own colormap, see materials.ts. */
+	k?: string;
 	/** The number drawn on it, matching the legend the tool printed. */
 	i?: number;
 }
@@ -288,8 +291,21 @@ interface Panel {
 	size: number;
 }
 
-function tri(panel: Panel, a: V3, b: V3, c: V3, r: number, g: number, bl: number, alpha: number, solid: boolean): void {
+interface Paint {
+	r: number;
+	g: number;
+	b: number;
+	alpha: number;
+	/** Set together: the colormap and each corner's tile coordinates, in a, b, c order. */
+	texture?: Texture;
+	uv?: [V3, V3, V3];
+}
+
+// Orthographic, so screen-linear interpolation of the tile coordinates is exact -- no perspective
+// correction needed.
+function tri(panel: Panel, a: V3, b: V3, c: V3, paint: Paint, solid: boolean): void {
 	const { surface, depth, size } = panel;
+	const { r, g, b: bl, alpha, texture, uv } = paint;
 	const minX = Math.max(0, Math.floor(Math.min(a[0], b[0], c[0])));
 	const maxX = Math.min(size - 1, Math.ceil(Math.max(a[0], b[0], c[0])));
 	const minY = Math.max(0, Math.floor(Math.min(a[1], b[1], c[1])));
@@ -310,7 +326,18 @@ function tri(panel: Panel, a: V3, b: V3, c: V3, r: number, g: number, bl: number
 			const at = y * size + x;
 			if (z >= (depth[at] ?? Infinity)) continue;
 			if (solid) depth[at] = z;
-			surface.blend(x, y, r, g, bl, alpha);
+			if (!texture || !uv) {
+				surface.blend(x, y, r, g, bl, alpha);
+				continue;
+			}
+			const [ua, ub, uc] = uv;
+			const u = ua[0] + w1 * (ub[0] - ua[0]) + w0 * (uc[0] - ua[0]);
+			const v = ua[1] + w1 * (ub[1] - ua[1]) + w0 * (uc[1] - ua[1]);
+			const tx = ((Math.floor(u * texture.size) % texture.size) + texture.size) % texture.size;
+			const ty = ((Math.floor(v * texture.size) % texture.size) + texture.size) % texture.size;
+			const texel = (ty * texture.size + tx) * 3;
+			const trgb = texture.rgb;
+			surface.blend(x, y, r * (trgb[texel] as number), g * (trgb[texel + 1] as number), bl * (trgb[texel + 2] as number), alpha);
 		}
 	}
 }
@@ -385,6 +412,15 @@ function fitScale(parts: ScenePart[], cameras: Camera[], bounds: Bounds, size: n
 	return (size * (1 - MARGIN * 2)) / (widest * 2);
 }
 
+// Tile coordinates for a face: the two local axes the face doesn't point along, in studs per
+// tile. Planar per face, which is what the engine does for parts too.
+function tileCoords(face: Face): V3[] {
+	const [nx, ny, nz] = face.normal.map(Math.abs) as V3;
+	const axisU = nx >= ny && nx >= nz ? 1 : 0;
+	const axisV = nz >= nx && nz >= ny ? 1 : 2;
+	return face.verts.map((v) => [v[axisU] / STUDS_PER_TILE, v[axisV] / STUDS_PER_TILE, 0]);
+}
+
 function renderPanel(
 	parts: ScenePart[],
 	camera: Camera,
@@ -392,6 +428,7 @@ function renderPanel(
 	size: number,
 	scale: number,
 	badges: boolean,
+	textures: Map<string, Texture>,
 ): Panel {
 	const surface = new Surface(size, size);
 	const depth = new Float32Array(size * size).fill(Infinity);
@@ -430,6 +467,7 @@ function renderPanel(
 		const spin = rotater(part.m);
 		const [cr = 0.6, cg = 0.6, cb = 0.6] = part.c;
 		const alpha = 1 - (typeof part.t === "number" ? part.t : 0);
+		const texture = part.k ? textures.get(part.k) : undefined;
 
 		for (const face of solid.faces) {
 			const normal = spin(face.normal);
@@ -441,8 +479,14 @@ function renderPanel(
 			const b = cb * shade * 255;
 
 			const screen = face.verts.map((v) => project(place(v)));
+			const tiles = texture ? tileCoords(face) : undefined;
 			for (let i = 1; i + 1 < screen.length; i++) {
-				tri(panel, screen[0] as V3, screen[i] as V3, screen[i + 1] as V3, r, g, b, alpha, writeDepth);
+				const paint: Paint = { r, g, b, alpha };
+				if (texture && tiles) {
+					paint.texture = texture;
+					paint.uv = [tiles[0] as V3, tiles[i] as V3, tiles[i + 1] as V3];
+				}
+				tri(panel, screen[0] as V3, screen[i] as V3, screen[i + 1] as V3, paint, writeDepth);
 			}
 		}
 
@@ -594,8 +638,14 @@ function viewsOf(raw: unknown[] | undefined): View[] {
 	return out.length > 0 ? out : [{ name: "iso", yaw: 45, pitch: 30, clip: false }];
 }
 
+/** Every material the scene names, so the caller can load them before drawing. */
+export function materialsOf(scene: Scene): string[] {
+	const parts = Array.isArray(scene.parts) ? scene.parts : [];
+	return parts.map((part) => part.k).filter((name): name is string => typeof name === "string");
+}
+
 /** Renders every requested view into one image, tiled. */
-export function renderScene(scene: Scene): Surface {
+export function renderScene(scene: Scene, textures: Map<string, Texture> = new Map()): Surface {
 	const parts = Array.isArray(scene.parts) ? scene.parts.filter((part) => Array.isArray(part.m)) : [];
 	const views = viewsOf(scene.views);
 	const columns = Math.ceil(Math.sqrt(views.length));
@@ -621,7 +671,15 @@ export function renderScene(scene: Scene): Surface {
 					return Math.hypot(v[0], v[1], v[2]) <= (view.radius as number);
 				})
 			: parts;
-		const panel = renderPanel(shown, cameras[index] as Camera, center, panelSize, viewScale, scene.badges === true);
+		const panel = renderPanel(
+			shown,
+			cameras[index] as Camera,
+			center,
+			panelSize,
+			viewScale,
+			scene.badges === true,
+			textures,
+		);
 		const left = (index % columns) * panelSize;
 		const top = Math.floor(index / columns) * panelSize;
 
