@@ -18,133 +18,166 @@ Lighting anyway. Only exception: the user names Lighting and asks. Lights, beams
 
 ## The pipeline
 
+Four phases, in order, no skipping. Each one says exactly what to do, what to check, and what
+to write down before moving on. "Write down" means a line in your reply, so the user can see
+the pass happened.
+
 ```
-1. DESIGN      think on paper: shape, structure, palette — before any code
-2. BLOCKOUT    whole build, rough sizes, no detail  -> apply_build -> numbers clean, iso reads
-3. DETAIL      one group per pass                   -> apply_build -> render_build aimed at that group
-               look, say what's off in words, edit the derivation, re-apply. Repeat until it reads.
-4. INSPECT     multi-view sweep of the finished build for occlusion, scale, and orientation bugs
+1. DESIGN    write the design block (masses, structure, access, palette+placement, variety)
+2. BLOCKOUT  apply_build the masses  -> bounds match, problems empty, iso silhouette matches
+3. DETAIL    per group: apply_build -> render_build aimed at the group -> say what's off -> fix -> re-render
+4. INSPECT   photo sweep + cutaway + access walk of the whole build against the checklist
 ```
 
-Every apply and render ends the same way: read the report, look at the picture, write one or two
-lines of what you saw ("roof slabs sit on the wall tops but the gable is open at the apex",
-"trees are identical copies"). A pass where you didn't open the picture and say what it showed
-was done blind. The picture and the numbers drive the next edit together; never read a
+Every `apply_build` / `render_build` ends the same way: read the numbers, look at the picture,
+write one or two lines of what it showed. A pass without that line was done blind. Never read a
 coordinate off the picture — the legend has it.
 
-### 1. Design — think before the first line
+**Accessibility is a requirement, not a nicety.** Unless the user says a space is sealed (a
+crypt, a decorative tower, a ruin with a collapsed stair), every interior space a player could
+see must be reachable on foot from outside and from every other interior space: a door or
+opening in a wall, a stair or ramp between levels, a gap wide enough to walk through. This is
+designed in phase 1, derived in the source, and verified in phase 4.
 
-Spend real effort here; it's the cheapest place to be wrong. Write the answers down as the comment
-block at the top of the source, then build to them.
+### 1. Design — write it before the first line of geometry
 
-**Shape.** What's the silhouette from 30 studs away? Name the three or four masses that make it
-(nave + tower + porch; hull + deck + mast) and their rough proportions to each other. What
-reads from the front, what from above? A build that's one box with things stuck on reads as a
-box with things stuck on.
+Output: a comment block at the top of the source, in this order. Build to it; if the build
+drifts from it, either fix the build or update the block, never leave them disagreeing.
 
-**Structure.** How does it stand up? Walls carry a roof, piers carry an arch, a beam spans an
-opening. Decide the load path and let it dictate sizes: a lintel is deeper than the wall is
-thick, a buttress is at the wall it braces, posts are under the thing they hold. Then decide the
-one set of numbers everything derives from (`W, D, H, T`, bay count, pitch) — every other
-dimension is arithmetic on those.
+1. **Masses.** Name the 3–5 volumes that make the silhouette (nave 40x12x20, tower 10x30x10 at
+   the west end, porch 8x8x6 on the south) and their proportions to each other. State what
+   should read from the front and from above.
+2. **Structure.** How it stands up — walls carry roof, piers carry arches, posts under what they
+   hold, lintels deeper than the wall is thick, buttresses at the wall they brace. Then the base
+   numbers everything derives from: `W, D, H, T`, bay count, roof pitch, floor heights. Every
+   other dimension is arithmetic on those.
+3. **Access.** List every interior space and how a player gets in and between them. For each
+   opening: which wall, width, height. Rules of thumb — doorway 4–6 wide and 7–8 tall, corridor
+   ≥ 4 wide, stair rise ≤ 1 per step with ≥ 1.5 tread, ramps ≤ 30°, headroom ≥ 7 everywhere a
+   player walks. If a space is *meant* to be sealed, say so here with why.
+4. **Palette and placement.** A table of roles, each with a material, a colour, and a comment
+   saying exactly which surfaces get it:
+   - big flat planes (walls, floors, roof planes) → low-contrast: Limestone, Concrete, Brick,
+     Plaster, WoodPlanks. This is what the eye rests on.
+   - loud / high-detail (Slate, Cobblestone, Rock, Metal, Marble) → accents and edges only:
+     plinth, trim, quoins, sills, doorstep, roof. Never the whole wall.
+   - a material change marks a *thing* change — trim isn't the wall's material, the plinth
+     isn't either. Same role touching same role can share; different roles don't.
+   - a distinct colour per role, not just a material; the same material at two shades is two
+     things.
+   - no one material on more than about half the parts. If one is, a role is missing.
 
-**Material — and specifically where it goes.** A palette is a set of *roles*, and the design
-question is which surfaces get which role. Walk the build surface by surface:
-
-- Large flat areas (walls, floors, roof planes) get a low-contrast material — Limestone,
-  Concrete, Brick, Plaster, WoodPlanks. They're the background the eye rests on.
-- Loud, high-detail materials (Slate, Cobblestone, Rock, Metal, Marble) are for accents and
-  edges: plinths, trim, quoins, sills, a doorstep, the roof. Never on the whole wall.
-- A change of material marks a change of *thing*. Trim reads as trim because it isn't the wall's
-  material; a base course reads as a base because it isn't either. Two touching parts with
-  different roles don't share a material; two with the same role do.
-- Colour does half the work: the same material at two shades reads as two things. Pick a
-  distinct colour per role, not just a material.
-- Cap it: no single material on more than about half the parts. If one does, a role is missing.
-
-```lua
-local P = {
-	wall   = { Enum.Material.Limestone,   Color3.fromRGB(118, 112, 102) }, -- the big planes
-	plinth = { Enum.Material.Cobblestone, Color3.fromRGB(78, 76, 70) },    -- lowest 2 studs of every wall
-	trim   = { Enum.Material.Sandstone,   Color3.fromRGB(150, 142, 128) }, -- sills, quoins, string courses, 0.2 proud
-	roof   = { Enum.Material.Slate,       Color3.fromRGB(58, 60, 66) },
-	beam   = { Enum.Material.Wood,        Color3.fromRGB(62, 46, 32) },    -- lintels, rafters, door frame
-	floor  = { Enum.Material.Marble,      Color3.fromRGB(96, 94, 90) },
-}
-```
-
-The comment on each role is the placement decision. Helpers take a role, not a material.
-
-**Variety.** Which repeated things want variants (trees, stones, rubble — hand-shaped variants
-with numbers in a normal range, a tree is 8–14 studs not 2–40) and which want sameness
-(balusters, columns, churchyard crosses). A ruin gets damage as data (`tops = {26, 26, 20, 15}`
-per bay), a kept garden doesn't.
+   ```lua
+   local P = {
+   	wall   = { Enum.Material.Limestone,   Color3.fromRGB(118, 112, 102) }, -- every wall plane above the plinth
+   	plinth = { Enum.Material.Cobblestone, Color3.fromRGB(78, 76, 70) },    -- lowest 2 studs of every exterior wall
+   	trim   = { Enum.Material.Sandstone,   Color3.fromRGB(150, 142, 128) }, -- sills, quoins, string courses; 0.2 proud
+   	roof   = { Enum.Material.Slate,       Color3.fromRGB(58, 60, 66) },    -- roof slabs and ridge only
+   	beam   = { Enum.Material.Wood,        Color3.fromRGB(62, 46, 32) },    -- lintels, rafters, door frames, doors
+   	floor  = { Enum.Material.Marble,      Color3.fromRGB(96, 94, 90) },    -- interior floor slabs
+   }
+   ```
+   Helpers take a role (`P.wall`), never a raw material.
+5. **Variety.** Which repeated things get hand-shaped variants (trees, stones, rubble — numbers
+   in a normal range, a tree is 8–14 studs not 2–40) and which are meant to be identical
+   (balusters, columns, churchyard crosses). Damage is data (`tops = {26, 26, 20, 15}` per bay),
+   not a second code path.
 
 ### 2. Blockout
 
-Every group, rough masses, right palette on the big planes, no openings, no props. Apply it.
-Bounds and groups must match the design numbers and the problem list must be empty before you
-add anything — a shell that's wrong makes every detail wrong. Look at the iso: does the
-silhouette match what you wrote in the design block? If not, fix the masses now.
+Do: write the helpers and the `return function(root)` with every top-level group from the
+masses list, right palette on the big planes, no openings, no props. `apply_build` it.
 
-### 3. Detail — iterate with the renderer
+Check, in this order:
+- `bounds` and each `groups` line equal the design-block numbers. A group at `y 2..6` on a
+  floor whose top is 0 is two studs high — fix it now.
+- the problem list is empty.
+- the iso picture: the silhouette matches the masses list. If a mass is missing, wrong size or
+  in the wrong place, this is where it gets fixed — a shell that's wrong makes every detail wrong.
 
-One group per pass: shell → openings and roof → interior → props → effects. A real build runs
-to 800+ lines and won't fit one reply, so keep the source in a file and apply from there.
+Write down: "blockout: bounds X, groups match, 0 problems, iso shows <what>". Don't add detail
+until that line is true.
 
-After each apply, `render_build` narrowed to the group you just touched, with the view that
-answers the question — `front` for a facade, `top` for a layout, `{ yaw, pitch, at, radius,
-clip = true }` aimed at a doorway. Narrow `root` is the main lever: 40 parts with badges on
-tells you more than 1500 without. Then:
+### 3. Detail — one group per pass, renderer after every pass
 
-- say in words what's off
-- find the derivation that produced it (it's nearly always a typed number that should have been
-  computed, or a wedge/rotation facing the wrong way)
-- edit, re-apply, render the same spot from a *different* angle — the same angle twice tells you
-  nothing new
+Order: shell openings → roof → interior floors and stairs → interior props → exterior props →
+effects. A real build is 800+ lines and won't fit one reply; keep the source in a file and apply
+from there.
 
-When the report says part 37 is sunk into part 12, the next render is
-`{ at = <that part>, radius = 6, clip = true }` from two angles, not the whole-build iso again.
+Each pass, exactly:
 
-Stop a group when its problem lines are empty or every remaining one is meant (rubble sits 20–30%
-in the ground on purpose) and the close-up reads. Don't chase pixels: if it looks off but the
-numbers say it's where you put it, the question is whether you put it in the right place.
+1. Edit the source for that one group. Every opening comes from the access list; every surface
+   pulls a role from `P`.
+2. `apply_build`. Read the report. Every new problem line is either fixed or written down as
+   intentional with the reason (rubble sits 20–30% in the ground on purpose).
+3. `render_build` narrowed to that group, with the view that answers the question:
+   `front` for a facade, `top` for a layout, `{ view = "front", at = <opening>, radius = 8,
+   clip = true }` for a doorway or window. Narrow `root` is the main lever — 40 parts with
+   badges tells you more than 1500 without.
+4. Write down what the picture shows that's wrong, in words: "door leaf is half the opening
+   width", "spandrel is rotated into the wall", "stairs stop 2 studs short of the ledge".
+5. For each, find the derivation that produced it — nearly always a typed number that should
+   have been computed, or a wedge/rotation facing the wrong way. Edit it.
+6. Re-apply, re-render the same spot from a *different* angle. Same angle twice tells you
+   nothing new. When the report names a part (`37 sunk into 12`), render
+   `{ at = <that part>, radius = 6, clip = true }` from two angles, not the whole build again.
+7. Repeat 4–6 until the group's problem lines are empty or all intentional, and the close-up
+   reads. Then write "group <X> done: <n> problems, all intentional: <list>" and move on.
 
-### 4. Inspect — the photo sweep
+Don't chase pixels: if it looks off but the numbers say it's where you put it, the question is
+whether you put it in the right place, and that's a source edit.
 
-When every group is done, take a deliberate set of pictures of the whole build and hunt for the
-bugs that survive per-group passes because each pass only looked at its own group:
+### 4. Inspect — photo sweep, cutaway, access walk
+
+Only after every group is done. This phase exists because per-group passes only ever looked at
+their own group; the bugs left are the ones between groups.
+
+**4a. The sweep.** One call, whole build:
 
 ```
 render_build { root = <whole build>, size = 768, views = [
-  "iso", { yaw = 225, pitch = 30, name = "iso-back" },   -- both diagonals
-  "front", "back", "left", "right",                       -- every elevation
-  "top",                                                  -- footprint
+  "iso", { yaw = 225, pitch = 30, name = "iso-back" },
+  "front", "back", "left", "right",
+  "top",
 ] }
 ```
 
-Then targeted panels at every place two groups meet — roof on wall, porch on facade, stairs on
-ledge, props against walls — with `clip = true` so the thing in front doesn't hide the join.
+Then a second call of targeted panels, `clip = true`, one per place two groups meet: roof on
+wall, porch on facade, stair on ledge, props against walls, tower on nave. Aim `at` the join,
+`radius` a few studs.
 
-What you're looking for, and it's a checklist, so go through it:
+**4b. The cutaway.** The renderer draws transparency as alpha, so give the source an
+`INSPECT` flag that sets the roof group and one long wall to `Transparency = 0.75` when true.
+Apply with it on, render `top` and an iso from the open side, and the interior is visible
+without the roof hiding it. Set it back to false and re-apply when done — never leave it on.
 
-- **Covered up.** A window the porch roof now hides, a door behind a buttress, a prop inside a
-  wall, a feature only visible from an angle nobody stands at. Compare elevations against the
-  design block: everything you named should be findable in at least one panel.
-- **Scale.** Doors 7–8 studs tall, steps ~1 rise, a chair seat ~2, a person is 5. Put a
-  reference next to anything that looks off. Check group against group — a porch that's a third
-  the height of the door it shelters, a tree taller than the tower when it shouldn't be.
+**4c. The checklist.** Go through every item and write "checked: fine" or the fix. Not
+optional, not "looked fine":
+
+- **Access.** Walk the access list from phase 1 against the cutaway and the elevations. For
+  every interior space: is its opening present in the wall, at the width and height from the
+  list, on the correct wall, at floor level (sill at `floorTop`, not 1 stud up)? Is the path
+  from outside to it, and from it to every neighbouring space, unblocked by a prop, a pier, a
+  buttress, a stair landing? Does every stair reach both floors it connects, top step at the
+  upper floor's height, headroom ≥ 7 over every step? A space with no way in is a bug unless the
+  design block said it's sealed.
+- **Covered up.** Every named feature is findable in at least one panel. A window the porch roof
+  now hides, a door behind a buttress, a prop inside a wall, a feature only visible from an
+  angle nobody stands at.
+- **Scale.** Doors 7–8 tall, steps ~1 rise, chair seat ~2, table ~3, a player is 5. Group against
+  group — a porch a third the height of the door it shelters, a tree taller than the tower.
 - **Orientation.** Wedges sloping the wrong way, a roof pitch that reads inverted from the back,
-  a spandrel rotated into the wall. The renderer models wedges as Roblox does, so a wedge that
+  a spandrel rotated into the wall. The renderer models wedges as Roblox does — a wedge that
   looks backwards is backwards.
-- **Silhouette.** Does the back read as well as the front? Blank faces the design didn't intend?
-- **Material placement.** Does the trim read as trim from 30 studs? Is any one material a grey
-  lump across most of a panel? Did the plinth end up at the wrong height on one wall?
-- **Seams.** Flickering coplanar faces where a quoin sits flush instead of 0.3 proud; four
-  full-length walls crossing at corners instead of two long and two short.
+- **Silhouette.** The back reads as well as the front; no blank face the design didn't intend.
+- **Material placement.** Trim reads as trim from 30 studs; no one material is a grey lump
+  across most of a panel; the plinth is the same height on every wall; the palette table's
+  comments match what's actually on each surface.
+- **Seams.** Coplanar faces where a quoin sits flush instead of 0.3 proud; four full-length
+  walls crossing at corners instead of two long and two short.
 
-Fix in the source, re-apply, re-render only the panels that showed the problem. The sweep is
-done when every panel reads and every checklist item has a written "checked, fine" or a fix.
+Fix in the source, re-apply, re-render only the panels that showed the problem. Done when every
+checklist item has its line and every panel reads.
 
 ## The source
 
