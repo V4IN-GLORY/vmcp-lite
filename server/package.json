@@ -1,7 +1,6 @@
 {
-  "name": "vmcp-server",
+  "name": "@v4in-glory/mcp-test",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "bin": {
     "vmcp": "dist/index.js"
@@ -13,7 +12,9 @@
     "fake-plugin": "node scripts/fake-plugin.mjs",
     "token": "node scripts/print-token.mjs",
     "probe": "node scripts/probe.mjs",
-    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js"
+    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
+    "build:plugin": "rojo build ../plugin.project.json -o plugin/VMCP.rbxmx",
+    "prepack": "npm run build && npm run build:plugin"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
@@ -24,5 +25,9 @@
     "@types/node": "^22.10.0",
     "@types/ws": "^8.5.13",
     "typescript": "^5.7.2"
-  }
+  },
+  "files": [
+    "dist",
+    "plugin/VMCP.rbxmx"
+  ]
 }

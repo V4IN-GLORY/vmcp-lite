@@ -5,8 +5,16 @@ import { Manifest } from "./manifest.js";
 import { SessionRegistry } from "./bridge/registry.js";
 import { startBridge } from "./bridge/server.js";
 import { startMcp } from "./mcp.js";
+import { installBundledPlugin } from "./install-plugin.js";
 
 async function main(): Promise<void> {
+	if (process.argv.includes("--auto-install-plugin")) {
+		try {
+			installBundledPlugin();
+		} catch (err) {
+			log("plugin install skipped:", err);
+		}
+	}
 	loadOrCreateToken();
 
 	const manifest = new Manifest();
