@@ -13,6 +13,12 @@ you end up fixing the second one against the first and drifting. Code holds ever
 "is this wall in the same place as that pillar" is a question you answer by reading two lines and
 subtracting, not by squinting. The tools here exist to keep you in that mode.
 
+**HARD RULE: DO NOT TOUCH `game.Lighting`.** No property changes (ClockTime, Ambient, Brightness,
+Technology, any of it), no new instances under it (Sky, Atmosphere, Bloom, ColorCorrection,
+SunRays, DepthOfField, anything), no deleting what's there. Not in the build source, not in a
+`run_luau` snippet, not "just to make the picture look better". The only exception is the user
+naming Lighting and asking for it. See "Leave `game.Lighting` alone" below.
+
 The loop, one tool call per pass:
 
 ```
@@ -369,10 +375,20 @@ A missing last segment is created as a Model.
 
 ## Leave `game.Lighting` alone
 
-Never touch anything under `game.Lighting` — ClockTime, Ambient, Bloom, ColorCorrection,
-Atmosphere, Sky, any of it — unless the user asks for it by name. A build is geometry under its
-root. Lights, beams and particle emitters *inside* the build are fine; they live under the root
-and get cleaned up with it. Lighting is place-wide state the user owns.
+You are NOT meant to adjust anything in `game.Lighting`, and you are NOT meant to create new
+instances for it. Concretely, unless the user asks for it by name:
+
+- don't set any property on `game.Lighting` — ClockTime, TimeOfDay, Ambient, OutdoorAmbient,
+  Brightness, ColorShift, EnvironmentDiffuseScale, ShadowSoftness, Technology, FogEnd, any of it
+- don't `Instance.new` anything parented to it — Sky, Atmosphere, Bloom, ColorCorrection,
+  SunRays, DepthOfField, Clouds, BlurEffect
+- don't edit or destroy what's already under it
+- don't do it from `apply_build` source, `run_luau`, a timeline, or anywhere else
+
+A build is geometry under its root, full stop. The renderer doesn't use Lighting anyway, so
+changing it never improves the picture. Lights, beams and particle emitters *inside* the build are
+fine; they live under the root and get cleaned up with it. Lighting is place-wide state the user
+owns.
 
 ## What it covers
 
