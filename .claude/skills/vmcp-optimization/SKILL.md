@@ -18,8 +18,10 @@ count_lines                      -- who's big
   -> write a candidate fix as a module that lives only in the playtest
   -> profile_scripts again: old vs new, same fake data, same call
   -> prove same outputs on the same inputs
-  -> revert, report in plain words, offer to apply
-  -> next script, or pause for the user to playtest
+  -> report in plain words
+  -> try_scripts: a playtest running the candidate, nothing saved -- the user plays it
+  -> they say yes: apply to disk; they say no or find a break: stop the playtest, it's gone
+  -> next script, or pause
 ```
 
 Load `vmcp-debugging` and `vmcp-timeline` alongside this — `vm = "game"`, `ctx`, `Remotes.WatchAll`
@@ -62,8 +64,10 @@ humanoid stepping and raycasts live. `scopes/render.md` / `scopes/gpu.md` for an
 - **Every change gets named.** If you fix a bug you tripped over, or a fast path skips a `warn`
   that used to fire, the user hears about it even when it's irrelevant. They own the game; you
   don't get to decide what's irrelevant.
-- **Revert by default.** The loop ends with the original code back in place and a written
-  recommendation. Only apply the fix when the user says so, and then stop so they can playtest.
+- **Nothing is applied until the user has played it.** The loop ends with a written
+  recommendation and a playtest running the candidate via `try_scripts` — the place, Studio and
+  disk all still hold the original. The user plays; if it's fine they say so and *then* you edit
+  the file. If they find a break, stopping the playtest is the whole revert.
 - **Measure before and after with the same load.** A fix without a before/after pair from the
   same `profile_scripts` call isn't a fix, it's a guess.
 - **Read p95 and worst frame, not mean.** A function whose mean is fine and whose worst frame is
@@ -487,7 +491,7 @@ the server error count. The event is `blocking` because `Hammer` yields for the 
 Notes on the template:
 
 - `keepOpen: true` because you'll likely run a second timeline (a different fix, a different
-  script) and a playtest costs seconds to start. Stop it explicitly when the pass is over.
+  script) and a playtest costs seconds to start. `try_scripts` in Step 7 restarts it anyway.
 - The candidate goes in `ServerStorage` **inside the playtest**. Nothing is saved; `m:Destroy()`
   at the end is tidiness, not safety.
 - `vmcp.Profile.Hammer(targets, { vm, env, frameLimit, top, dump, name, labels })` is the
@@ -509,13 +513,31 @@ per-call time and adds 4 MB of heap is trading CPU for GC and will show up as hi
 If the gain is under ~15% per call and nothing in the worst frame moved, it isn't worth the risk
 of any change. Say that.
 
-## Step 7 — applying, if asked
+## Step 7 — let the user play the candidate
 
-Only after the user says yes in Step 8. Edit the source file on disk (this is a Rojo project;
-Studio's copy follows), then one timeline: `plugin` event for `search_scripts { drift = true }`,
-a `client` event that fires the real remote the way a player would, a `server` event that reads
-the result, an `assertion`. Then **stop and tell the user to playtest**. Don't start the next
-script until they've come back.
+The report goes out first (Step 8 — write it now, hand it over with this). Then, in the same
+reply, start the playtest that runs the fix:
+
+```json
+{ "scripts": [ { "script": "ServerScriptService.Combat", "source": "...the whole module with the fix..." } ] }
+```
+
+`try_scripts` writes the replacement into Studio for the few seconds the playtest takes to boot,
+then puts the original back; the playtest keeps the swapped copy. The place isn't marked changed
+in any way that survives, nothing reaches disk, and Rojo never sees it. Every script the fix
+touches goes in the one call. If a playtest is already up, it's restarted — say so.
+
+Then **stop and wait**. Tell the user what to try: the specific flows that go through the
+changed function, plus whatever the error-path check in Step 6 covered. Ask them to hit Stop (or
+say so, and you call `playtest { action = "stop" }`) when they're done — that's the revert.
+
+- **They say it's fine** → edit the source file on disk (this is a Rojo project; Studio follows),
+  then one `run_timeline`: `plugin` event for `search_scripts { drift = true }`, a `client` event
+  that fires the real remote the way a player would, a `server` event that reads the result, an
+  `assertion`. Report the outcome. Only now is anything changed.
+- **They find a break** → the playtest gets stopped, the original is everywhere, and you have a
+  bug report against the candidate. Fix it, back to Step 6, new `try_scripts`.
+- **They don't answer** → nothing happened. That's the point.
 
 ## Step 8 — report
 
@@ -544,8 +566,9 @@ on every miss; the new code warns once per rig. Not a gameplay change, but it's 
 Risk: rigs created without the tag won't register hits. Everything that creates a rig goes through
 Spawner.Make, so tagging there covers it — but if there's a path I couldn't see, that's the hole.
 
-The original code is back in place. Want me to apply this? I'll make the change and stop so you
-can playtest.
+Nothing is changed yet. I've started a playtest with the new version in — swing at a few dummies,
+try a hit on a dead target, whatever you'd normally do. Hit Stop when you're done and the original
+is back; tell me it's fine and I'll write it to Combat.luau.
 ```
 
 Every report has those six parts: what's slow (with lines), the fix, before/after numbers, the
@@ -560,8 +583,8 @@ After the report, one of three things, and say which:
   work through the list. Say which one you're doing next and why.
 - **Ask** where to go next when the list has no obvious next candidate, or when the next candidate
   is a different kind of problem (physics, rendering, network) that a script pass won't fix.
-- **Pause** after applying any fix, so the user can playtest. Always. The verification in Step 7
-  is not a substitute for a human playing the game.
+- **Pause** after every `try_scripts`, and again after applying. Always. The checks in Step 6
+  are not a substitute for a human playing the game with the new code in.
 
 If you're continuing, reuse the running playtest — it's already up — unless the next script needs
 `sections`, which restarts it. And batch across scripts too: if two scripts' suspect functions
@@ -588,7 +611,10 @@ timeline with one `Hammer` call carrying four targets.
 - **`sections` failed with a syntax error** → the range ended mid-block. `get_logs` shows the
   script's compile error with the (shifted) line.
 - **Playtest restart lost state** → the user had something set up in a running playtest and
-  `sections` restarted it. Warn before calling with `sections` when a playtest is already up.
+  `sections` or `try_scripts` restarted it. Warn before either when a playtest is already up.
+- **Two Studio windows** → playtest DataModels attach to whichever window's plugin connected
+  last, so `where = "server"` can point at the wrong window's test and the first window's socket
+  can drop when a test starts. One Studio window while profiling.
 - **Studio's copy of the script isn't the one on disk** → `search_scripts { drift = true }` before
   you read lines for `sections`; line numbers must match what Studio has.
 - **The function is a method on an object** → `setup` builds or fetches the object and returns a
@@ -597,5 +623,3 @@ timeline with one `Hammer` call carrying four targets.
   non-yielding pieces separately.
 - **Numbers look impossibly small** → the function early-returned on your fake data. Check the
   section labels inside it ran (`n` > 0).
-- **Two Studio windows** → the plugin's playtest belongs to whichever window connected last. Close
-  the other one.

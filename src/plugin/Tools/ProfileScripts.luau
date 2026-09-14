@@ -3,8 +3,8 @@
 -- Hammers functions in the running game under the MicroProfiler and says what the frame time went
 -- on. Two halves in one module, told apart by which DataModel it's running in:
 --
---   edit session   instruments sections with debug.profilebegin/end, makes sure a playtest is up,
---                  hands the run to the live context, then puts every Source back how it was.
+--   edit session   builds instrumented Source for the sections, starts a playtest running it
+--                  (Playtest/Swap -- the place never keeps it), hands the run to the live context.
 --   playtest       builds the load loop, runs it in the game's own VM under a LibMP capture,
 --                  reads the capture, and posts it to the VMCP server as a .gprx dump.
 --
@@ -19,11 +19,11 @@ local Env = require(script.Parent.Parent.Env)
 local Path = require(script.Parent.Parent.Path)
 local Profile = require(script.Parent.Parent.Lib.Profile)
 local Session = require(script.Parent.Parent.Playtest.Session)
+local Swap = require(script.Parent.Parent.Playtest.Swap)
 
 local DEFAULT_SECONDS = 2
 local MAX_TARGETS = 8
 local MAX_TOTAL_SECONDS = 120
-local PEER_TIMEOUT = 90
 
 type Result = {
 	content: { { type: "text", text: string } },
@@ -231,8 +231,6 @@ local function capture(arguments: any): Result
 	)
 end
 
-type Original = { instance: Instance, source: string }
-
 local function splitLines(source: string): { string }
 	local lines = {}
 	for line in string.gmatch(source .. "\n", "([^\n]*)\n") do
@@ -241,10 +239,10 @@ local function splitLines(source: string): { string }
 	return lines
 end
 
--- Rewrites each script's Source with the profiler calls in, and hands back what to put back.
--- Sections on one script are merged in a single pass over the original line numbers, so they can
--- nest or overlap without shifting each other.
-local function instrument(sections: { Section }): ({ Original }, string?)
+-- Builds each script's Source with the profiler calls in. Sections on one script are merged in a
+-- single pass over the original line numbers, so they can nest or overlap without shifting each
+-- other. Nothing is written here -- Swap does that, briefly.
+local function instrument(sections: { Section }): ({ Swap.Replacement }, string?)
 	local byScript: { [Instance]: { Section } } = {}
 	for index, section in sections do
 		local instance, why = Path.Resolve(section.script)
@@ -265,18 +263,16 @@ local function instrument(sections: { Section }): ({ Original }, string?)
 		table.insert(list, section)
 	end
 
-	local originals: { Original } = {}
+	local replacements: { Swap.Replacement } = {}
 	for instance, list in byScript do
-		local readable, source = pcall(function()
-			return (instance :: any).Source
-		end)
-		if not readable or type(source) ~= "string" then
-			return originals, `couldn't read {instance:GetFullName()} -- allow script injection for VMCP`
+		local source, why = Swap.ReadSource(instance)
+		if not source then
+			return {}, why
 		end
 		local lines = splitLines(source)
 		for _, section in list do
 			if section.fromLine > section.toLine or section.toLine > #lines then
-				return originals,
+				return {},
 					`section "{section.label}" wants lines {section.fromLine}-{section.toLine} but {instance:GetFullName()} has {#lines}`
 			end
 		end
@@ -311,43 +307,9 @@ local function instrument(sections: { Section }): ({ Original }, string?)
 			end
 		end
 
-		table.insert(originals, { instance = instance, source = source })
-		local container: any = instance
-		container.Source = table.concat(out, "\n")
+		table.insert(replacements, { instance = instance, source = table.concat(out, "\n") })
 	end
-	return originals, nil
-end
-
-local function restore(originals: { Original })
-	for _, original in originals do
-		pcall(function()
-			(original.instance :: any).Source = original.source
-		end)
-	end
-end
-
-local function waitForPeer(context: string, player: number?): string?
-	local deadline = os.clock() + PEER_TIMEOUT
-	local last = "never answered"
-	repeat
-		local reached, result = Bridge.Invoke("peer", { action = "ping", context = context, player = player }, 10)
-		if reached and result ~= nil and result.isError ~= true then
-			return nil
-		end
-		last = if reached then "not up yet" else tostring(result)
-		task.wait(0.5)
-	until os.clock() >= deadline
-	return `the {context} never came up ({last})`
-end
-
-local function stopPlaytest(): string?
-	Bridge.Invoke("peer", { action = "stop", context = "server" }, 20)
-	Session.Forget()
-	local deadline = os.clock() + 30
-	while Session.IsRunning() and os.clock() < deadline do
-		task.wait(0.25)
-	end
-	return if Session.IsRunning() then "the running playtest wouldn't stop" else nil
+	return replacements, nil
 end
 
 local function orchestrate(arguments: any): Result
@@ -373,39 +335,38 @@ local function orchestrate(arguments: any): Result
 
 	local notes = {}
 	local sections: { Section } = arguments.sections or {}
-	local originals: { Original } = {}
+	local context = arguments.where or "server"
+	local players = math.clamp(arguments.players or 1, 1, 8)
+	local startedHere = false
 
 	if #sections > 0 then
-		if Session.IsRunning() then
-			local failure = stopPlaytest()
-			if failure then
-				return text(failure, true)
-			end
-			table.insert(notes, "stopped the running playtest so the instrumented scripts would be the ones that ran")
-		end
-		local why
-		originals, why = instrument(sections)
+		local replacements, why = instrument(sections)
 		if why then
-			restore(originals)
 			return text(why, true)
 		end
-	end
-
-	local context = arguments.where or "server"
-	local startedHere = false
-	if not Session.IsRunning() then
-		local failure = Session.Start(math.clamp(arguments.players or 1, 1, 8))
+		local failure, restarted = Swap.Start(replacements, players, context, arguments.player)
 		if failure then
-			restore(originals)
 			return text(failure, true)
 		end
 		startedHere = true
-	end
-
-	local notUp = waitForPeer(context, arguments.player)
-	if notUp then
-		restore(originals)
-		return text(notUp, true)
+		if restarted then
+			table.insert(notes, "stopped the running playtest so the instrumented scripts would be the ones that ran")
+		end
+		table.insert(
+			notes,
+			`{#replacements} script(s) run instrumented in this playtest only; Studio's Source was never left changed`
+		)
+	elseif Session.IsRunning() then
+		local notUp = Swap.WaitFor(context, arguments.player)
+		if notUp then
+			return text(notUp, true)
+		end
+	else
+		local failure = Swap.Start({}, players, context, arguments.player)
+		if failure then
+			return text(failure, true)
+		end
+		startedHere = true
 	end
 
 	local reached, result = Bridge.Invoke("profile_scripts", {
@@ -420,8 +381,6 @@ local function orchestrate(arguments: any): Result
 		name = arguments.name,
 	}, totalSeconds + 60)
 
-	restore(originals)
-
 	if not reached then
 		return text(`couldn't run the profile in the {context}: {tostring(result)}`, true)
 	end
@@ -431,12 +390,6 @@ local function orchestrate(arguments: any): Result
 		if type(item.text) == "string" then
 			table.insert(body, item.text)
 		end
-	end
-	if #originals > 0 then
-		table.insert(
-			notes,
-			`{#originals} script(s) had their Source put back; the playtest still runs the instrumented copies until it stops`
-		)
 	end
 	if startedHere then
 		table.insert(notes, 'the playtest is still open -- stop it with playtest { action = "stop" } when you\'re done')
