@@ -103,7 +103,8 @@ local ok, health = vmcp.Tool("run_luau", {
 filesystem, and an event has no result to hang a `postProcess` directive on.
 
 `vmcp.Game.Require(path)` is the one for module debugging — see the `vmcp-debugging` skill.
-`vmcp.Remotes`, `vmcp.Exploit` and `vmcp.Bench` live there too. `vmcp.Build`, `vmcp.Rig`,
+`vmcp.Remotes`, `vmcp.Exploit` and `vmcp.Bench` live there too; `vmcp.Profile` (MicroProfiler
+captures) is in `vmcp-optimization`. `vmcp.Build`, `vmcp.Rig`,
 `vmcp.Anim`, `vmcp.Canvas`, `vmcp.Style` and `vmcp.Serialize` are all in scope as well.
 
 ## input: client events only

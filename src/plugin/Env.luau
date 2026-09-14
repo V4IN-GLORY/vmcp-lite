@@ -12,6 +12,7 @@ local Env = {
 	Build = require(script.Parent.Lib.Build),
 	Canvas = require(script.Parent.Lib.Canvas),
 	Exploit = require(script.Parent.Lib.Exploit),
+	Profile = require(script.Parent.Lib.Profile),
 	Remotes = require(script.Parent.Lib.Remotes),
 	Rig = require(script.Parent.Lib.Rig),
 	Style = require(script.Parent.Lib.Style),

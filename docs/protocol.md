@@ -425,8 +425,9 @@ folder, or point `VMCP_PROJECT` at one.
 ## 10. `postProcess` — asking the server to finish a result
 
 A tool result may carry a `postProcess` object alongside `content`. It's for work the plugin
-genuinely can't do, which so far means drawing something and writing the file. Two kinds: `png`
-replays a Canvas recording, `scene` renders collected part geometry as a blockout picture.
+genuinely can't do, which means writing a file. Three kinds: `png` replays a Canvas recording,
+`scene` renders collected part geometry as a blockout picture, and `gprx` writes a base64 `data`
+field out as a MicroProfiler capture under `~/.vmcp/profiles/<name>.gprx` for LibMP to open.
 
 ```json
 {

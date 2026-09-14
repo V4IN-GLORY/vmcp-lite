@@ -238,6 +238,11 @@ The report is `calls, errors, firstError, totalMs, meanMs, minMs, maxMs, p50Ms, 
 elapsedSeconds`. **Read p99, not mean.** A function whose mean is fine and whose p99 is forty times
 its median is the one causing the hitch; an average hides that completely.
 
+Bench tells you *how long*; it can't tell you *where inside* or what else was in the frame. For
+that it's `profile_scripts` — the same hammering under the MicroProfiler with LibMP, self time per
+scope, worst frames, heap delta and a `.gprx` on disk. The whole find-measure-fix-verify loop is
+the `vmcp-optimization` skill.
+
 ## Output and errors
 
 `get_logs` reads a rolling buffer the plugin fills in whatever DataModel it's in, so

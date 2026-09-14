@@ -9,10 +9,10 @@ import { loadMaterials } from "./materials.js";
 /**
  * The one place the relay acts on a result instead of passing it along.
  *
- * A tool can return a `postProcess` directive asking for something only this side can do — right
- * now that means writing a Canvas recording out as a PNG, since the plugin has no filesystem.
- * Kept deliberately narrow: one field, a `kind` that has to be recognised, and a line of text
- * back. Anything broader and the relay stops being a relay.
+ * A tool can return a `postProcess` directive asking for something only this side can do — writing
+ * a Canvas recording out as a PNG, or a MicroProfiler capture out as a .gprx, since the plugin has
+ * no filesystem. Kept deliberately narrow: one field, a `kind` that has to be recognised, and a
+ * line of text back. Anything broader and the relay stops being a relay.
  */
 
 export interface Directive {
@@ -22,15 +22,30 @@ export interface Directive {
 
 const SAFE_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 
-function pngPath(directive: Directive): string {
-	const dir = resolve(config.stateDir, "images");
+// The name is chosen by whatever wrote the snippet, so it never gets to be a path: no directories,
+// no traversal, no extension of its own.
+function outputPath(directive: Directive, folder: string, fallback: string, extension: string): string {
+	const dir = resolve(config.stateDir, folder);
 	mkdirSync(dir, { recursive: true });
-
-	// The name is chosen by whatever wrote the snippet, so it never gets to be a path: no
-	// directories, no traversal, no extension of its own.
 	const asked = typeof directive.name === "string" ? directive.name : "";
-	const name = SAFE_NAME.test(asked) ? asked : `canvas-${Date.now()}`;
-	return join(dir, `${name}.png`);
+	const name = SAFE_NAME.test(asked) ? asked : `${fallback}-${Date.now()}`;
+	return join(dir, `${name}.${extension}`);
+}
+
+/** A LibMP capture, base64 over the socket because JSON has no bytes. Lute opens it with OpenFromFile. */
+function writeCapture(directive: Directive): Outcome {
+	if (typeof directive.data !== "string" || directive.data.length === 0) {
+		return { text: "[a gprx job needs base64 in `data`]" };
+	}
+	try {
+		const path = outputPath(directive, "profiles", "capture", "gprx");
+		const bytes = Buffer.from(directive.data, "base64");
+		writeFileSync(path, bytes);
+		log(`wrote ${path}`);
+		return { text: `[wrote the capture to ${path} (${Math.round(bytes.length / 1024)} KB)]` };
+	} catch (err) {
+		return { text: `[couldn't write the capture: ${(err as Error).message}]` };
+	}
 }
 
 // Past this the image is more of the reply than the words are, and the file on disk is the better
@@ -44,6 +59,7 @@ interface Outcome {
 
 /** Writes the image and returns a line to append to the tool's own output, plus the bytes. */
 async function finish(directive: Directive): Promise<Outcome> {
+	if (directive.kind === "gprx") return writeCapture(directive);
 	if (directive.kind !== "png" && directive.kind !== "scene") {
 		return { text: `[vmcp doesn't know how to finish a "${String(directive.kind)}" job]` };
 	}
@@ -56,7 +72,7 @@ async function finish(directive: Directive): Promise<Outcome> {
 		} else {
 			surface = rasterize(directive as unknown as Recording);
 		}
-		const path = pngPath(directive);
+		const path = outputPath(directive, "images", "canvas", "png");
 		const png = encodePng(surface);
 		writeFileSync(path, png);
 		log(`wrote ${path}`);
