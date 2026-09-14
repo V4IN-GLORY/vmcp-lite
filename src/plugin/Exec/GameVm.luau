@@ -26,6 +26,9 @@ local Serialize = require(script.Parent.Serialize)
 local BRIDGE_NAME = "__VMCP_GameBridge"
 local INVOKE_NAME = "__VMCP_GameInvoke"
 local SERIALIZE_NAME = "__VMCP_Serialize"
+-- Also copied in: an equivalence checker that game-VM snippets can require to compare two live
+-- functions. See Lib/Equiv.
+local EQUIV_NAME = "__VMCP_Equiv"
 local READY_TIMEOUT = 5
 
 local GameVm = {}
@@ -101,6 +104,12 @@ local function ensure(): (BindableFunction?, string?)
 		serializer.Archivable = false
 		serializer.Parent = parent
 
+		local equiv = Instance.new("ModuleScript")
+		equiv.Name = EQUIV_NAME
+		equiv.Source = (script.Parent.Parent.Lib.Equiv :: ModuleScript).Source
+		equiv.Archivable = false
+		equiv.Parent = parent
+
 		local bridge: any = Instance.new(if RunService:IsServer() then "Script" else "LocalScript")
 		bridge.Name = BRIDGE_NAME
 		bridge.Source = BRIDGE_SOURCE
@@ -174,6 +183,13 @@ function GameVm.Require(path: string): (boolean, string)
 		"end",
 		"return require(current)",
 	}, "\n"))
+end
+
+-- Where a game-VM snippet finds the equivalence checker: `require(vmcp.Game.EquivPath())` isn't
+-- possible across VMs, so it's a path string to splice into the snippet.
+function GameVm.EquivPath(): string
+	local parent = container()
+	return if parent then `{parent:GetFullName()}.{EQUIV_NAME}` else EQUIV_NAME
 end
 
 -- Serialize is handed to snippets alongside this, so a caller that wants the plugin-side renderer

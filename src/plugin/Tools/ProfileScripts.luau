@@ -16,6 +16,7 @@ local RunService = game:GetService("RunService")
 
 local Bridge = require(script.Parent.Parent.Bridge)
 local Env = require(script.Parent.Parent.Env)
+local Instrument = require(script.Parent.Parent.Lib.Instrument)
 local Path = require(script.Parent.Parent.Path)
 local Profile = require(script.Parent.Parent.Lib.Profile)
 local Session = require(script.Parent.Parent.Playtest.Session)
@@ -41,15 +42,19 @@ local Tool = {}
 
 Tool.Definition = {
 	name = "profile_scripts",
-	description = "Runs functions from the live game thousands of times under the MicroProfiler and "
-		.. "reports what the frame time went on: your labels with per-call and worst-frame numbers, "
+	description = "Profiles the live game with the MicroProfiler. Two modes, usable together: `observe` "
+		.. "captures the game running on its own for N seconds (the real-load baseline -- what "
+		.. "actually costs frame time while someone plays), and `targets` hammer specific functions "
+		.. "thousands of times with fake data. Reports your labels with per-call, allocation-per-call "
+		.. "and worst-frame numbers, "
 		.. "the top scopes by self time across every thread, the slowest frames and what filled them, "
 		.. "and the Luau heap delta. Each target is a `setup` Luau body that runs once in the game's "
 		.. "own VM (so require() returns the live module with its real state) and returns the "
 		.. "function to hammer; the tool wraps every call in debug.profilebegin(label). `sections` "
 		.. "additionally brackets line ranges inside scripts with profilebegin/profileend so a slow "
-		.. "loop inside a function shows up as its own scope -- those edits live only in Studio while "
-		.. "the tool runs and are reverted before it returns. Needs LibMP in the place (pass "
+		.. "loop inside a function shows up as its own scope, and `autoSections` does that for every "
+		.. "named function in a script at once -- the edits live only in the playtest, never the place. "
+		.. "Needs LibMP in the place (pass "
 		.. "installLibMP to insert it). Starts a playtest if none is running; if sections are given "
 		.. "and one is already running, restarts it so the instrumented code is what runs. Each "
 		.. "capture is also written to disk as a .gprx dump for LibMP under Lute. Batch: put every "
@@ -60,9 +65,29 @@ Tool.Definition = {
 	inputSchema = {
 		type = "object",
 		properties = {
+			observe = {
+				type = "object",
+				description = "Capture the game as it runs, no hammering. Drive it yourself (play, or a "
+					.. "client timeline event) during the window. Runs before any targets.",
+				properties = {
+					seconds = {
+						type = "number",
+						description = "How long to watch. Defaults to 3; 256 frames is the cap.",
+						minimum = 0.5,
+					},
+				},
+			},
+			autoSections = {
+				type = "array",
+				description = "Scripts to instrument function-by-function: every named function gets its own "
+					.. 'scope, labelled <ScriptName>.<function>. The fastest way from "this script is slow" to '
+					.. '"it\'s this function".',
+				items = { type = "string", description = 'Dotted path, like "ServerScriptService.Combat".' },
+			},
 			targets = {
 				type = "array",
-				description = "What to hammer. Each runs as its own capture, one after another.",
+				description = "What to hammer. Each runs as its own capture, one after another. Optional when "
+					.. "observe is given.",
 				minItems = 1,
 				maxItems = MAX_TARGETS,
 				items = {
@@ -170,7 +195,6 @@ Tool.Definition = {
 				maximum = 8,
 			},
 		},
-		required = { "targets" },
 	},
 	tags = { title = "Profile Scripts", destructive = true },
 	timeoutMs = 240000,
@@ -180,9 +204,12 @@ local function text(body: string, isError: boolean?): Result
 	return { content = { { type = "text", text = body } }, isError = isError }
 end
 
-local function checkTargets(targets: any): (string?, number)
+local function checkTargets(targets: any, observing: boolean): (string?, number)
+	if targets == nil and observing then
+		return nil, 0
+	end
 	if type(targets) ~= "table" or #targets == 0 then
-		return "targets must be a non-empty array", 0
+		return "targets must be a non-empty array (or pass observe)", 0
 	end
 	if #targets > MAX_TARGETS then
 		return `at most {MAX_TARGETS} targets per call`, 0
@@ -206,7 +233,8 @@ end
 -- The playtest half. Everything real is Profile.Hammer, so a timeline event can do the same thing
 -- without a tool call per target.
 local function capture(arguments: any): Result
-	local problem = checkTargets(arguments.targets)
+	local observe = arguments.observe
+	local problem = checkTargets(arguments.targets, observe ~= nil)
 	if problem then
 		return text(problem, true)
 	end
@@ -214,21 +242,41 @@ local function capture(arguments: any): Result
 	for _, section in arguments.sections or {} do
 		table.insert(labels, section.label)
 	end
-	local body, failed = Profile.Hammer(arguments.targets, {
-		vm = arguments.vm,
-		env = Env,
-		frameLimit = arguments.frameLimit,
-		top = arguments.top,
-		dump = arguments.dump,
-		name = arguments.name,
-		labels = labels,
-	})
-	return text(
-		body
-			.. "\n\nThe last capture is still open in this context: a run_luau or timeline event here can "
-			.. "reopen it with vmcp.Profile.Session() and walk it with LibMP directly.",
-		failed
+	for _, label in arguments.autoLabels or {} do
+		table.insert(labels, label)
+	end
+
+	local parts = {}
+	local failed = false
+	if observe then
+		local watched = Profile.Observe(observe.seconds, {
+			frameLimit = arguments.frameLimit,
+			top = arguments.top,
+			labels = labels,
+			dump = arguments.dump ~= false,
+			name = arguments.name,
+		})
+		table.insert(parts, watched)
+	end
+	if arguments.targets then
+		local body, hammerFailed = Profile.Hammer(arguments.targets, {
+			vm = arguments.vm,
+			env = Env,
+			frameLimit = arguments.frameLimit,
+			top = arguments.top,
+			dump = arguments.dump,
+			name = arguments.name,
+			labels = labels,
+		})
+		table.insert(parts, body)
+		failed = hammerFailed
+	end
+	table.insert(
+		parts,
+		"The last capture is still open in this context: a run_luau or timeline event here can "
+			.. "reopen it with vmcp.Profile.Session() and walk it with LibMP directly."
 	)
+	return text(table.concat(parts, "\n\n"), failed)
 end
 
 local function splitLines(source: string): { string }
@@ -242,18 +290,31 @@ end
 -- Builds each script's Source with the profiler calls in. Sections on one script are merged in a
 -- single pass over the original line numbers, so they can nest or overlap without shifting each
 -- other. Nothing is written here -- Swap does that, briefly.
-local function instrument(sections: { Section }): ({ Swap.Replacement }, string?)
+local function instrument(sections: { Section }, autoScripts: { string }): ({ Swap.Replacement }, { string }, string?)
 	local byScript: { [Instance]: { Section } } = {}
+	local autoLabels: { string } = {}
+	local autoOn: { [Instance]: boolean } = {}
+	for _, path in autoScripts do
+		local instance, why = Path.Resolve(path)
+		if not instance then
+			return {}, {}, why
+		end
+		if not instance:IsA("LuaSourceContainer") then
+			return {}, {}, `{path} is a {instance.ClassName}, not a script`
+		end
+		autoOn[instance] = true
+		byScript[instance] = byScript[instance] or {}
+	end
 	for index, section in sections do
 		local instance, why = Path.Resolve(section.script)
 		if not instance then
-			return {}, why
+			return {}, {}, why
 		end
 		if not instance:IsA("LuaSourceContainer") then
-			return {}, `{section.script} is a {instance.ClassName}, not a script`
+			return {}, {}, `{section.script} is a {instance.ClassName}, not a script`
 		end
 		if type(section.label) ~= "string" or section.label == "" then
-			return {}, `section {index} needs a label`
+			return {}, {}, `section {index} needs a label`
 		end
 		local list = byScript[instance]
 		if not list then
@@ -267,12 +328,22 @@ local function instrument(sections: { Section }): ({ Swap.Replacement }, string?
 	for instance, list in byScript do
 		local source, why = Swap.ReadSource(instance)
 		if not source then
-			return {}, why
+			return {}, {}, why
 		end
-		local lines = splitLines(source)
+		-- Function scopes go in first; they're inserted inline, so the line numbers the sections
+		-- were written against still hold.
+		if autoOn[instance] then
+			local labels
+			source, labels = Instrument.Functions(source :: string, instance.Name)
+			for _, label in labels do
+				table.insert(autoLabels, label)
+			end
+		end
+		local lines = splitLines(source :: string)
 		for _, section in list do
 			if section.fromLine > section.toLine or section.toLine > #lines then
 				return {},
+					{},
 					`section "{section.label}" wants lines {section.fromLine}-{section.toLine} but {instance:GetFullName()} has {#lines}`
 			end
 		end
@@ -309,13 +380,16 @@ local function instrument(sections: { Section }): ({ Swap.Replacement }, string?
 
 		table.insert(replacements, { instance = instance, source = table.concat(out, "\n") })
 	end
-	return replacements, nil
+	return replacements, autoLabels, nil
 end
 
 local function orchestrate(arguments: any): Result
-	local problem, totalSeconds = checkTargets(arguments.targets)
+	local problem, totalSeconds = checkTargets(arguments.targets, arguments.observe ~= nil)
 	if problem then
 		return text(problem, true)
+	end
+	if arguments.observe then
+		totalSeconds += (arguments.observe.seconds or 3)
 	end
 
 	if not Profile.Find() then
@@ -335,15 +409,18 @@ local function orchestrate(arguments: any): Result
 
 	local notes = {}
 	local sections: { Section } = arguments.sections or {}
+	local autoScripts: { string } = arguments.autoSections or {}
+	local autoLabels: { string } = {}
 	local context = arguments.where or "server"
 	local players = math.clamp(arguments.players or 1, 1, 8)
 	local startedHere = false
 
-	if #sections > 0 then
-		local replacements, why = instrument(sections)
+	if #sections > 0 or #autoScripts > 0 then
+		local replacements, labels, why = instrument(sections, autoScripts)
 		if why then
 			return text(why, true)
 		end
+		autoLabels = labels
 		local failure, restarted = Swap.Start(replacements, players, context, arguments.player)
 		if failure then
 			return text(failure, true)
@@ -374,6 +451,8 @@ local function orchestrate(arguments: any): Result
 		player = arguments.player,
 		targets = arguments.targets,
 		sections = sections,
+		autoLabels = autoLabels,
+		observe = arguments.observe,
 		vm = arguments.vm,
 		frameLimit = arguments.frameLimit,
 		top = arguments.top,

@@ -18,6 +18,8 @@ import {
 } from "../protocol.js";
 import { runPostProcess, settle } from "../postprocess.js";
 import { rojoMap, type ScriptHash } from "../rojo.js";
+import { readLedger, writeLedger } from "../ledger.js";
+import { readFileSync, writeFileSync } from "node:fs";
 import { routeFor, ownerOf } from "./routing.js";
 import { Session, type ProgressUpdate } from "./session.js";
 import type { SessionRegistry } from "./registry.js";
@@ -149,6 +151,63 @@ function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegist
 			);
 			try {
 				replyOk(socket, msg, { projectPath: map.projectPath, drift: map.compare(scripts) });
+			} catch (err) {
+				replyError(socket, msg, VmcpErrorCode.InternalError, (err as Error).message);
+			}
+			return;
+		}
+
+		if (msg.method === "source/write") {
+			// Writes a script's file on disk -- the one Rojo syncs it from -- so an applied fix lands
+			// in the repo, not just in Studio. Refuses anything Rojo doesn't manage: that file is
+			// someone else's, and Studio is the only copy anyway.
+			const map = rojoMap();
+			if (!map || map.isEmpty) {
+				replyError(socket, msg, VmcpErrorCode.InvalidRequest, "this server can't see a Rojo project, so there's no file to write");
+				return;
+			}
+			const params = (msg.params ?? {}) as { path?: unknown; className?: unknown; source?: unknown };
+			if (typeof params.path !== "string" || typeof params.className !== "string" || typeof params.source !== "string") {
+				replyError(socket, msg, VmcpErrorCode.InvalidParams, "source/write needs path, className and source");
+				return;
+			}
+			const file = map.fileFor(params.path, params.className);
+			if (!file) {
+				replyError(socket, msg, VmcpErrorCode.InvalidRequest, `Rojo has no file for ${params.path}; it only exists in Studio`);
+				return;
+			}
+			try {
+				const previous = readFileSync(file, "utf8");
+				writeFileSync(file, params.source);
+				log(`wrote ${file}`);
+				replyOk(socket, msg, { file, previous });
+			} catch (err) {
+				replyError(socket, msg, VmcpErrorCode.InternalError, (err as Error).message);
+			}
+			return;
+		}
+
+		if (msg.method === "ledger/read" || msg.method === "ledger/write") {
+			const owner = ownerOf(session, (id) => registry.get(id));
+			const placeId = owner?.placeId ?? session.placeId;
+			const params = (msg.params ?? {}) as { key?: unknown; entry?: unknown };
+			try {
+				if (msg.method === "ledger/read") {
+					replyOk(socket, msg, { placeId, entries: readLedger(placeId) });
+					return;
+				}
+				if (typeof params.key !== "string") {
+					replyError(socket, msg, VmcpErrorCode.InvalidParams, "ledger/write needs a key");
+					return;
+				}
+				// Luau can't put a JSON null in a table, so "no entry" is the delete.
+				const entry = params.entry;
+				const record = entry && typeof entry === "object" ? (entry as Record<string, unknown>) : null;
+				if (entry !== null && entry !== undefined && record === null) {
+					replyError(socket, msg, VmcpErrorCode.InvalidParams, "ledger/write entry must be an object, or absent to clear");
+					return;
+				}
+				replyOk(socket, msg, { placeId, entries: writeLedger(placeId, params.key, record) });
 			} catch (err) {
 				replyError(socket, msg, VmcpErrorCode.InternalError, (err as Error).message);
 			}

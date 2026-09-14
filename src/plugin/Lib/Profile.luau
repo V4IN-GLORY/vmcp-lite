@@ -79,6 +79,17 @@ export type HammerOptions = {
 	labels: { string }?,
 }
 
+-- One target's outcome: the load line's facts plus the capture's report.
+export type Outcome = {
+	label: string,
+	calls: number,
+	errors: number,
+	seconds: number,
+	allocatedKbPerCall: number,
+	report: Report?,
+	error: string?,
+}
+
 export type Report = {
 	frames: number,
 	spanMs: number,
@@ -570,14 +581,22 @@ else
 		pcall(fn, 0)
 	end
 	local made, errors, firstError = 0, 0, nil
+	local allocatedKb = 0
 	local inFrame = 0
 	local started = os.clock()
 	local deadline = started + %s
 	while made < %d and os.clock() < deadline do
 		made += 1
+		local heapBefore = collectgarbage("count")
+		debug.setmemorycategory(label)
 		debug.profilebegin(label)
 		local passed, failure = pcall(fn, made)
 		debug.profileend()
+		debug.resetmemorycategory()
+		local grew = collectgarbage("count") - heapBefore
+		if grew > 0 then
+			allocatedKb += grew
+		end
 		if not passed then
 			errors += 1
 			firstError = firstError or tostring(failure)
@@ -592,6 +611,7 @@ else
 	result.errors = errors
 	result.firstError = firstError
 	result.seconds = os.clock() - started
+	result.allocatedKbPerCall = if made > 0 then allocatedKb / made else 0
 end
 local holder = game:GetService("ReplicatedStorage"):FindFirstChild(%q) or Instance.new("StringValue")
 holder.Name = %q
@@ -640,8 +660,9 @@ end
 -- Runs every target under its own capture, one after another, and hands back the report text for
 -- all of them. This is what profile_scripts does in the playtest; a timeline `server` event calls
 -- it directly as vmcp.Profile.Hammer so old-vs-new plus the output check fit in one run.
-function Profile.Hammer(targets: { Target }, options: HammerOptions?): (string, boolean)
+function Profile.Hammer(targets: { Target }, options: HammerOptions?): (string, boolean, { [string]: Outcome })
 	local settings: HammerOptions = options or {}
+	local outcomes: { [string]: Outcome } = {}
 	local labels: { string } = {}
 	for _, target in targets do
 		table.insert(labels, target.label)
@@ -661,15 +682,35 @@ function Profile.Hammer(targets: { Target }, options: HammerOptions?): (string, 
 			loadResult, loadProblem = runLoad(target, settings.vm, settings.env)
 		end)
 
+		local outcome: Outcome = {
+			label = target.label,
+			calls = 0,
+			errors = 0,
+			seconds = 0,
+			allocatedKbPerCall = 0,
+		}
+		outcomes[target.label] = outcome
+
 		local header = { `== {target.label} ==` }
 		if loadProblem then
-			table.insert(header, `load failed: {loadProblem}`)
+			outcome.error = `load failed: {loadProblem}`
+			table.insert(header, outcome.error :: string)
 			failed = true
 		elseif loadResult.error then
+			outcome.error = loadResult.error
 			table.insert(header, loadResult.error)
 			failed = true
 		else
-			local line = string.format("%d calls in %.2fs", loadResult.calls, loadResult.seconds)
+			outcome.calls = loadResult.calls
+			outcome.errors = loadResult.errors
+			outcome.seconds = loadResult.seconds
+			outcome.allocatedKbPerCall = loadResult.allocatedKbPerCall or 0
+			local line = string.format(
+				"%d calls in %.2fs, ~%.1f KB allocated per call",
+				loadResult.calls,
+				loadResult.seconds,
+				outcome.allocatedKbPerCall
+			)
 			if loadResult.errors > 0 then
 				line ..= ` -- {loadResult.errors} errored, first: {loadResult.firstError}`
 			end
@@ -687,6 +728,7 @@ function Profile.Hammer(targets: { Target }, options: HammerOptions?): (string, 
 		if not report then
 			table.insert(header, `couldn't read the capture: {analyzeProblem}`)
 		else
+			outcome.report = report
 			table.insert(header, Profile.Summarise(report))
 		end
 
@@ -698,19 +740,145 @@ function Profile.Hammer(targets: { Target }, options: HammerOptions?): (string, 
 					`(capture is {math.floor(size / 1024)} KB, too big to ship as one message -- lower frameLimit, or raise VMCP_MAX_MESSAGE_MB)`
 				)
 			else
-				local posted, outcome = Bridge.Post({
+				local posted, written = Bridge.Post({
 					kind = "gprx",
 					name = `{prefix}-{safeName(target.label)}`,
 					data = Profile.Base64(buf),
 				})
-				table.insert(header, if posted then outcome else `dump failed: {outcome}`)
+				table.insert(header, if posted then written else `dump failed: {written}`)
 			end
 		end
 
 		table.insert(parts, table.concat(header, "\n"))
 	end
 
-	return table.concat(parts, "\n\n"), failed
+	return table.concat(parts, "\n\n"), failed, outcomes
+end
+
+-- The label's own row in a report, with or without the engine's "::" prefix.
+local function labelRow(report: Report, label: string): TimerRow?
+	for _, row in report.labels do
+		if row.name == label or row.name == `::{label}` then
+			return row
+		end
+	end
+	return nil
+end
+
+export type Delta = {
+	-- Fractions: 0.4 means "new is 40% of old", so under 1 is faster/smaller.
+	perCall: number?,
+	worstFrame: number?,
+	frameP95: number,
+	heap: number?,
+	allocation: number?,
+	text: string,
+	-- True when nothing got worse and something got meaningfully better.
+	better: boolean,
+}
+
+local function ratio(after: number, before: number): number?
+	if before <= 0 then
+		return nil
+	end
+	return after / before
+end
+
+local function pct(fraction: number?): string
+	if not fraction then
+		return "n/a"
+	end
+	return string.format("%+.0f%%", (fraction - 1) * 100)
+end
+
+-- Two outcomes from the same Hammer call, old against new. Everything is a ratio so a timeline
+-- assertion can say `ctx.delta.worstFrame < 0.8` and mean it.
+function Profile.Compare(old: Outcome, new: Outcome): Delta
+	local oldReport, newReport = old.report, new.report
+	local oldRow = if oldReport then labelRow(oldReport, old.label) else nil
+	local newRow = if newReport then labelRow(newReport, new.label) else nil
+
+	local perCall
+	if oldRow and newRow and oldRow.count > 0 and newRow.count > 0 then
+		perCall = ratio(newRow.inclusiveMs / newRow.count, oldRow.inclusiveMs / oldRow.count)
+	end
+	local worstFrame = if oldRow and newRow then ratio(newRow.worstFrameMs, oldRow.worstFrameMs) else nil
+	local frameP95 = if oldReport and newReport then ratio(newReport.frameP95Ms, oldReport.frameP95Ms) else nil
+	local heap
+	if oldReport and newReport and oldReport.heapStartMb and newReport.heapStartMb then
+		local oldGrowth = (oldReport.heapEndMb :: number) - oldReport.heapStartMb
+		local newGrowth = (newReport.heapEndMb :: number) - newReport.heapStartMb
+		heap = if oldGrowth > 0.05 then newGrowth / oldGrowth else nil
+	end
+	local allocation = ratio(new.allocatedKbPerCall, old.allocatedKbPerCall)
+
+	local worse = (perCall or 1) > 1.05 or (worstFrame or 1) > 1.1 or (allocation or 1) > 1.25
+	local gained = (perCall or 1) < 0.85 or (worstFrame or 1) < 0.85 or (allocation or 1) < 0.75
+	local lines = {
+		`{old.label} -> {new.label}:`,
+		`  per call    {pct(perCall)}` .. (if oldRow and newRow
+			then string.format(
+				"  (%.3fms -> %.3fms)",
+				oldRow.inclusiveMs / math.max(oldRow.count, 1),
+				newRow.inclusiveMs / math.max(newRow.count, 1)
+			)
+			else ""),
+		`  worst frame {pct(worstFrame)}` .. (if oldRow and newRow
+			then string.format("  (%.2fms -> %.2fms)", oldRow.worstFrameMs, newRow.worstFrameMs)
+			else ""),
+		`  frame p95   {pct(frameP95)}`,
+		`  allocation  {pct(allocation)}`
+			.. string.format("  (%.1f KB -> %.1f KB per call)", old.allocatedKbPerCall, new.allocatedKbPerCall),
+		`  heap growth {pct(heap)}`,
+		if worse
+			then "  verdict: REGRESSION on at least one axis"
+			elseif gained then "  verdict: better"
+			else "  verdict: no meaningful change",
+	}
+	return {
+		perCall = perCall,
+		worstFrame = worstFrame,
+		frameP95 = frameP95 or 1,
+		heap = heap,
+		allocation = allocation,
+		text = table.concat(lines, "\n"),
+		better = gained and not worse,
+	}
+end
+
+-- A capture of whatever the game is doing on its own for `seconds` -- the real-load baseline.
+-- Nothing is hammered; whatever drives the game (the user, a client timeline event walking and
+-- firing remotes) is the load. Returns the report text and the report.
+export type ObserveOptions = { frameLimit: number?, top: number?, labels: { string }?, dump: boolean?, name: string? }
+
+function Profile.Observe(seconds: number?, options: ObserveOptions?): (string, Report?)
+	local settings: ObserveOptions = options or {}
+	local hold = math.max(seconds or 3, 0.1)
+	local buf, why = Profile.Capture(settings.frameLimit or MAX_FRAME_LIMIT, function()
+		task.wait(hold)
+	end)
+	if not buf then
+		return `no capture: {why}`, nil
+	end
+	local report, problem = Profile.Analyze(buf, { labels = settings.labels, top = settings.top or 25 })
+	if not report then
+		return `couldn't read the capture: {problem}`, nil
+	end
+	local text = `== observed {string.format("%.1f", hold)}s of the game as it runs ==\n` .. Profile.Summarise(report)
+	if settings.dump then
+		local size = buffer.len(buf)
+		if size <= MAX_DUMP_BYTES then
+			local posted, outcome = Bridge.Post({
+				kind = "gprx",
+				name = `{safeName(settings.name or os.date("%Y%m%d-%H%M%S"))}-observe`,
+				data = Profile.Base64(buf),
+			})
+			text ..= "\n" .. (if posted then outcome else `dump failed: {outcome}`)
+		else
+			text ..= `\n(capture is {math.floor(size / 1024)} KB, too big to ship -- lower frameLimit)`
+		end
+	end
+	return text, report
 end
 
 local ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"

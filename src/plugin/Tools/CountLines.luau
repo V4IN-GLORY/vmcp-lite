@@ -15,7 +15,9 @@ local Tool = {}
 
 Tool.Definition = {
 	name = "count_lines",
-	description = "Lines of code for every script under a root, biggest first, with totals. Skips any "
+	description = "Lines of code for every script under a root, biggest first, with totals and a hot "
+		.. "column (per-frame connections, while-true loops, connect count) since a 40-line Heartbeat "
+		.. "handler outranks a 2000-line shop. Skips any "
 		.. `script tagged {EXCLUDE_TAG} and anything under an instance with that tag -- tag LibMP, `
 		.. "vendored libraries and the VMCP plugin itself so they don't dominate the list. This is "
 		.. "the first step of a performance pass: the long scripts are where the frame time usually "
@@ -43,7 +45,38 @@ Tool.Definition = {
 	tags = { title = "Count Lines", readOnly = true, idempotent = true },
 }
 
-type Entry = { path: string, className: string, lines: number, code: number }
+type Entry = {
+	path: string,
+	className: string,
+	lines: number,
+	code: number,
+	perFrame: number,
+	polling: number,
+	connects: number,
+}
+
+-- Cheap signals that a script does per-frame work, which ranks better than length does.
+local PER_FRAME_PATTERNS = {
+	"Heartbeat:Connect",
+	"RenderStepped:Connect",
+	"Stepped:Connect",
+	"PreSimulation:Connect",
+	"PostSimulation:Connect",
+	"PreRender:Connect",
+	"PreAnimation:Connect",
+	"BindToRenderStep",
+}
+
+local function countHot(source: string): (number, number, number)
+	local perFrame = 0
+	for _, pattern in PER_FRAME_PATTERNS do
+		local _, hits = string.gsub(source, pattern, "")
+		perFrame += hits
+	end
+	local _, polling = string.gsub(source, "while%s+true%s+do", "")
+	local _, connects = string.gsub(source, ":Connect%(", "")
+	return perFrame, polling, connects
+end
 
 -- Total lines and lines that aren't blank or a bare comment, so a script that's half header
 -- comments doesn't outrank one that's all logic.
@@ -90,12 +123,18 @@ function Tool.Run(arguments: { root: string?, maxResults: number?, minLines: num
 			continue
 		end
 		local lines, code = measure(source)
+		local perFrame, polling, connects = countHot(source)
 		totalLines += lines
 		totalCode += code
-		table.insert(
-			entries,
-			{ path = instance:GetFullName(), className = instance.ClassName, lines = lines, code = code }
-		)
+		table.insert(entries, {
+			path = instance:GetFullName(),
+			className = instance.ClassName,
+			lines = lines,
+			code = code,
+			perFrame = perFrame,
+			polling = polling,
+			connects = connects,
+		})
 	end
 
 	table.sort(entries, function(a, b)
@@ -118,9 +157,26 @@ function Tool.Run(arguments: { root: string?, maxResults: number?, minLines: num
 			break
 		end
 		shown += 1
+		local hot = {}
+		if entry.perFrame > 0 then
+			table.insert(hot, `{entry.perFrame} per-frame`)
+		end
+		if entry.polling > 0 then
+			table.insert(hot, `{entry.polling} while-true`)
+		end
+		if entry.connects > 0 then
+			table.insert(hot, `{entry.connects} connect`)
+		end
 		table.insert(
 			out,
-			string.format("%6d  (%5d code)  %-12s %s", entry.lines, entry.code, entry.className, entry.path)
+			string.format(
+				"%6d  (%5d code)  %-12s %s%s",
+				entry.lines,
+				entry.code,
+				entry.className,
+				entry.path,
+				if #hot > 0 then "  [" .. table.concat(hot, ", ") .. "]" else ""
+			)
 		)
 	end
 	if unreadable > 0 then

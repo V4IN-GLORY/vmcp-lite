@@ -1,31 +1,55 @@
 ---
 name: vmcp-optimization
-description: Finding and fixing frame-time problems in a Roblox game with VMCP — ranking scripts by size with count_lines, reading them for hot paths, hammering suspect functions under the MicroProfiler with profile_scripts (LibMP captures, .gprx dumps), reading self vs inclusive time, benchmarking a candidate fix against the original without touching the game, verifying nothing changed, and reporting it in plain words. Use for "why is this laggy", "optimize this script", "what's eating frame time", or any performance pass on a live place.
+description: Finding and fixing frame-time problems in a Roblox game with VMCP — a real-load MicroProfiler baseline (profile_scripts observe, multi-client load), a hot-path lint and line/hot-column ranking, per-function auto-instrumentation and targeted hammering with LibMP captures and .gprx dumps, self vs inclusive time and allocation per call, a candidate fix benchmarked and proven equivalent in one timeline (Profile.Hammer, Profile.Compare, Equiv.Check), handed to the user in a playtest before anything is written (try_scripts), applied with an automatic revert (apply_fix), and tracked per place (optimization_ledger). Use for "why is this laggy", "optimize this script", "what's eating frame time", or any performance pass on a live place.
 ---
 
 # Optimizing a game with VMCP
 
-This is a loop, not a checklist. You run it on one script, report, then either run it on the next
-script or stop and let the user playtest. The game must behave identically when you're done —
-the only thing you're allowed to change is how long it takes.
+This is a loop, not a checklist. Each pass takes one script from "suspect" to "applied or
+rejected", and the game must behave identically when you're done — the only thing you're allowed
+to change is how long it takes.
 
 ```
-count_lines                      -- who's big
-  -> read the script + its callers/callees
-  -> pick the functions/sections that look hot
-  -> profile_scripts             -- hammer them under the MicroProfiler, get numbers + a .gprx
-  -> read self time, worst frame, heap delta; dig with vmcp.Profile.Session() if needed
-  -> write a candidate fix as a module that lives only in the playtest
-  -> profile_scripts again: old vs new, same fake data, same call
-  -> prove same outputs on the same inputs
-  -> report in plain words
-  -> try_scripts: a playtest running the candidate, nothing saved -- the user plays it
-  -> they say yes: apply to disk; they say no or find a break: stop the playtest, it's gone
-  -> next script, or pause
+optimization_ledger read            -- what a previous pass already did
+  -> profile_scripts { observe }    -- the real-load baseline: what costs frame time while it's played
+  -> lint_hotpaths + count_lines    -- the shortlist, ranked by how often it runs
+  -> read the script (from disk)    -- the callers, the callees, the state it needs
+  -> profile_scripts { autoSections, targets }   -- which function, which lines, how much, how often
+  -> write the candidate            -- whole module, same signature, same behaviour
+  -> run_timeline                   -- Hammer old vs new, Compare, Equiv.Check, one call
+  -> report, then try_scripts       -- the user plays the candidate; nothing is saved
+  -> apply_fix { check }            -- only after yes; reverts itself if anything fails
+  -> optimization_ledger write      -- close the script out; next one, or pause
 ```
 
-Load `vmcp-debugging` and `vmcp-timeline` alongside this — `vm = "game"`, `ctx`, `Remotes.WatchAll`
-and `Bench` are all used below and explained there.
+Load `vmcp-debugging` and `vmcp-timeline` alongside this — `vm = "game"`, `ctx`, `input`,
+`Remotes.WatchAll` and `Bench` are all used below and explained there.
+
+## The tools and the library
+
+| tool | what it does | when |
+|---|---|---|
+| `optimization_ledger` | per-place record: which scripts were profiled, proposed, applied, rejected, with numbers | first call of a pass; last call per script |
+| `profile_scripts { observe }` | captures the game **running on its own** for N seconds and reports the top scopes | the baseline, before you touch anything |
+| `lint_hotpaths` | static shortlist: tree walks / allocation / string building / physics queries / connections inside per-frame handlers and loops, polling loops, legacy `wait`, deep paths | right after the baseline; no playtest needed |
+| `count_lines` | scripts by size with a hot column (per-frame connections, while-true loops) | same time as lint; ordering only |
+| `profile_scripts { autoSections }` | every named function in a script gets its own scope, labelled `Script.fn` | "this script is slow" → "it's this function", one call |
+| `profile_scripts { targets, sections }` | hammer named functions with fake data, bracket line ranges | zooming in; per-call cost, allocation per call, worst frame |
+| `try_scripts` | playtest running your candidate Source; nothing saved anywhere | after the report, before the user says yes |
+| `apply_fix` | writes the file on disk, waits for Rojo, restarts the playtest, runs your check with the previous version planted beside it, **reverts itself on any failure** | after the user says yes |
+
+In `run_luau` and timeline events, `vmcp` carries the same machinery so a whole comparison is one
+call:
+
+| library | use |
+|---|---|
+| `vmcp.Profile.Hammer(targets, opts) -> text, failed, outcomes` | the playtest half of `profile_scripts`; `outcomes[label]` has `calls, allocatedKbPerCall, report` |
+| `vmcp.Profile.Compare(outcomes.old, outcomes.new) -> delta` | ratios for per-call, worst frame, p95, allocation, heap; `delta.better`, `delta.text` |
+| `vmcp.Profile.Observe(seconds, opts) -> text, report` | the baseline capture from inside a timeline |
+| `vmcp.Profile.Session()` / `.LibMP()` / `.LastBuffer` | reopen the last capture and walk it with LibMP directly |
+| `vmcp.Equiv.Check(old, new, generate, opts) -> result` | same inputs into both: returns, errors, state; plus broken-argument probes. In the game VM it's `require(<container>.__VMCP_Equiv)` next to the game bridge |
+| `vmcp.Load.Wander(input, opts)` | client event: walk, jump, fire remotes for N seconds, so a capture has real players in it |
+| `vmcp.Lint.Script(source)`, `vmcp.Instrument.Functions(source, prefix)` | the lint and the auto-instrumenter as functions, for a script that only exists in a timeline |
 
 ## Reference files — open on demand, not up front
 
@@ -50,26 +74,21 @@ humanoid stepping and raycasts live. `scopes/render.md` / `scopes/gpu.md` for an
 
 ## Ground rules
 
-- **One call per question, not per step.** Every tool call re-sends the conversation. Put all
-  the functions you want numbers for in one `profile_scripts` (up to 8 targets, all the
-  sections at once). Plant the candidate, hammer old and new, diff the outputs and check the
-  logs in **one** `run_timeline` (Step 6 has the template). Read scripts from disk with the Read
-  tool — this is a Rojo project, the source is right there — instead of asking Studio for it.
-  When you need three facts from the live game, one `run_luau` that returns a table with three
-  fields, never three calls. If you catch yourself about to make a second call to the same
-  context, fold it into the first.
-- **Never change behaviour.** Not "mostly the same" — the same. Same return values, same order of
-  side effects, same events fired, same errors on bad input. If the faster version can't do that,
-  say so and let the user decide.
-- **Every change gets named.** If you fix a bug you tripped over, or a fast path skips a `warn`
-  that used to fire, the user hears about it even when it's irrelevant. They own the game; you
-  don't get to decide what's irrelevant.
-- **Nothing is applied until the user has played it.** The loop ends with a written
-  recommendation and a playtest running the candidate via `try_scripts` — the place, Studio and
-  disk all still hold the original. The user plays; if it's fine they say so and *then* you edit
-  the file. If they find a break, stopping the playtest is the whole revert.
-- **Measure before and after with the same load.** A fix without a before/after pair from the
-  same `profile_scripts` call isn't a fix, it's a guess.
+- **One call per question, not per step.** Every tool call re-sends the conversation. All the
+  functions you want numbers for go in one `profile_scripts` (8 targets, every section, every
+  `autoSections` script). Candidate + old/new hammer + Compare + Equiv + logs is **one**
+  `run_timeline` (Step 6). Read scripts from disk with the Read tool — this is a Rojo project —
+  instead of asking Studio. Three facts from the live game is one `run_luau` returning a table.
+- **Measure the real thing first.** A hammered function tells you what a function *costs*; only
+  the observed baseline tells you what the game *spends*. Optimizing the wrong function perfectly
+  is the most expensive mistake this loop can make.
+- **Never change behaviour.** Same return values, same order of side effects, same events fired,
+  same errors on bad input. `Equiv.Check` is how you know, not how you feel about it.
+- **Every change gets named.** A bug you tripped over, a `warn` that fires once instead of every
+  time, an error message that reads differently — the user hears about it even when it's
+  irrelevant. They own the game; you don't get to decide what's irrelevant.
+- **Nothing is applied until the user has played it.** Report, `try_scripts`, wait. Then
+  `apply_fix`, which reverts itself if the check or the logs say no.
 - **Read p95 and worst frame, not mean.** A function whose mean is fine and whose worst frame is
   30ms is the one players feel.
 - **Don't hammer things that talk to the outside world.** DataStore, HttpService, MessagingService,
@@ -81,38 +100,87 @@ humanoid stepping and raycasts live. `scopes/render.md` / `scopes/gpu.md` for an
 - **LibMP in the place.** `profile_scripts` looks for a `ModuleScript` named `LibMP` in
   `ReplicatedStorage` (then anywhere). Missing → pass `installLibMP = true` once; it inserts
   Creator Store asset `109009378620272` and tags it `excludeLOC`. That's a change to the place —
-  tell the user, and tell them where it went. Or they can add it themselves from
-  github.com/Roblox/libmp/releases.
-- **Script injection allowed** for VMCP in Plugin Management, or `count_lines` can't read Source and
-  `sections` can't be written.
-- **A playtest.** `profile_scripts` starts one if none is running (Play Solo, 1 player, unless you
-  pass `players`). It leaves it running. If `sections` are given and a playtest is already up, it
-  stops and restarts it so the instrumented copies are what runs — say so before you call it if
-  the user might be mid-test.
+  tell the user, and tell them where it went.
+- **Script injection allowed** for VMCP in Plugin Management, or Source can't be read or swapped.
+- **One Studio window.** Playtest DataModels attach to whichever window's plugin connected last;
+  with two windows open the server context can be the other window's test and the first window's
+  socket drops when a test starts.
+- **Rojo connected** (`rojo serve` + the Rojo plugin) for `apply_fix` — it writes the file and
+  waits for Studio to follow; without Rojo it times out and reverts.
+- **A playtest** is started by the tools as needed. `sections`, `autoSections`, `try_scripts` and
+  `apply_fix` **restart** a running one so their copies are what runs — warn the user before if
+  they might be mid-test.
 
-## Step 1 — find the big scripts
+## Step 0 — read the ledger
 
 ```
-count_lines                                  -- whole place
-count_lines { root = "ServerScriptService" } -- one side
-count_lines { minLines = 200 }               -- only the ones that matter
+optimization_ledger { action = "read" }
 ```
 
-It uses `QueryDescendants("LuaSourceContainer:not(.excludeLOC)")` and skips anything under an
-instance tagged `excludeLOC`, so tag LibMP, vendored libraries, and the VMCP plugin folder
-(`ServerStorage.VMCP` in this place) before reading the numbers. Output is sorted by total lines,
-with a code-only count next to it so a script that's half comments doesn't outrank real logic.
+Skip scripts marked `applied` or `rejected` unless the user asks; pick up `proposed` ones where
+they stopped. An empty ledger is a fresh pass.
 
-Size is a heuristic, not a verdict. A 40-line `Heartbeat` handler can cost more than a 2000-line
-shop. Use the list to order your reading, then look for the actual hot-path shapes below.
+## Step 1 — the baseline, under real load
 
-## Step 2 — read for hot paths
+```json
+{ "observe": { "seconds": 4 }, "top": 30, "name": "baseline" }
+```
 
-Read the whole script **from disk** (Read tool on the file Rojo syncs it from — free, no tool
-round-trip; `search_scripts { drift = true }` once if you doubt Studio matches). Then read what it
-requires and who requires it (Grep on the repo for callers; `search_scripts` only when the thing
-you're after was made in Studio and isn't on disk). You need the stack — a function that looks cheap can be called 300
-times a frame by something else.
+That captures the game **as it runs** — no hammering — and lists the top scopes by self time, the
+slowest frames and what filled them. It answers the only question that matters at this point:
+what does the game actually spend frame time on while someone plays it?
+
+Something has to be playing it during those seconds. In order of preference:
+
+1. **The user.** Start the playtest (`playtest { action = "start" }`), tell them to play the
+   thing they think is slow for ten seconds, and call `observe` while they do. Cheapest, most
+   real.
+2. **Scripted players.** One timeline: `players = 4` (or 8), a `client` event per player running
+   `vmcp.Load.Wander(input, { seconds = 6, seed = <player index>, remotes = { { remote = game.ReplicatedStorage.Remotes.Swing, args = {"Sword"}, perSecond = 2 } } })`,
+   and a `server` event at 1s doing `ctx.baseline = vmcp.Profile.Observe(4, { top = 30 })`. Real
+   movement, animation, replication and remote traffic, at the player count where per-player
+   loops actually hurt.
+3. **A timeline that reaches the state.** If the slow thing only happens at wave 12 or with the
+   boss alive, a `server` event that sets that state up (spawn the boss, set the wave) followed by
+   the `Observe`.
+
+**When a real load isn't possible** — the state can't be reached from a timeline, it needs
+something external (a DataStore full of real saves, a Discord bot, a live economy), or the user
+can't play right now — fall back to hammering with the **most realistic fake data you can build**:
+captured remote arguments (`Remotes.Shapes()`), rigs cloned from `ServerStorage`, tables shaped
+like the real module state read via `vm = "game"`, and call rates matching what the game does
+(per-frame handler → `perFrame = 1`; a remote → how often a player fires it). Say in the report
+that the numbers are synthetic and why.
+
+Read the baseline the way "Reading the report" below describes. What you're looking for: user
+labels or `$Script` in the top rows (script work), a `Lua/GC` row with a heap climbing (allocation),
+and whether the worst frames are script-shaped or engine-shaped (`Physics/stepWorld`,
+`Render`, `MegaReplicator`). If the top of the list is engine work your scripts don't drive,
+say so now — a script pass won't fix a map with 40k parts.
+
+## Step 2 — the shortlist
+
+```
+lint_hotpaths { minSeverity = "medium" }
+count_lines { minLines = 100 }
+```
+
+Both in the same reply as the baseline read. `lint_hotpaths` is the table below applied
+mechanically, with context: `GetDescendants` inside a `Heartbeat` handler is high, the same call
+in a function that runs once a match is low. Its "scripts by weight" line plus `count_lines`'s
+hot column (`[2 per-frame, 1 while-true, 9 connect]`) is your order of reading. Cross it with the
+baseline: a script that's heavy in lint *and* shows up in the capture's top rows is the first
+one; a script that's heavy in lint and absent from the capture is a maybe.
+
+Lint is a shortlist, not a verdict. It can't see how often a named function is called, only what
+it does when it is.
+
+## Step 3 — read the script
+
+Read the whole script **from disk** (Read tool on the file Rojo syncs it from — free, no
+round-trip; `search_scripts { drift = true }` once if you doubt Studio matches). Then what it
+requires and who requires it (Grep the repo). You need the stack — a function that looks cheap can
+be called 300 times a frame by something else.
 
 What actually costs frame time, in rough order of how often it's the culprit:
 
@@ -133,11 +201,55 @@ What actually costs frame time, in rough order of how often it's the culprit:
 | remotes fired per frame, or `FireAllClients` with big tables | serialisation, network |
 | `wait()`, `spawn()`, `delay()` | legacy scheduler; `task.*` is cheaper and more predictable |
 
-Mark **functions** (the unit `profile_scripts` hammers) and **sections** inside them (a loop, a
-query, a block you suspect). Note what each function needs to be called: which arguments, what
-module state must exist first, whether it needs a character in the world.
+Mark **functions** (what `targets` hammer), **sections** inside them (a loop, a query, a block),
+and what each function needs to be called: which arguments, what module state must exist, whether
+it needs a character in the world.
 
-## Step 3 — build fake data
+## Step 4 — zoom in
+
+Two moves, usually one call each — and if you already know the function, one call total.
+
+### Which function: `autoSections`
+
+```json
+{ "observe": { "seconds": 4 }, "autoSections": ["ServerScriptService.Combat"], "top": 30 }
+```
+
+Every named function in `Combat` gets a `debug.profilebegin("Combat.<name>")` scope for the
+duration of the playtest (early returns handled; anonymous handlers skipped — name the function
+you want seen). The observe then reports `::Combat.ResolveHit 3.02ms avg, worst frame 31ms`
+instead of `$Script 40ms`. That's the whole "which function is it" step in one round-trip, under
+real load. `autoSections` combines with `targets` and with `observe`; it restarts the playtest.
+
+### How much and why: `targets` + `sections`
+
+```json
+{
+  "targets": [
+    { "label": "Combat.ResolveHit", "setup": "...", "calls": 600, "seconds": 2 }
+  ],
+  "sections": [
+    { "script": "ServerScriptService.Combat", "fromLine": 88, "toLine": 104, "label": "ResolveHit.partScan" },
+    { "script": "ServerScriptService.Combat", "fromLine": 110, "toLine": 131, "label": "ResolveHit.applyDamage" }
+  ],
+  "where": "server",
+  "frameLimit": 128,
+  "name": "combat-before"
+}
+```
+
+Put **every** function from the script in the one call — up to 8 targets, each its own capture —
+and every section you want. Ask for `top = 40` up front rather than a second call. Each target
+reports calls made, **allocation per call** (`~11.2 KB allocated per call` — the number behind a
+climbing heap), and the full capture report.
+
+What happens, in order: sections and auto-instrumentation are written into the scripts' Source in
+Studio; a playtest is started (or restarted); Studio's Source is put back the moment the test is
+up; the load runs in the live context with every call wrapped in `debug.profilebegin(label)` and
+`debug.setmemorycategory(label)`; LibMP snapshots the last `frameLimit` frames; the snapshot is
+read and written to `~/.vmcp/profiles/<name>-<label>.gprx`.
+
+### Building fake data
 
 `setup` is a Luau body that runs once and `return`s the function to hammer. It runs in the
 **game VM** by default, so `require(game.ServerScriptService.Combat)` gives you the live module
@@ -184,40 +296,6 @@ Things that will bite:
   profile the non-yielding sub-functions instead.
 - **`vm = "plugin"`** gives a fresh module copy with none of the game's state. Only for pure
   functions. It does put `vmcp` in scope, if you want `vmcp.Bench` or `vmcp.Remotes` in `setup`.
-
-## Step 4 — profile
-
-```json
-{
-  "targets": [
-    {
-      "label": "Combat.ResolveHit",
-      "setup": "...the body above...",
-      "calls": 600,
-      "seconds": 2
-    }
-  ],
-  "sections": [
-    { "script": "ServerScriptService.Combat", "fromLine": 88, "toLine": 104, "label": "ResolveHit.partScan" },
-    { "script": "ServerScriptService.Combat", "fromLine": 110, "toLine": 131, "label": "ResolveHit.applyDamage" }
-  ],
-  "where": "server",
-  "frameLimit": 128,
-  "name": "combat-before"
-}
-```
-
-Put **every** function from the script you're examining in the one call — up to 8 targets, each
-its own capture — and every section you want, in the same call. A second `profile_scripts` for
-the function you forgot costs a full round-trip of everything above it. If you want a deeper
-LibMP walk of the capture as well, do it in the same reply's next `run_luau`, not after reading
-the report and thinking about it: ask for `top = 40` up front instead.
-
-What happens, in order: sections are written into the scripts' Source in Studio; a playtest is
-started (or restarted); the load runs in the live context with every call wrapped in
-`debug.profilebegin(label)`; LibMP snapshots the last `frameLimit` frames; the snapshot is read and
-written to `~/.vmcp/profiles/<name>-<label>.gprx`; the Sources are put back. Each target is its own
-capture, run one after another.
 
 ### Sizing the load
 
@@ -459,12 +537,12 @@ timeline below as a long string. If the function depends on the module's private
 whole-module copy is what makes those exist. If it depends on *live* state the game filled at
 startup, read it from the live module in `setup` and pass it in.
 
-## Step 6 — benchmark, compare, verify: one timeline
+## Step 6 — benchmark, compare, prove: one timeline
 
-This is where token discipline pays. Planting the candidate, hammering old and new, proving the
-outputs match, checking state, and checking logs is **one `run_timeline` call**, not five. The
-candidate ModuleScript is created inside the playtest (never in the real place), `vmcp.Profile.Hammer`
-is the same code `profile_scripts` runs, and the assertion judges the whole thing.
+Planting the candidate, hammering old and new, comparing, proving equivalence and checking logs
+is **one `run_timeline` call**. `vmcp.Profile.Hammer` is the same code `profile_scripts` runs,
+`Profile.Compare` turns two outcomes into ratios with a verdict, `Equiv.Check` runs the same
+inputs through both versions, and the assertion judges all of it.
 
 ```json
 {
@@ -472,46 +550,45 @@ is the same code `profile_scripts` runs, and the assertion judges the whole thin
   "keepOpen": true,
   "events": [
     {
-      "at": 0, "context": "server", "blocking": true, "label": "plant + hammer + compare",
-      "code": "local SS = game:GetService('ServerStorage')\nlocal HS = game:GetService('HttpService')\n\n-- 1. the candidate, playtest-only\nlocal m = Instance.new('ModuleScript')\nm.Name = 'Combat_Candidate'\nm.Source = [==[\n... the whole module with the fix applied ...\n]==]\nm.Parent = SS\n\n-- 2. shared fake data, built once so both versions see the same thing\nlocal setup = [[\n  local pool = {}\n  for i = 1, 8 do\n    local rig = game.ServerStorage.Rigs.Dummy:Clone()\n    rig:PivotTo(CFrame.new(i * 6, 5, 0)); rig.Parent = workspace; pool[i] = rig\n  end\n  local attacker = game.Players:GetPlayers()[1].Character\n  return function(i)\n    local target = pool[(i % #pool) + 1]\n    target.Humanoid.Health = 100\n    M.ResolveHit(attacker, target, 'Sword')\n  end\n]]\nlocal old = 'local M = require(game.ServerScriptService.Combat)\\n' .. setup\nlocal new = 'local M = require(game.ServerStorage.Combat_Candidate)\\n' .. setup\n\n-- 3. warm both (first run carries compile + lazy init), then the run that counts\nvmcp.Profile.Hammer({ { label = 'warm.old', setup = old, calls = 50, seconds = 0.5 }, { label = 'warm.new', setup = new, calls = 50, seconds = 0.5 } }, { dump = false, top = 1 })\nlocal report = vmcp.Profile.Hammer({\n  { label = 'ResolveHit.old', setup = old, calls = 600, seconds = 2 },\n  { label = 'ResolveHit.new', setup = new, calls = 600, seconds = 2 },\n}, { name = 'combat-compare', top = 12, labels = { 'ResolveHit.partScan', 'ResolveHit.applyDamage' } })\nctx.report = report\n\n-- 4. same inputs into both, compare results and the state they leave behind\nlocal ok, mismatches = vmcp.Game.Eval([[\n  local Old = require(game.ServerScriptService.Combat)\n  local New = require(game.ServerStorage.Combat_Candidate)\n  local HS = game:GetService('HttpService')\n  local bad = {}\n  for i = 1, 200 do\n    local a = { Old.ResolveHit(makeArgs(i)) }\n    local b = { New.ResolveHit(makeArgs(i)) }\n    if HS:JSONEncode(a) ~= HS:JSONEncode(b) then table.insert(bad, i) end\n  end\n  for _, args in { {nil}, {'x'}, {deadRig} } do  -- the error paths real callers can hit\n    local ea = select(2, pcall(Old.ResolveHit, table.unpack(args)))\n    local eb = select(2, pcall(New.ResolveHit, table.unpack(args)))\n    if tostring(ea) ~= tostring(eb) then table.insert(bad, 'err:' .. tostring(ea) .. ' vs ' .. tostring(eb)) end\n  end\n  return HS:JSONEncode(bad)\n]])\nctx.mismatches = if ok then HS:JSONDecode(mismatches) else { 'eval failed: ' .. tostring(mismatches) }\n\n-- 5. leave nothing behind\nfor _, rig in workspace:GetChildren() do if rig.Name == 'Dummy' then rig:Destroy() end end\nm:Destroy()"
+      "at": 0, "context": "server", "blocking": true, "label": "plant + hammer + compare + prove",
+      "code": "local SS = game:GetService('ServerStorage')\n\n-- 1. the candidate, playtest-only\nlocal m = Instance.new('ModuleScript')\nm.Name = 'Combat_Candidate'\nm.Source = [==[\n... the whole module with the fix applied ...\n]==]\nm.Parent = SS\n\n-- 2. one setup body, both versions -- only the require differs\nlocal setup = [[\n  local pool = {}\n  for i = 1, 8 do\n    local rig = game.ServerStorage.Rigs.Dummy:Clone()\n    rig:PivotTo(CFrame.new(i * 6, 5, 0)); rig.Parent = workspace; pool[i] = rig\n  end\n  local attacker = game.Players:GetPlayers()[1].Character\n  return function(i)\n    local target = pool[(i % #pool) + 1]\n    target.Humanoid.Health = 100\n    M.ResolveHit(attacker, target, 'Sword')\n  end\n]]\nlocal old = 'local M = require(game.ServerScriptService.Combat)\\n' .. setup\nlocal new = 'local M = require(game.ServerStorage.Combat_Candidate)\\n' .. setup\n\n-- 3. warm both, then the run that counts\nvmcp.Profile.Hammer({ { label = 'warm.old', setup = old, calls = 50, seconds = 0.5 }, { label = 'warm.new', setup = new, calls = 50, seconds = 0.5 } }, { dump = false, top = 1 })\nlocal text, failed, outcomes = vmcp.Profile.Hammer({\n  { label = 'ResolveHit.old', setup = old, calls = 600, seconds = 2 },\n  { label = 'ResolveHit.new', setup = new, calls = 600, seconds = 2 },\n}, { name = 'combat-compare', top = 12, labels = { 'ResolveHit.partScan', 'ResolveHit.applyDamage' } })\nctx.report = text\nlocal delta = vmcp.Profile.Compare(outcomes['ResolveHit.old'], outcomes['ResolveHit.new'])\nctx.delta = { text = delta.text, better = delta.better, perCall = delta.perCall, worstFrame = delta.worstFrame, allocation = delta.allocation }\n\n-- 4. same inputs into both: returns, errors, state, broken-argument probes\nlocal ok, equiv = vmcp.Game.Eval([[\n  local Equiv = require(game.ServerScriptService.__VMCP_Equiv)\n  local Old = require(game.ServerScriptService.Combat)\n  local New = require(game.ServerStorage.Combat_Candidate)\n  local rig = game.ServerStorage.Rigs.Dummy:Clone(); rig.Parent = workspace\n  local attacker = game.Players:GetPlayers()[1].Character\n  local result = Equiv.Check(Old.ResolveHit, New.ResolveHit, function(i)\n    rig.Humanoid.Health = 100\n    return { attacker, rig, if i % 2 == 0 then 'Sword' else 'Axe' }\n  end, { n = 200, state = function() return { health = rig.Humanoid.Health, combo = Old.State.combo } end })\n  rig:Destroy()\n  return game:GetService('HttpService'):JSONEncode({ passed = result.passed, text = result.text })\n]])\nctx.equiv = if ok then game:GetService('HttpService'):JSONDecode(equiv) else { passed = false, text = 'eval failed: ' .. tostring(equiv) }\n\n-- 5. leave nothing behind\nfor _, rig in workspace:GetChildren() do if rig.Name == 'Dummy' then rig:Destroy() end end\nm:Destroy()"
     },
     {
       "at": 0.5, "context": "plugin", "label": "verify",
-      "code": "local _, drift = vmcp.Tool('search_scripts', { drift = true })\nlocal _, logs = vmcp.Tool('get_logs', { context = 'server' })\nctx.drift = drift\nctx.serverErrors = select(2, logs:gsub('%[error%]', ''))"
+      "code": "local _, drift = vmcp.Tool('search_scripts', { drift = true })\nlocal _, logs = vmcp.Tool('get_logs', { context = 'server', severity = 'error', sinceSeconds = 60 })\nctx.drift = drift\nctx.serverErrors = if logs:find('^no log lines') then 0 else 1"
     }
   ],
-  "assertion": "return #ctx.mismatches == 0 and ctx.serverErrors == 0 and ctx.drift:find('agree') ~= nil"
+  "assertion": "return ctx.delta.better and ctx.equiv.passed and ctx.serverErrors == 0 and ctx.drift:find('agree') ~= nil"
 }
 ```
 
-What that buys you: one reply holding the old/new report, the output diff, the drift check and
-the server error count. The event is `blocking` because `Hammer` yields for the whole load;
-`0.5` on the plugin event is "after it", not a real delay.
+One reply holds the old/new report, the Compare verdict, the Equiv result, the drift check and the
+error count. The event is `blocking` because `Hammer` yields for the whole load; `0.5` on the
+plugin event is "after it", not a real delay.
 
-Notes on the template:
+Notes:
 
-- `keepOpen: true` because you'll likely run a second timeline (a different fix, a different
-  script) and a playtest costs seconds to start. `try_scripts` in Step 7 restarts it anyway.
-- The candidate goes in `ServerStorage` **inside the playtest**. Nothing is saved; `m:Destroy()`
-  at the end is tidiness, not safety.
-- `vmcp.Profile.Hammer(targets, { vm, env, frameLimit, top, dump, name, labels })` is the
-  playtest half of `profile_scripts`. Same targets shape, same report text. `labels` adds section
-  names to the "your labels" block — sections still need the `profile_scripts` tool once to be
-  written in, since only the edit session can edit Source; after that the running playtest keeps
-  them and every `Hammer` sees them.
-- `vmcp.Game.Eval` runs in the game VM and only returns text — encode the answer as JSON on that
-  side and decode it here.
-- Side-effect functions: compare the **state after**, not the return. Read the humanoid, the
-  module's table, `vmcp.Remotes.Calls()` for each version, and push those through `ctx` too.
-- Run the timeline **twice** only if the numbers look off; the warm pass inside it already covers
-  compile and lazy init.
+- `Equiv` in the game VM: `require(game.ServerScriptService.__VMCP_Equiv)` on the server,
+  `require(<LocalPlayer>.PlayerScripts.__VMCP_Equiv)` on a client — GameVm installs it next to its
+  bridge the first time a game-VM snippet runs. In the plugin VM it's just `vmcp.Equiv`.
+- `Equiv.Check` copies the arguments before each version sees them, so a function that mutates its
+  input can't leak into the other run. `state` is a snapshot taken after each call and diffed — put
+  whatever the function is supposed to change in it. Probes (`arg 2: nil`, `arg 1: string instead
+  of table`, "no arguments") compare how both versions fail; a differing *error message* on a probe
+  is a real finding — usually acceptable, always reported.
+- `Compare` is ratios: `perCall 0.14` means the new one takes 14% of the time. `better` is "nothing
+  got worse by more than noise and something got at least 15% better". A per-call win with a
+  worse worst-frame is a regression and it says so.
+- The candidate goes in `ServerStorage` **inside the playtest**. Nothing is saved; `m:Destroy()` is
+  tidiness. If the function depends on the module's private upvalues, the whole-module copy is
+  what makes those exist; if it depends on live state the game filled at startup, `require` the
+  live module in `setup` and hand the candidate the same reference.
+- Side-effect functions: `state` in `Equiv`, plus `vmcp.Remotes.WatchAll` before and
+  `Remotes.Calls()` after each version if remotes are involved.
+- `keepOpen: true` because you'll likely run a second timeline; `try_scripts` restarts it anyway.
 
-Numbers to compare, in this order: worst frame, p95 frame time, avg per call, heap delta. A change
-that improves the average and worsens the worst frame is a regression. A change that halves
-per-call time and adds 4 MB of heap is trading CPU for GC and will show up as hitches later.
-
-If the gain is under ~15% per call and nothing in the worst frame moved, it isn't worth the risk
-of any change. Say that.
+Numbers to weigh, in this order: worst frame, p95 frame time, per call, allocation per call, heap
+growth. If `Compare` says "no meaningful change", it isn't worth the risk of any change. Say that.
 
 ## Step 7 — let the user play the candidate
 
@@ -531,10 +608,7 @@ Then **stop and wait**. Tell the user what to try: the specific flows that go th
 changed function, plus whatever the error-path check in Step 6 covered. Ask them to hit Stop (or
 say so, and you call `playtest { action = "stop" }`) when they're done — that's the revert.
 
-- **They say it's fine** → edit the source file on disk (this is a Rojo project; Studio follows),
-  then one `run_timeline`: `plugin` event for `search_scripts { drift = true }`, a `client` event
-  that fires the real remote the way a player would, a `server` event that reads the result, an
-  `assertion`. Report the outcome. Only now is anything changed.
+- **They say it's fine** → Step 9, `apply_fix`. Only now is anything changed.
 - **They find a break** → the playtest gets stopped, the original is everywhere, and you have a
   bug report against the candidate. Fix it, back to Step 6, new `try_scripts`.
 - **They don't answer** → nothing happened. That's the point.
@@ -555,12 +629,13 @@ Fix: tag hitbox parts once when a rig spawns (CollectionService "Hitbox") and re
 GetTagged inside ResolveHit instead of GetDescendants + IsA. Same parts come back, same order
 they're found in the rig. 14 lines change, all inside ResolveHit.
 
-Numbers (600 calls, 2s, same fake data):
-  old  avg 3.02ms/call   worst frame 31.1ms   heap +6.7 MB
-  new  avg 0.41ms/call   worst frame  6.8ms   heap +0.4 MB
+Numbers (600 calls, 2s, same fake data; baseline under real play had ResolveHit at 28ms of the
+41ms worst frame):
+  old  avg 3.02ms/call   worst frame 31.1ms   11.2 KB allocated per call
+  new  avg 0.41ms/call   worst frame  6.8ms    0.4 KB allocated per call
 
-Behaviour: identical over 200 random inputs and the three error cases (nil target, dead target,
-target with no hitboxes). One thing you should know: the old code warned "no hitboxes" via warn()
+Behaviour: Equiv.Check passed — identical returns and state over 200 inputs and 9 broken-argument
+probes. One thing you should know: the old code warned "no hitboxes" via warn()
 on every miss; the new code warns once per rig. Not a gameplay change, but it's a change.
 
 Risk: rigs created without the tag won't register hits. Everything that creates a rig goes through
@@ -575,24 +650,57 @@ Every report has those six parts: what's slow (with lines), the fix, before/afte
 behaviour statement (including "identical" and every deviation however small), the risk, and the
 offer. If you found a bug on the way — even one you didn't fix — it goes in a seventh line.
 
+## Step 9 — apply, with the net
+
+Only after the user has played it and said yes.
+
+```json
+{
+  "script": "ServerScriptService.Combat",
+  "source": "...the whole module with the fix...",
+  "check": "local Equiv = require(game.ServerScriptService.__VMCP_Equiv)\nlocal Old = require(game.ServerStorage.__VMCP_Previous_Combat)\nlocal New = require(game.ServerScriptService.Combat)\n... same generator as Step 6 ...\nlocal r = Equiv.Check(Old.ResolveHit, New.ResolveHit, gen, { n = 100 })\nreturn if r.passed then true else r.text"
+}
+```
+
+`apply_fix` writes the file Rojo syncs the script from, waits for Studio to pick it up, restarts
+the playtest with the **previous** version planted as `ServerStorage.__VMCP_Previous_<Name>`, runs
+`check` in the game VM, and reads the server error log. `check` returning anything but `true`, an
+error, a sync that never lands, or a logged server error → the old file is written back and the
+reply starts with `NOT applied:` and why. On success the playtest stays up running the applied
+code — tell the user to play it once more, and write the ledger:
+
+```
+optimization_ledger { action = "write", script = "ServerScriptService.Combat", entry = { status = "applied", summary = "tag hitboxes once, GetTagged in ResolveHit", worstFrameBefore = 31.1, worstFrameAfter = 6.8, perCallBefore = 3.02, perCallAfter = 0.41 } }
+```
+
+Rejected fixes get `status = "rejected"` and the reason; scripts you profiled and found fine get
+`status = "profiled"` with the numbers, so nobody profiles them again next week.
+
 ## Then
 
-After the report, one of three things, and say which:
+After the ledger write, one of three things, and say which:
 
-- **Continue** to the next script in the `count_lines` list on your own, if the user told you to
-  work through the list. Say which one you're doing next and why.
-- **Ask** where to go next when the list has no obvious next candidate, or when the next candidate
-  is a different kind of problem (physics, rendering, network) that a script pass won't fix.
-- **Pause** after every `try_scripts`, and again after applying. Always. The checks in Step 6
-  are not a substitute for a human playing the game with the new code in.
-
-If you're continuing, reuse the running playtest — it's already up — unless the next script needs
-`sections`, which restarts it. And batch across scripts too: if two scripts' suspect functions
-are independent, they go in one `profile_scripts` call, and their candidates can share one
-timeline with one `Hammer` call carrying four targets.
+- **Continue** to the next script on the shortlist on your own, if the user told you to work
+  through the list. Say which one and why. Batch across scripts when their suspects are
+  independent: one `profile_scripts` with both scripts' targets, one timeline whose `Hammer` call
+  carries four targets.
+- **Ask** where to go next when the shortlist is exhausted, or when the baseline says the cost is
+  engine-side (physics, rendering, replication) and a script pass won't move it.
+- **Pause** after every `try_scripts` and after every `apply_fix`. Always. The checks are not a
+  substitute for a human playing the game with the new code in.
 
 ## Gotchas, all in one place
 
+- **Observe shows nothing script-shaped** → nobody was playing during the window, or the load
+  driver hadn't started yet. Put the `Observe` a second after the `Wander` events begin.
+- **`autoSections` broke the script** → the instrumenter misread a body start (an exotic return
+  type annotation, say). `get_logs` shows the compile error; fall back to hand `sections` for that
+  script and tell me the construct.
+- **`apply_fix` says the sync never landed** → the Rojo plugin isn't connected. It already reverted
+  the file; connect Rojo and call it again.
+- **Equiv reports differing error messages on probes only** → the two versions fail the same
+  inputs differently (`attempt to iterate over nil` vs `attempt to get length of nil`). Behaviour
+  change on bad input; usually fine, always in the report.
 - **No labels in the report** → the function never ran (setup errored, check the load line), the
   label has a typo, the capture evicted it (load longer than frameLimit), or the scope was in a
   context you didn't capture (`where`). In Play Solo server and client are one DataModel, so
@@ -623,3 +731,4 @@ timeline with one `Hammer` call carrying four targets.
   non-yielding pieces separately.
 - **Numbers look impossibly small** → the function early-returned on your fake data. Check the
   section labels inside it ran (`n` > 0).
+

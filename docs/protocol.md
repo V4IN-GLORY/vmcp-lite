@@ -422,6 +422,25 @@ The server hashes the file the same way, so the two only differ when the content
 with `-32600` when the server can't find a `default.project.json` — start it from the project
 folder, or point `VMCP_PROJECT` at one.
 
+## 9b. `source/write` and `ledger/*` — the plugin asking the server to keep something
+
+`source/write` writes a script's file on disk — the one Rojo syncs it from — so an applied fix lands
+in the repo. Refused when the server can't see a Rojo project or Rojo has no file for that path
+(a Studio-only script is Studio's business).
+
+```json
+{ "jsonrpc": "2.0", "id": 9, "method": "source/write",
+  "params": { "path": "ServerScriptService.Combat", "className": "ModuleScript", "source": "..." } }
+```
+
+The reply is `{ "file": "<absolute path>", "previous": "<what the file held before>" }`, so the
+caller can put it back.
+
+`ledger/read` and `ledger/write` keep a per-place JSON record under
+`~/.vmcp/optimization/<placeId>.json` for the optimization pass — one object per script path.
+`ledger/write` takes `{ "key": "<script path>", "entry": { ... } }` and merges the fields in
+(stamping `updatedAt`); an absent `entry` deletes the key. Both reply with `{ placeId, entries }`.
+
 ## 10. `postProcess` — asking the server to finish a result
 
 A tool result may carry a `postProcess` object alongside `content`. It's for work the plugin

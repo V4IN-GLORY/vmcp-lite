@@ -63,12 +63,14 @@ function Swap.ReadSource(instance: Instance): (string?, string?)
 end
 
 -- Swaps, starts, waits for `context` to answer, restores. `restarted` says whether a playtest
--- that was already running had to be stopped first.
+-- that was already running had to be stopped first. `temporary` instances ride along the same
+-- way: parented for the boot, destroyed once the playtest has its copy.
 function Swap.Start(
 	replacements: { Replacement },
 	players: number,
 	context: string,
-	player: number?
+	player: number?,
+	temporary: { Instance }?
 ): (string?, boolean)
 	local restarted = false
 	if Session.IsRunning() then
@@ -85,6 +87,11 @@ function Swap.Start(
 			pcall(function()
 				(original.instance :: any).Source = original.source
 			end)
+		end
+		if temporary then
+			for _, instance in temporary do
+				instance:Destroy()
+			end
 		end
 	end
 
