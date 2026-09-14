@@ -12,41 +12,22 @@
 -- lines you chose, applied in Studio only for as long as the tool is running, and the load calls
 -- the same functions the game would with arguments you made up in `setup`.
 
-local HttpService = game:GetService("HttpService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
 local Bridge = require(script.Parent.Parent.Bridge)
 local Env = require(script.Parent.Parent.Env)
-local GameVm = require(script.Parent.Parent.Exec.GameVm)
-local Inject = require(script.Parent.Parent.Exec.Inject)
 local Path = require(script.Parent.Parent.Path)
 local Profile = require(script.Parent.Parent.Lib.Profile)
 local Session = require(script.Parent.Parent.Playtest.Session)
 
-local DEFAULT_CALLS = 500
 local DEFAULT_SECONDS = 2
-local DEFAULT_WARMUP = 5
-local DEFAULT_FRAME_LIMIT = 128
 local MAX_TARGETS = 8
 local MAX_TOTAL_SECONDS = 120
 local PEER_TIMEOUT = 90
-local RESULT_NAME = "__VMCP_ProfileResult"
--- Base64 of the capture has to fit one socket message (VMCP_MAX_MESSAGE_MB, 8 by default).
-local MAX_DUMP_BYTES = 4_500_000
 
 type Result = {
 	content: { { type: "text", text: string } },
 	isError: boolean?,
-}
-
-type Target = {
-	label: string,
-	setup: string,
-	calls: number?,
-	seconds: number?,
-	perFrame: number?,
-	warmup: number?,
 }
 
 type Section = {
@@ -71,7 +52,10 @@ Tool.Definition = {
 		.. "the tool runs and are reverted before it returns. Needs LibMP in the place (pass "
 		.. "installLibMP to insert it). Starts a playtest if none is running; if sections are given "
 		.. "and one is already running, restarts it so the instrumented code is what runs. Each "
-		.. "capture is also written to disk as a .gprx dump for LibMP under Lute. Load the "
+		.. "capture is also written to disk as a .gprx dump for LibMP under Lute. Batch: put every "
+		.. "function you want numbers for in one call's targets, and for old-vs-new comparisons or "
+		.. "anything that also needs setup, output checks or state reads, call vmcp.Profile.Hammer "
+		.. "from a run_timeline server event instead so the whole pass is one call. Load the "
 		.. "vmcp-optimization skill before using this.",
 	inputSchema = {
 		type = "object",
@@ -219,178 +203,32 @@ local function checkTargets(targets: any): (string?, number)
 	return nil, total
 end
 
--- The load loop as source, because it runs in the game VM where nothing of ours is in scope.
-local function loadSource(target: Target): string
-	local calls = target.calls or DEFAULT_CALLS
-	local seconds = target.seconds or DEFAULT_SECONDS
-	local perFrame = target.perFrame or math.max(1, math.ceil(calls / (seconds * 60)))
-	local warmup = target.warmup or DEFAULT_WARMUP
-	return string.format(
-		[[
-local RunService = game:GetService("RunService")
-local HttpService = game:GetService("HttpService")
-local label = %q
-local result = { label = label }
-local function setup()
-%s
-end
-local ok, fn = pcall(setup)
-if not ok then
-	result.error = "setup errored: " .. tostring(fn)
-elseif type(fn) ~= "function" then
-	result.error = "setup must return a function, it returned " .. typeof(fn)
-else
-	for _ = 1, %d do
-		pcall(fn, 0)
-	end
-	local made, errors, firstError = 0, 0, nil
-	local inFrame = 0
-	local started = os.clock()
-	local deadline = started + %s
-	while made < %d and os.clock() < deadline do
-		made += 1
-		debug.profilebegin(label)
-		local passed, failure = pcall(fn, made)
-		debug.profileend()
-		if not passed then
-			errors += 1
-			firstError = firstError or tostring(failure)
-		end
-		inFrame += 1
-		if inFrame >= %d then
-			inFrame = 0
-			RunService.Heartbeat:Wait()
-		end
-	end
-	result.calls = made
-	result.errors = errors
-	result.firstError = firstError
-	result.seconds = os.clock() - started
-end
-local holder = game:GetService("ReplicatedStorage"):FindFirstChild(%q) or Instance.new("StringValue")
-holder.Name = %q
-holder.Archivable = false
-holder.Value = HttpService:JSONEncode(result)
-holder.Parent = game:GetService("ReplicatedStorage")
-]],
-		target.label,
-		target.setup,
-		warmup,
-		tostring(seconds),
-		calls,
-		perFrame,
-		RESULT_NAME,
-		RESULT_NAME
-	)
-end
-
-local function runLoad(target: Target, vm: string?): (any?, string?)
-	local source = loadSource(target)
-	local ok, failure
-	if vm == "plugin" then
-		ok, failure = Inject.Run(source, Env, (target.seconds or DEFAULT_SECONDS) + 30)
-	else
-		ok, failure = GameVm.Run(source)
-	end
-	if not ok then
-		return nil, tostring(failure)
-	end
-	local holder = ReplicatedStorage:FindFirstChild(RESULT_NAME)
-	if not holder or not holder:IsA("StringValue") then
-		return nil, "the load ran but left no result behind"
-	end
-	local decoded, result = pcall(HttpService.JSONDecode, HttpService, holder.Value)
-	holder:Destroy()
-	if not decoded then
-		return nil, `couldn't read the load's result: {result}`
-	end
-	return result, nil
-end
-
-local function safeName(name: string): string
-	return (string.gsub(name, "[^%w_%-]", "_"):sub(1, 48))
-end
-
+-- The playtest half. Everything real is Profile.Hammer, so a timeline event can do the same thing
+-- without a tool call per target.
 local function capture(arguments: any): Result
 	local problem = checkTargets(arguments.targets)
 	if problem then
 		return text(problem, true)
 	end
-
-	local labels: { string } = {}
-	for _, target in arguments.targets do
-		table.insert(labels, target.label)
-	end
+	local labels = {}
 	for _, section in arguments.sections or {} do
 		table.insert(labels, section.label)
 	end
-
-	local prefix = safeName(arguments.name or os.date("%Y%m%d-%H%M%S"))
-	local parts = {}
-	local failed = false
-
-	for _, target in arguments.targets :: { Target } do
-		local loadResult: any = nil
-		local loadProblem: string? = nil
-		local buf, why = Profile.Capture(arguments.frameLimit or DEFAULT_FRAME_LIMIT, function()
-			loadResult, loadProblem = runLoad(target, arguments.vm)
-		end)
-
-		local header = { `== {target.label} ==` }
-		if loadProblem then
-			table.insert(header, `load failed: {loadProblem}`)
-			failed = true
-		elseif loadResult.error then
-			table.insert(header, loadResult.error)
-			failed = true
-		else
-			local line = string.format("%d calls in %.2fs", loadResult.calls, loadResult.seconds)
-			if loadResult.errors > 0 then
-				line ..= ` -- {loadResult.errors} errored, first: {loadResult.firstError}`
-			end
-			table.insert(header, line)
-		end
-
-		if not buf then
-			table.insert(header, `no capture: {why}`)
-			table.insert(parts, table.concat(header, "\n"))
-			failed = true
-			continue
-		end
-
-		local report, analyzeProblem = Profile.Analyze(buf, { labels = labels, top = arguments.top })
-		if not report then
-			table.insert(header, `couldn't read the capture: {analyzeProblem}`)
-		else
-			table.insert(header, Profile.Summarise(report))
-		end
-
-		if arguments.dump ~= false then
-			local size = buffer.len(buf)
-			if size > MAX_DUMP_BYTES then
-				table.insert(
-					header,
-					`(capture is {math.floor(size / 1024)} KB, too big to ship as one message -- lower frameLimit, or raise VMCP_MAX_MESSAGE_MB)`
-				)
-			else
-				local posted, outcome = Bridge.Post({
-					kind = "gprx",
-					name = `{prefix}-{safeName(target.label)}`,
-					data = Profile.Base64(buf),
-				})
-				table.insert(header, if posted then outcome else `dump failed: {outcome}`)
-			end
-		end
-
-		table.insert(parts, table.concat(header, "\n"))
-	end
-
-	table.insert(
-		parts,
-		"The last capture is still open in this context: run_luau here with `local session = "
-			.. "vmcp.Profile.Session()` to walk it with LibMP directly."
+	local body, failed = Profile.Hammer(arguments.targets, {
+		vm = arguments.vm,
+		env = Env,
+		frameLimit = arguments.frameLimit,
+		top = arguments.top,
+		dump = arguments.dump,
+		name = arguments.name,
+		labels = labels,
+	})
+	return text(
+		body
+			.. "\n\nThe last capture is still open in this context: a run_luau or timeline event here can "
+			.. "reopen it with vmcp.Profile.Session() and walk it with LibMP directly.",
+		failed
 	)
-	return text(table.concat(parts, "\n\n"), failed)
 end
 
 type Original = { instance: Instance, source: string }

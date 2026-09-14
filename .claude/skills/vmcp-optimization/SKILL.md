@@ -48,6 +48,14 @@ humanoid stepping and raycasts live. `scopes/render.md` / `scopes/gpu.md` for an
 
 ## Ground rules
 
+- **One call per question, not per step.** Every tool call re-sends the conversation. Put all
+  the functions you want numbers for in one `profile_scripts` (up to 8 targets, all the
+  sections at once). Plant the candidate, hammer old and new, diff the outputs and check the
+  logs in **one** `run_timeline` (Step 6 has the template). Read scripts from disk with the Read
+  tool — this is a Rojo project, the source is right there — instead of asking Studio for it.
+  When you need three facts from the live game, one `run_luau` that returns a table with three
+  fields, never three calls. If you catch yourself about to make a second call to the same
+  context, fold it into the first.
 - **Never change behaviour.** Not "mostly the same" — the same. Same return values, same order of
   side effects, same events fired, same errors on bad input. If the faster version can't do that,
   say so and let the user decide.
@@ -96,8 +104,10 @@ shop. Use the list to order your reading, then look for the actual hot-path shap
 
 ## Step 2 — read for hot paths
 
-Read the whole script. Then read what it requires and who requires it (`search_scripts` with the
-module name finds callers). You need the stack — a function that looks cheap can be called 300
+Read the whole script **from disk** (Read tool on the file Rojo syncs it from — free, no tool
+round-trip; `search_scripts { drift = true }` once if you doubt Studio matches). Then read what it
+requires and who requires it (Grep on the repo for callers; `search_scripts` only when the thing
+you're after was made in Studio and isn't on disk). You need the stack — a function that looks cheap can be called 300
 times a frame by something else.
 
 What actually costs frame time, in rough order of how often it's the culprit:
@@ -192,6 +202,12 @@ Things that will bite:
   "name": "combat-before"
 }
 ```
+
+Put **every** function from the script you're examining in the one call — up to 8 targets, each
+its own capture — and every section you want, in the same call. A second `profile_scripts` for
+the function you forgot costs a full round-trip of everything above it. If you want a deeper
+LibMP walk of the capture as well, do it in the same reply's next `run_luau`, not after reading
+the report and thinking about it: ask for `top = 40` up front instead.
 
 What happens, in order: sections are written into the scripts' Source in Studio; a playtest is
 started (or restarted); the load runs in the live context with every call wrapped in
@@ -293,7 +309,8 @@ How to read it:
 ### Digging deeper
 
 The last capture stays in memory in the context that took it. `run_luau { context = "server" }`
-(plugin VM — the default) gets:
+(plugin VM — the default) gets these — and if you already know you'll want two of them, put both
+in one snippet returning one table:
 
 ```lua
 local session = vmcp.Profile.Session()          -- LibMP session over the last capture
@@ -433,45 +450,57 @@ Keep the fix **local**: same file, same function, same signature. A fix that nee
 a changed call site, or a different data shape is a design change; propose it, don't do it inside
 this loop.
 
-### Where the candidate lives
+Write the candidate as the **whole module with the fix applied** — you'll paste it into the
+timeline below as a long string. If the function depends on the module's private upvalues, the
+whole-module copy is what makes those exist. If it depends on *live* state the game filled at
+startup, read it from the live module in `setup` and pass it in.
 
-Never edit the real script to test the fix. Put the candidate in a ModuleScript **created inside
-the playtest** via `run_luau { context = "server" }` — it exists only in that DataModel and is gone
-when the playtest stops:
+## Step 6 — benchmark, compare, verify: one timeline
 
-```lua
-local m = Instance.new("ModuleScript")
-m.Name = "Combat_Candidate"
-m.Source = [==[
--- the whole original module, with the fix applied
-...
-]==]
-m.Parent = game:GetService("ServerStorage")
-return m:GetFullName()
-```
-
-If the function depends on the module's private state, copy the entire module so the candidate
-has the same upvalues, not just the function. If it depends on *live* state (a table the game
-filled at startup), read it from the live module in `setup` and pass it in — or, if it's a plain
-data table, `require` the live module and hand the candidate the same reference.
-
-## Step 6 — benchmark old vs new
-
-One `profile_scripts` call, two targets, **identical** `setup` apart from which module they require,
-same `calls`, same `seconds`, same pool of fake data. Label them so the report reads itself:
+This is where token discipline pays. Planting the candidate, hammering old and new, proving the
+outputs match, checking state, and checking logs is **one `run_timeline` call**, not five. The
+candidate ModuleScript is created inside the playtest (never in the real place), `vmcp.Profile.Hammer`
+is the same code `profile_scripts` runs, and the assertion judges the whole thing.
 
 ```json
 {
-  "targets": [
-    { "label": "ResolveHit.old", "setup": "local M = require(game.ServerScriptService.Combat) ...", "calls": 600, "seconds": 2 },
-    { "label": "ResolveHit.new", "setup": "local M = require(game.ServerStorage.Combat_Candidate) ...", "calls": 600, "seconds": 2 }
+  "players": 1,
+  "keepOpen": true,
+  "events": [
+    {
+      "at": 0, "context": "server", "blocking": true, "label": "plant + hammer + compare",
+      "code": "local SS = game:GetService('ServerStorage')\nlocal HS = game:GetService('HttpService')\n\n-- 1. the candidate, playtest-only\nlocal m = Instance.new('ModuleScript')\nm.Name = 'Combat_Candidate'\nm.Source = [==[\n... the whole module with the fix applied ...\n]==]\nm.Parent = SS\n\n-- 2. shared fake data, built once so both versions see the same thing\nlocal setup = [[\n  local pool = {}\n  for i = 1, 8 do\n    local rig = game.ServerStorage.Rigs.Dummy:Clone()\n    rig:PivotTo(CFrame.new(i * 6, 5, 0)); rig.Parent = workspace; pool[i] = rig\n  end\n  local attacker = game.Players:GetPlayers()[1].Character\n  return function(i)\n    local target = pool[(i % #pool) + 1]\n    target.Humanoid.Health = 100\n    M.ResolveHit(attacker, target, 'Sword')\n  end\n]]\nlocal old = 'local M = require(game.ServerScriptService.Combat)\\n' .. setup\nlocal new = 'local M = require(game.ServerStorage.Combat_Candidate)\\n' .. setup\n\n-- 3. warm both (first run carries compile + lazy init), then the run that counts\nvmcp.Profile.Hammer({ { label = 'warm.old', setup = old, calls = 50, seconds = 0.5 }, { label = 'warm.new', setup = new, calls = 50, seconds = 0.5 } }, { dump = false, top = 1 })\nlocal report = vmcp.Profile.Hammer({\n  { label = 'ResolveHit.old', setup = old, calls = 600, seconds = 2 },\n  { label = 'ResolveHit.new', setup = new, calls = 600, seconds = 2 },\n}, { name = 'combat-compare', top = 12, labels = { 'ResolveHit.partScan', 'ResolveHit.applyDamage' } })\nctx.report = report\n\n-- 4. same inputs into both, compare results and the state they leave behind\nlocal ok, mismatches = vmcp.Game.Eval([[\n  local Old = require(game.ServerScriptService.Combat)\n  local New = require(game.ServerStorage.Combat_Candidate)\n  local HS = game:GetService('HttpService')\n  local bad = {}\n  for i = 1, 200 do\n    local a = { Old.ResolveHit(makeArgs(i)) }\n    local b = { New.ResolveHit(makeArgs(i)) }\n    if HS:JSONEncode(a) ~= HS:JSONEncode(b) then table.insert(bad, i) end\n  end\n  for _, args in { {nil}, {'x'}, {deadRig} } do  -- the error paths real callers can hit\n    local ea = select(2, pcall(Old.ResolveHit, table.unpack(args)))\n    local eb = select(2, pcall(New.ResolveHit, table.unpack(args)))\n    if tostring(ea) ~= tostring(eb) then table.insert(bad, 'err:' .. tostring(ea) .. ' vs ' .. tostring(eb)) end\n  end\n  return HS:JSONEncode(bad)\n]])\nctx.mismatches = if ok then HS:JSONDecode(mismatches) else { 'eval failed: ' .. tostring(mismatches) }\n\n-- 5. leave nothing behind\nfor _, rig in workspace:GetChildren() do if rig.Name == 'Dummy' then rig:Destroy() end end\nm:Destroy()"
+    },
+    {
+      "at": 0.5, "context": "plugin", "label": "verify",
+      "code": "local _, drift = vmcp.Tool('search_scripts', { drift = true })\nlocal _, logs = vmcp.Tool('get_logs', { context = 'server' })\nctx.drift = drift\nctx.serverErrors = select(2, logs:gsub('%[error%]', ''))"
+    }
   ],
-  "name": "combat-compare"
+  "assertion": "return #ctx.mismatches == 0 and ctx.serverErrors == 0 and ctx.drift:find('agree') ~= nil"
 }
 ```
 
-Run it **twice** and use the second run. The first run after creating the candidate includes its
-compile and whatever lazy init your change has.
+What that buys you: one reply holding the old/new report, the output diff, the drift check and
+the server error count. The event is `blocking` because `Hammer` yields for the whole load;
+`0.5` on the plugin event is "after it", not a real delay.
+
+Notes on the template:
+
+- `keepOpen: true` because you'll likely run a second timeline (a different fix, a different
+  script) and a playtest costs seconds to start. Stop it explicitly when the pass is over.
+- The candidate goes in `ServerStorage` **inside the playtest**. Nothing is saved; `m:Destroy()`
+  at the end is tidiness, not safety.
+- `vmcp.Profile.Hammer(targets, { vm, env, frameLimit, top, dump, name, labels })` is the
+  playtest half of `profile_scripts`. Same targets shape, same report text. `labels` adds section
+  names to the "your labels" block — sections still need the `profile_scripts` tool once to be
+  written in, since only the edit session can edit Source; after that the running playtest keeps
+  them and every `Hammer` sees them.
+- `vmcp.Game.Eval` runs in the game VM and only returns text — encode the answer as JSON on that
+  side and decode it here.
+- Side-effect functions: compare the **state after**, not the return. Read the humanoid, the
+  module's table, `vmcp.Remotes.Calls()` for each version, and push those through `ctx` too.
+- Run the timeline **twice** only if the numbers look off; the warm pass inside it already covers
+  compile and lazy init.
 
 Numbers to compare, in this order: worst frame, p95 frame time, avg per call, heap delta. A change
 that improves the average and worsens the worst frame is a regression. A change that halves
@@ -480,49 +509,13 @@ per-call time and adds 4 MB of heap is trading CPU for GC and will show up as hi
 If the gain is under ~15% per call and nothing in the worst frame moved, it isn't worth the risk
 of any change. Say that.
 
-### Prove the outputs match
+## Step 7 — applying, if asked
 
-Same inputs into both, compare results. Deterministic functions: one `run_luau` in the game VM:
-
-```lua
-local Old = require(game.ServerScriptService.Combat)
-local New = require(game.ServerStorage.Combat_Candidate)
-local mismatches = {}
-for i = 1, 200 do
-    local args = makeArgs(i)           -- the same generator setup used
-    local a = { Old.ResolveHit(table.unpack(args)) }
-    local b = { New.ResolveHit(table.unpack(args)) }
-    if game:GetService("HttpService"):JSONEncode(a) ~= game:GetService("HttpService"):JSONEncode(b) then
-        table.insert(mismatches, i)
-    end
-end
-return #mismatches == 0 and "identical over 200 inputs" or mismatches
-```
-
-Functions with side effects: compare the **state after**, not the return — humanoid health, the
-table the module holds, instances created, remotes fired (`vmcp.Remotes.WatchAll` then
-`Remotes.Calls()` for each version). A `run_timeline` with a `server` event per version and an
-`assertion` at the end is the tidy way; `vmcp-timeline` has the shape.
-
-Error paths too: feed both versions the bad input the real callers can send (nil, wrong type, a
-dead character). Same error, or same silent return. Different is a behaviour change — name it.
-
-## Step 7 — verify the game still works
-
-Even though the real script hasn't changed yet, do a pass as if it had — you're about to
-recommend it:
-
-- `search_scripts { drift = true }` — Studio and disk agree, i.e. the instrumentation really was
-  reverted and nothing else moved.
-- `get_logs { context = "server" }` and `{ context = "client" }` — no errors from the profiling run
-  left behind (a dummy that never got cleaned up, a candidate module something else found by name).
-- Destroy anything `setup` created in the world, or just stop the playtest.
-
-If the user asked you to **apply** the fix (Step 8 said yes): edit the source file on disk — this is
-a Rojo project, Studio's copy follows — then `search_scripts { drift = true }` to confirm it synced,
-then a `run_timeline` that exercises the real call path (a client firing the real remote, a
-server event reading the result), then stop and **tell the user to playtest**. Don't start the
-next script until they've come back.
+Only after the user says yes in Step 8. Edit the source file on disk (this is a Rojo project;
+Studio's copy follows), then one timeline: `plugin` event for `search_scripts { drift = true }`,
+a `client` event that fires the real remote the way a player would, a `server` event that reads
+the result, an `assertion`. Then **stop and tell the user to playtest**. Don't start the next
+script until they've come back.
 
 ## Step 8 — report
 
@@ -571,7 +564,9 @@ After the report, one of three things, and say which:
   is not a substitute for a human playing the game.
 
 If you're continuing, reuse the running playtest — it's already up — unless the next script needs
-`sections`, which restarts it.
+`sections`, which restarts it. And batch across scripts too: if two scripts' suspect functions
+are independent, they go in one `profile_scripts` call, and their candidates can share one
+timeline with one `Hammer` call carrying four targets.
 
 ## Gotchas, all in one place
 

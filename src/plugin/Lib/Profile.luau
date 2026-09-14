@@ -12,10 +12,15 @@
 -- The last capture stays in `Profile.LastBuffer` so a run_luau snippet in the same context can
 -- open it again with `vmcp.Profile.Session()` and dig deeper than the summary went.
 
+local CollectionService = game:GetService("CollectionService")
+local HttpService = game:GetService("HttpService")
 local InsertService = game:GetService("InsertService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
-local CollectionService = game:GetService("CollectionService")
+
+local Bridge = require(script.Parent.Parent.Bridge)
+local GameVm = require(script.Parent.Parent.Exec.GameVm)
+local Inject = require(script.Parent.Parent.Exec.Inject)
 
 local Profile = {}
 
@@ -23,6 +28,13 @@ local Profile = {}
 local LIBMP_ASSET_ID = 109009378620272
 local MAX_FRAME_LIMIT = 256
 local DEFAULT_TOP = 15
+local DEFAULT_CALLS = 500
+local DEFAULT_SECONDS = 2
+local DEFAULT_WARMUP = 5
+local DEFAULT_FRAME_LIMIT = 128
+local RESULT_NAME = "__VMCP_ProfileResult"
+-- Base64 of the capture has to fit one socket message (VMCP_MAX_MESSAGE_MB, 8 by default).
+local MAX_DUMP_BYTES = 4_500_000
 
 Profile.LastBuffer = nil :: buffer?
 
@@ -44,6 +56,27 @@ export type FrameRow = {
 	absoluteId: number,
 	cpuMs: number,
 	top: { { name: string, selfMs: number } },
+}
+
+export type Target = {
+	label: string,
+	setup: string,
+	calls: number?,
+	seconds: number?,
+	perFrame: number?,
+	warmup: number?,
+}
+
+export type HammerOptions = {
+	vm: string?,
+	-- What a plugin-VM setup sees as `vmcp`. Ignored for the game VM.
+	env: any?,
+	frameLimit: number?,
+	top: number?,
+	dump: boolean?,
+	name: string?,
+	-- Extra scope names to report alongside the targets' own labels (section labels, usually).
+	labels: { string }?,
 }
 
 export type Report = {
@@ -510,6 +543,174 @@ function Profile.Summarise(report: Report): string
 	end
 
 	return table.concat(lines, "\n")
+end
+
+-- The load loop as source, because it runs in the game VM where nothing of ours is in scope.
+local function loadSource(target: Target): string
+	local calls = target.calls or DEFAULT_CALLS
+	local seconds = target.seconds or DEFAULT_SECONDS
+	local perFrame = target.perFrame or math.max(1, math.ceil(calls / (seconds * 60)))
+	local warmup = target.warmup or DEFAULT_WARMUP
+	return string.format(
+		[[
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local label = %q
+local result = { label = label }
+local function setup()
+%s
+end
+local ok, fn = pcall(setup)
+if not ok then
+	result.error = "setup errored: " .. tostring(fn)
+elseif type(fn) ~= "function" then
+	result.error = "setup must return a function, it returned " .. typeof(fn)
+else
+	for _ = 1, %d do
+		pcall(fn, 0)
+	end
+	local made, errors, firstError = 0, 0, nil
+	local inFrame = 0
+	local started = os.clock()
+	local deadline = started + %s
+	while made < %d and os.clock() < deadline do
+		made += 1
+		debug.profilebegin(label)
+		local passed, failure = pcall(fn, made)
+		debug.profileend()
+		if not passed then
+			errors += 1
+			firstError = firstError or tostring(failure)
+		end
+		inFrame += 1
+		if inFrame >= %d then
+			inFrame = 0
+			RunService.Heartbeat:Wait()
+		end
+	end
+	result.calls = made
+	result.errors = errors
+	result.firstError = firstError
+	result.seconds = os.clock() - started
+end
+local holder = game:GetService("ReplicatedStorage"):FindFirstChild(%q) or Instance.new("StringValue")
+holder.Name = %q
+holder.Archivable = false
+holder.Value = HttpService:JSONEncode(result)
+holder.Parent = game:GetService("ReplicatedStorage")
+]],
+		target.label,
+		target.setup,
+		warmup,
+		tostring(seconds),
+		calls,
+		perFrame,
+		RESULT_NAME,
+		RESULT_NAME
+	)
+end
+
+local function runLoad(target: Target, vm: string?, env: any?): (any?, string?)
+	local source = loadSource(target)
+	local ok, failure
+	if vm == "plugin" then
+		ok, failure = Inject.Run(source, env or {}, (target.seconds or DEFAULT_SECONDS) + 30)
+	else
+		ok, failure = GameVm.Run(source)
+	end
+	if not ok then
+		return nil, tostring(failure)
+	end
+	local holder = ReplicatedStorage:FindFirstChild(RESULT_NAME)
+	if not holder or not holder:IsA("StringValue") then
+		return nil, "the load ran but left no result behind"
+	end
+	local decoded, result = pcall(HttpService.JSONDecode, HttpService, holder.Value)
+	holder:Destroy()
+	if not decoded then
+		return nil, `couldn't read the load's result: {result}`
+	end
+	return result, nil
+end
+
+local function safeName(name: string): string
+	return (string.gsub(name, "[^%w_%-]", "_"):sub(1, 48))
+end
+
+-- Runs every target under its own capture, one after another, and hands back the report text for
+-- all of them. This is what profile_scripts does in the playtest; a timeline `server` event calls
+-- it directly as vmcp.Profile.Hammer so old-vs-new plus the output check fit in one run.
+function Profile.Hammer(targets: { Target }, options: HammerOptions?): (string, boolean)
+	local settings: HammerOptions = options or {}
+	local labels: { string } = {}
+	for _, target in targets do
+		table.insert(labels, target.label)
+	end
+	for _, label in settings.labels or ({} :: { string }) do
+		table.insert(labels, label)
+	end
+
+	local prefix = safeName(settings.name or os.date("%Y%m%d-%H%M%S"))
+	local parts = {}
+	local failed = false
+
+	for _, target in targets do
+		local loadResult: any = nil
+		local loadProblem: string? = nil
+		local buf, why = Profile.Capture(settings.frameLimit or DEFAULT_FRAME_LIMIT, function()
+			loadResult, loadProblem = runLoad(target, settings.vm, settings.env)
+		end)
+
+		local header = { `== {target.label} ==` }
+		if loadProblem then
+			table.insert(header, `load failed: {loadProblem}`)
+			failed = true
+		elseif loadResult.error then
+			table.insert(header, loadResult.error)
+			failed = true
+		else
+			local line = string.format("%d calls in %.2fs", loadResult.calls, loadResult.seconds)
+			if loadResult.errors > 0 then
+				line ..= ` -- {loadResult.errors} errored, first: {loadResult.firstError}`
+			end
+			table.insert(header, line)
+		end
+
+		if not buf then
+			table.insert(header, `no capture: {why}`)
+			table.insert(parts, table.concat(header, "\n"))
+			failed = true
+			continue
+		end
+
+		local report, analyzeProblem = Profile.Analyze(buf, { labels = labels, top = settings.top })
+		if not report then
+			table.insert(header, `couldn't read the capture: {analyzeProblem}`)
+		else
+			table.insert(header, Profile.Summarise(report))
+		end
+
+		if settings.dump ~= false then
+			local size = buffer.len(buf)
+			if size > MAX_DUMP_BYTES then
+				table.insert(
+					header,
+					`(capture is {math.floor(size / 1024)} KB, too big to ship as one message -- lower frameLimit, or raise VMCP_MAX_MESSAGE_MB)`
+				)
+			else
+				local posted, outcome = Bridge.Post({
+					kind = "gprx",
+					name = `{prefix}-{safeName(target.label)}`,
+					data = Profile.Base64(buf),
+				})
+				table.insert(header, if posted then outcome else `dump failed: {outcome}`)
+			end
+		end
+
+		table.insert(parts, table.concat(header, "\n"))
+	end
+
+	return table.concat(parts, "\n\n"), failed
 end
 
 local ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
