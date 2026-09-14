@@ -10,8 +10,9 @@ rejected", and the game must behave identically when you're done — the only th
 to change is how long it takes.
 
 ```
-optimization_ledger read            -- what a previous pass already did
-  -> profile_scripts { observe }    -- the real-load baseline: what costs frame time while it's played
+ask what to look at                 -- one question, up front; "just find it" is a valid answer
+  -> optimization_ledger read       -- what a previous pass already did
+  -> profile_scripts { observe }    -- the real-load baseline, with the game driven to the thing under test
   -> lint_hotpaths + count_lines    -- the shortlist, ranked by how often it runs
   -> read the script (from disk)    -- the callers, the callees, the state it needs
   -> profile_scripts { autoSections, targets }   -- which function, which lines, how much, how often
@@ -111,7 +112,25 @@ humanoid stepping and raycasts live. `scopes/render.md` / `scopes/gpu.md` for an
   `apply_fix` **restart** a running one so their copies are what runs — warn the user before if
   they might be mid-test.
 
-## Step 0 — read the ledger
+## Step 0 — ask, then read the ledger
+
+One question before anything runs, because "optimize the game" and "the boss fight stutters"
+are different passes. Ask it with AskUserQuestion, one call, all four at once:
+
+1. **Where does it feel slow?** A place, a moment, a system, a player count — or "don't know,
+   find it".
+2. **What should I drive?** The flows you can script (walk, fight, open the shop, fire remotes)
+   vs the ones you'll play yourself while I capture.
+3. **What's off limits?** Scripts not to touch, systems mid-rewrite, anything that talks to the
+   outside world I shouldn't hammer.
+4. **How far on my own?** Stop after each report, or work the whole shortlist and only stop at
+   `try_scripts`.
+
+Don't wait on a long answer. "Don't know, find it" is the common one and it's a real answer:
+it means the pass starts with **exploration**, below. If they name a moment ("when a lot of
+enemies are alive"), that moment is your load and everything else is context.
+
+Then:
 
 ```
 optimization_ledger { action = "read" }
@@ -130,19 +149,33 @@ That captures the game **as it runs** — no hammering — and lists the top sco
 slowest frames and what filled them. It answers the only question that matters at this point:
 what does the game actually spend frame time on while someone plays it?
 
-Something has to be playing it during those seconds. In order of preference:
+Something has to be driving it during those seconds — and by default **that's you**, not the
+user. Idle observation is only a baseline of the idle game. In order of preference:
 
-1. **The user.** Start the playtest (`playtest { action = "start" }`), tell them to play the
-   thing they think is slow for ten seconds, and call `observe` while they do. Cheapest, most
-   real.
-2. **Scripted players.** One timeline: `players = 4` (or 8), a `client` event per player running
+1. **The moment the user named.** Build it: a timeline whose `server` event puts the game into
+   that state (spawn the enemies, set the wave, give the player the item) and whose `client`
+   events act it out (`input:Tap`, `vmcp.Load.Wander`, the remotes the UI would fire), with the
+   `Observe` inside it. Reproducible, so the after-fix capture is the same load.
+2. **Exploration, when nobody named anything.** Learn the game before profiling it, all in a
+   couple of calls: `get_tree` on `ReplicatedStorage.Remotes` (or wherever the remotes are) and
+   `review_remotes` for what a player can trigger; `count_lines` + `lint_hotpaths` for what runs
+   per frame; a short `Remotes.WatchAll` while `Load.Wander` runs for the real argument shapes.
+   Then **drive every flow you found**, one `Observe` each, in one timeline: walk the map with 4
+   clients, fire each remote at its real rate with captured arguments, spawn whatever the server
+   spawns (enemies, drops, rounds), trigger the round loop if there is one. The flow whose capture
+   has the worst frames is the pass. Say which flows you drove and which you couldn't reach.
+3. **The user plays.** Start the playtest, tell them exactly what to do for ten seconds, and call
+   `observe` while they do. Best fidelity, but it's their time — use it for the things you
+   genuinely can't script (a real fight, real UI habits), not as the default.
+4. **Scripted players, generic.** One timeline: `players = 4` (or 8), a `client` event per player running
    `vmcp.Load.Wander(input, { seconds = 6, seed = <player index>, remotes = { { remote = game.ReplicatedStorage.Remotes.Swing, args = {"Sword"}, perSecond = 2 } } })`,
    and a `server` event at 1s doing `ctx.baseline = vmcp.Profile.Observe(4, { top = 30 })`. Real
    movement, animation, replication and remote traffic, at the player count where per-player
    loops actually hurt.
-3. **A timeline that reaches the state.** If the slow thing only happens at wave 12 or with the
-   boss alive, a `server` event that sets that state up (spawn the boss, set the wave) followed by
-   the `Observe`.
+
+Exploration is active: if reaching a state means calling the game's own module functions from a
+`server` event (`Rounds.Start()`, `Spawner.Spawn("Boss", cf)`), do it — that's what `vm = "game"`
+is for. Tell the user what you triggered, since a spawned boss in a test is still a spawned boss.
 
 **When a real load isn't possible** — the state can't be reached from a timeline, it needs
 something external (a DataStore full of real saves, a Discord bot, a live economy), or the user
@@ -680,8 +713,9 @@ Rejected fixes get `status = "rejected"` and the reason; scripts you profiled an
 
 After the ledger write, one of three things, and say which:
 
-- **Continue** to the next script on the shortlist on your own, if the user told you to work
-  through the list. Say which one and why. Batch across scripts when their suspects are
+- **Continue** to the next script on the shortlist on your own, if the intake answer was "work
+  the list" — and to the next *flow* if the current one is clean: exploration isn't finished
+  until every flow you found has a capture. Say which one and why. Batch across scripts when their suspects are
   independent: one `profile_scripts` with both scripts' targets, one timeline whose `Hammer` call
   carries four targets.
 - **Ask** where to go next when the shortlist is exhausted, or when the baseline says the cost is
