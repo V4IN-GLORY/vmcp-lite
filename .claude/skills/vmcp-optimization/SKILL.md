@@ -25,6 +25,27 @@ count_lines                      -- who's big
 Load `vmcp-debugging` and `vmcp-timeline` alongside this — `vm = "game"`, `ctx`, `Remotes.WatchAll`
 and `Bench` are all used below and explained there.
 
+## Reference files — open on demand, not up front
+
+The full LibMP documentation ships next to this file under `references/`. It's ~400 KB, so it's
+split by what you'd be asking. Read the one file you need with the Read tool when you reach that
+point; don't load them all.
+
+| when | open |
+|---|---|
+| you're writing your own LibMP snippet against `vmcp.Profile.Session()` and the cheat sheet in Step 4 isn't enough — iterator config flags, state getters, frame-boundary handling, `Get` vs `Fetch` | `references/libmp-guide.md` (concepts + the three reference iterators: simple, frame-local, full-reconstruct) |
+| you need an exact method signature, return type, or a struct's fields | `references/libmp-api.md` |
+| an engine scope you don't recognise is in the top list or a spike frame (`Physics/stepWorld`, `TS::JobStep`, `MegaReplicator::...`, `Lua/GC`, `Present`, `Sleep`) and you need to know what it is, what drives its cost, and whether the creator can do anything about it | `references/scopes/INDEX.md` first — grep the scope name there to find its group — then that group's file (`scopes/physics.md`, `scopes/render.md`, `scopes/script.md`, `scopes/network.md`, …) |
+| you want a working end-to-end example rather than a fragment | `references/examples/` — `04-basic-iteration.luau` (one frame, one thread), `05-advanced-iteration.luau` (the reusable iterator module), `06-advanced-frame-stats.luau` (per-timer inclusive times, top 20), `07-advanced-counter.luau` (counter tree), `09-usecase-snapshot-analyzer.luau` (analysis spread over frames so it doesn't hitch) |
+
+The scope files are the part that turns "this scope is 6ms" into "and here's why, and here's the
+lever". `scopes/script.md` covers everything Luau-side: `$Script`, GC scopes, parallel VMs,
+`CollectionService`, deferred events. `scopes/physics.md` is where `stepWorld`, broadphase,
+humanoid stepping and raycasts live. `scopes/render.md` / `scopes/gpu.md` for anything under
+`Render`/`Present`. `scopes/network.md` for replication and streaming. `scopes/jobs.md` for the
+`TS::` task-scheduler scopes that wrap everything else. `scopes/profiler-runtime.md` explains
+`Sleep` and the profiler's own overhead.
+
 ## Ground rules
 
 - **Never change behaviour.** Not "mostly the same" — the same. Same return values, same order of
