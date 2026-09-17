@@ -199,3 +199,22 @@ Jura label up) 2–3px and confirm by eye in Studio — the screenshot tool's bi
 Ten pips named `P1..P10` with `LayoutOrder` set still render with the tenth in slot two, which
 reads as a random gap in the filled run. Always pass `SortOrder = Enum.SortOrder.LayoutOrder`
 when children carry a LayoutOrder; if a list looks shuffled, that's the first thing to read.
+
+## Edit view vs playtest drift
+
+Three things can make the playtest disagree with Studio even after "I fixed it":
+
+1. **The client session is stale.** PlayerGui is a copy of StarterGui taken at spawn; any edit
+   after that never reaches the running client. Before debugging a live/edit mismatch, check
+   `playtest status` — if it's been running for a while (or "started outside VMCP"), ask the
+   user to restart it first. A Studio-toolbar playtest can't be restarted from here.
+2. **The controller script in Studio is older than the generator.** The runtime re-set for
+   default-valued rules (the `TextLabel.Center` block after `refit()`) lived in the generator
+   file but not in the LocalScript Studio was running, because the generator was edited and
+   never rerun. When a live symptom matches a workaround the generator already contains, diff
+   the live script's Source against the generator before assuming the workaround failed.
+3. **The default-valued rule trap itself** (above): it only shows in play, so a rule that
+   works in the edit view isn't verified until it's been seen in a fresh playtest.
+
+Rule of thumb: every generator edit is followed by either a rerun or a matching live patch to
+the same instances *and* the controller Source — and a `playtest stop`/`start` before judging.
