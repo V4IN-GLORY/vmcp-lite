@@ -33,9 +33,11 @@ thickness instead.
 
 ## Getting a file out
 
-`vmcp.Render(canvas, name)` sends the recording to the VMCP server, which rasterizes it, writes a
-PNG under `~/.vmcp/images/` and hands back the path. It works from **any context and from inside a
-timeline event**, which is the reason to prefer it.
+`vmcp.Render(canvas, name)` sends the canvas to the VMCP server, which writes a PNG under
+`~/.vmcp/images/` and hands back the path. It works from **any context and from inside a
+timeline event**, which is the reason to prefer it. The real pixels go along (base64 of
+`ReadPixelsBuffer`) whenever the image is 512x512 or smaller, so anything drawn straight on
+`canvas.image` is in the file too; bigger images are replayed from the recording instead.
 
 ```lua
 local ok, where = vmcp.Render(canvas, "health-bar")
@@ -50,7 +52,24 @@ return { postProcess = canvas:Recording() }
 ```
 
 Names are letters, digits, underscore and hyphen only — anything else gets a timestamp instead.
-The recording is a few hundred bytes; the image itself never crosses the socket.
+
+## Uploading it as an asset
+
+An `EditableImage` only exists in the session that drew it, so a script that needs the picture at
+runtime wants an asset id. `upload = true` publishes it as an Image asset and puts the id in the
+reply:
+
+```lua
+local ok, text = vmcp.Render(canvas, "hud-icon", { upload = true })
+-- "[wrote the image to ...hud-icon.png] (uploaded as rbxassetid://123456789)"
+local id = canvas.assetId   -- set when Studio did the upload itself
+```
+
+Studio's own `AssetService:CreateAssetAsync` is tried first. Where it isn't enabled yet the server
+uploads through Open Cloud instead, which needs an API key with the assets scope in
+`ROBLOX_API_KEY` or `~/.vmcp/roblox-api-key`; the asset belongs to the Studio user, or to
+`ROBLOX_GROUP_ID` when that's set. Moderation runs after upload — the id is real at once, the
+picture shows a little later.
 
 ## Limits that come from the engine
 
@@ -63,5 +82,8 @@ The recording is a few hundred bytes; the image itself never crosses the socket.
 ## When you want more than these four operations
 
 `canvas.image` is the real `EditableImage`, so `DrawImage`, `DrawImageTransformed`,
-`WritePixelsBuffer` and the rest are all there. Anything drawn that way is **not recorded**, so it
-appears in Studio and not in the PNG — use it for things that only need to exist in-engine.
+`WritePixelsBuffer` and the rest are all there. Anything drawn that way is **not recorded**, but
+it still reaches the PNG through the pixel copy as long as the image is 512x512 or smaller.
+
+`Line` is one pixel wide in the engine; a thickness is drawn as that many parallel lines, with
+the endpoints clamped inside the image because `DrawLine` refuses a point outside it.

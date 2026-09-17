@@ -5,6 +5,8 @@ import type { ToolResult, ToolResultContent } from "./protocol.js";
 import { encodePng, rasterize, type Recording } from "./image.js";
 import { materialsOf, renderScene, type Scene } from "./scene.js";
 import { loadMaterials } from "./materials.js";
+import { renderUi, type UiScene } from "./ui.js";
+import { uploadImage } from "./upload.js";
 
 /**
  * The one place the relay acts on a result instead of passing it along.
@@ -60,7 +62,7 @@ interface Outcome {
 /** Writes the image and returns a line to append to the tool's own output, plus the bytes. */
 async function finish(directive: Directive): Promise<Outcome> {
 	if (directive.kind === "gprx") return writeCapture(directive);
-	if (directive.kind !== "png" && directive.kind !== "scene") {
+	if (directive.kind !== "png" && directive.kind !== "scene" && directive.kind !== "ui") {
 		return { text: `[vmcp doesn't know how to finish a "${String(directive.kind)}" job]` };
 	}
 
@@ -69,6 +71,8 @@ async function finish(directive: Directive): Promise<Outcome> {
 		if (directive.kind === "scene") {
 			const scene = directive as unknown as Scene;
 			surface = renderScene(scene, await loadMaterials(materialsOf(scene)));
+		} else if (directive.kind === "ui") {
+			surface = renderUi(directive as unknown as UiScene);
 		} else {
 			surface = rasterize(directive as unknown as Recording);
 		}
@@ -76,7 +80,19 @@ async function finish(directive: Directive): Promise<Outcome> {
 		const png = encodePng(surface);
 		writeFileSync(path, png);
 		log(`wrote ${path}`);
-		return { text: `[wrote the image to ${path}]`, png };
+		let asset = typeof directive.assetId === "number" ? ` (uploaded as rbxassetid://${directive.assetId})` : "";
+		// The plugin asks this side to upload when Studio's own CreateAssetAsync isn't available.
+		if (directive.upload === true && !asset) {
+			const name = typeof directive.name === "string" ? directive.name : "vmcp-canvas";
+			const userId = typeof directive.userId === "number" ? directive.userId : undefined;
+			try {
+				const id = await uploadImage(png, { name, userId });
+				asset = ` (uploaded as rbxassetid://${id})`;
+			} catch (err) {
+				asset = ` (upload failed: ${(err as Error).message})`;
+			}
+		}
+		return { text: `[wrote the image to ${path}${asset}]`, png };
 	} catch (err) {
 		return { text: `[couldn't write the image: ${(err as Error).message}]` };
 	}

@@ -33,12 +33,29 @@ local Env = {
 -- Writes a Canvas out as a PNG on the VMCP server, which is the only side with a filesystem.
 -- Works from any context and from inside a timeline event, where returning a directive isn't an
 -- option. `name` becomes the file name; leave it out and it gets a timestamped one.
-function Env.Render(canvas: any, name: string?): (boolean, string)
+-- `options.upload` publishes it as an Image asset first (Canvas:Upload), and the reply carries
+-- the rbxassetid so scripts can use the picture without EditableImage at runtime.
+function Env.Render(canvas: any, name: string?, options: { upload: boolean? }?): (boolean, string)
+	local serverUpload = false
+	if options and options.upload then
+		if type(canvas) ~= "table" or not canvas.Upload then
+			return false, "upload needs a Canvas, not a recording"
+		end
+		-- Studio's own upload when it's enabled; otherwise the server does it over Open Cloud.
+		serverUpload = canvas:Upload(name or "vmcp-canvas") == nil
+	end
 	local recording = if type(canvas) == "table" and canvas.Recording then canvas:Recording() else canvas
 	if type(recording) ~= "table" then
 		return false, "Render wants a Canvas, or the table its Recording() gave you"
 	end
 	recording.name = name
+	if serverUpload then
+		recording.upload = true
+		local ok, userId = pcall(function()
+			return game:GetService("StudioService"):GetUserId()
+		end)
+		recording.userId = if ok then userId else nil
+	end
 	return Bridge.Post(recording)
 end
 

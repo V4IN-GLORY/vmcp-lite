@@ -738,7 +738,12 @@ local Env = {
 	Bench = require(script.Parent.Lib.Bench),
 	Build = require(script.Parent.Lib.Build),
 	Canvas = require(script.Parent.Lib.Canvas),
+	Equiv = require(script.Parent.Lib.Equiv),
 	Exploit = require(script.Parent.Lib.Exploit),
+	Instrument = require(script.Parent.Lib.Instrument),
+	Lint = require(script.Parent.Lib.Lint),
+	Load = require(script.Parent.Lib.Load),
+	Profile = require(script.Parent.Lib.Profile),
 	Remotes = require(script.Parent.Lib.Remotes),
 	Rig = require(script.Parent.Lib.Rig),
 	Style = require(script.Parent.Lib.Style),
@@ -755,12 +760,29 @@ local Env = {
 -- Writes a Canvas out as a PNG on the VMCP server, which is the only side with a filesystem.
 -- Works from any context and from inside a timeline event, where returning a directive isn't an
 -- option. `name` becomes the file name; leave it out and it gets a timestamped one.
-function Env.Render(canvas: any, name: string?): (boolean, string)
+-- `options.upload` publishes it as an Image asset first (Canvas:Upload), and the reply carries
+-- the rbxassetid so scripts can use the picture without EditableImage at runtime.
+function Env.Render(canvas: any, name: string?, options: { upload: boolean? }?): (boolean, string)
+	local serverUpload = false
+	if options and options.upload then
+		if type(canvas) ~= "table" or not canvas.Upload then
+			return false, "upload needs a Canvas, not a recording"
+		end
+		-- Studio's own upload when it's enabled; otherwise the server does it over Open Cloud.
+		serverUpload = canvas:Upload(name or "vmcp-canvas") == nil
+	end
 	local recording = if type(canvas) == "table" and canvas.Recording then canvas:Recording() else canvas
 	if type(recording) ~= "table" then
 		return false, "Render wants a Canvas, or the table its Recording() gave you"
 	end
 	recording.name = name
+	if serverUpload then
+		recording.upload = true
+		local ok, userId = pcall(function()
+			return game:GetService("StudioService"):GetUserId()
+		end)
+		recording.userId = if ok then userId else nil
+	end
 	return Bridge.Post(recording)
 end
 
@@ -818,6 +840,9 @@ local Serialize = require(script.Parent.Serialize)
 local BRIDGE_NAME = "__VMCP_GameBridge"
 local INVOKE_NAME = "__VMCP_GameInvoke"
 local SERIALIZE_NAME = "__VMCP_Serialize"
+-- Also copied in: an equivalence checker that game-VM snippets can require to compare two live
+-- functions. See Lib/Equiv.
+local EQUIV_NAME = "__VMCP_Equiv"
 local READY_TIMEOUT = 5
 
 local GameVm = {}
@@ -893,6 +918,12 @@ local function ensure(): (BindableFunction?, string?)
 		serializer.Archivable = false
 		serializer.Parent = parent
 
+		local equiv = Instance.new("ModuleScript")
+		equiv.Name = EQUIV_NAME
+		equiv.Source = (script.Parent.Parent.Lib.Equiv :: ModuleScript).Source
+		equiv.Archivable = false
+		equiv.Parent = parent
+
 		local bridge: any = Instance.new(if RunService:IsServer() then "Script" else "LocalScript")
 		bridge.Name = BRIDGE_NAME
 		bridge.Source = BRIDGE_SOURCE
@@ -966,6 +997,13 @@ function GameVm.Require(path: string): (boolean, string)
 		"end",
 		"return require(current)",
 	}, "\n"))
+end
+
+-- Where a game-VM snippet finds the equivalence checker: `require(vmcp.Game.EquivPath())` isn't
+-- possible across VMs, so it's a path string to splice into the snippet.
+function GameVm.EquivPath(): string
+	local parent = container()
+	return if parent then `{parent:GetFullName()}.{EQUIV_NAME}` else EQUIV_NAME
 end
 
 -- Serialize is handed to snippets alongside this, so a caller that wants the plugin-side renderer
@@ -2037,6 +2075,23 @@ local function num(value: number): string
 	return string.format("%.4g", value)
 end
 
+local function rgb(channel: number): string
+	return string.format("%d", math.floor(channel * 255 + 0.5))
+end
+
+-- Radians are five digits nobody typed; a whole number of degrees is what the source said.
+local function angle(radians: number): string
+	if radians == 0 then
+		return "0"
+	end
+	local degrees = math.deg(radians)
+	local whole = math.floor(degrees + 0.5)
+	if math.abs(degrees - whole) < 0.01 then
+		return `math.rad({whole})`
+	end
+	return num(radians)
+end
+
 -- Every value that can appear in the generated source, written the way you'd type it. Anything
 -- not here is skipped rather than guessed at, which is why the property list above is curated.
 local function literal(value: any): string?
@@ -2057,7 +2112,7 @@ local function literal(value: any): string?
 		return `Vector2.new({num(value.X)}, {num(value.Y)})`
 	end
 	if kind == "Color3" then
-		return `Color3.new({num(value.R)}, {num(value.G)}, {num(value.B)})`
+		return `Color3.fromRGB({rgb(value.R)}, {rgb(value.G)}, {rgb(value.B)})`
 	end
 	if kind == "UDim" then
 		return `UDim.new({num(value.Scale)}, {num(value.Offset)})`
@@ -2081,7 +2136,7 @@ local function literal(value: any): string?
 		if rx == 0 and ry == 0 and rz == 0 then
 			return origin
 		end
-		return `{origin} * CFrame.Angles({num(rx)}, {num(ry)}, {num(rz)})`
+		return `{origin} * CFrame.Angles({angle(rx)}, {angle(ry)}, {angle(rz)})`
 	end
 	return nil
 end
@@ -2126,8 +2181,20 @@ local function ensure(parent, name, class)
 	return found
 end
 
+-- An anchored part with nothing unusual about it, on one line.
+local function part(parent, name, class, size, cframe, material, color)
+	local found = ensure(parent, name, class)
+	found.Size, found.CFrame, found.Anchored = size, cframe, true
+	if material then found.Material = Enum.Material[material] end
+	if color then found.Color = color end
+	return found
+end
+
 return function(root)
 ]]
+
+-- A part whose only non-default properties are these collapses to one `part(...)` line.
+local PLAIN_PART: { [string]: boolean } = { Size = true, CFrame = true, Anchored = true, Material = true, Color = true }
 
 export type Options = {
 	depth: number?,
@@ -2155,16 +2222,14 @@ function Build.Dump(root: Instance, options: Options?): (string, number)
 		end
 		count += 1
 		local variable = `n{count}`
-
-		table.insert(
-			lines,
-			`\tlocal {variable} = ensure({parentVar}, {string.format("%q", instance.Name)}, {string.format(
-				"%q",
-				instance.ClassName
-			)})`
-		)
+		local nameAndClass =
+			`{parentVar}, {string.format("%q", instance.Name)}, {string.format("%q", instance.ClassName)}`
+		local tags: { string } = if wantTags then CollectionService:GetTags(instance) else {}
+		local attributes: { [string]: any } = if wantTags then instance:GetAttributes() else {}
 
 		local fresh = defaults(instance.ClassName)
+		local changed: { { name: string, value: any } } = {}
+		local plain = fresh ~= nil and instance:IsA("BasePart") and (instance :: BasePart).Anchored
 		for _, name in propertiesFor(instance) do
 			local ok, value = pcall(function()
 				return (instance :: any)[name]
@@ -2180,25 +2245,46 @@ function Build.Dump(root: Instance, options: Options?): (string, number)
 					continue
 				end
 			end
-			local written = literal(value)
-			if written then
-				table.insert(lines, `\t{variable}.{name} = {written}`)
+			if not PLAIN_PART[name] then
+				plain = false
+			end
+			table.insert(changed, { name = name, value = value })
+		end
+
+		-- The local only exists if a later line refers to it: children, a property line, a tag.
+		local referenced = (depth < depthLimit and #instance:GetChildren() > 0)
+			or not plain
+			or #tags > 0
+			or next(attributes) ~= nil
+		local declare = if referenced then `local {variable} = ` else ""
+
+		if plain then
+			local basePart = instance :: BasePart
+			local material = basePart.Material
+			local materialName = if material == Enum.Material.Plastic then "nil" else string.format("%q", material.Name)
+			local color = if basePart.Color == (fresh :: BasePart).Color then "nil" else literal(basePart.Color)
+			table.insert(
+				lines,
+				`\t{declare}part({nameAndClass}, {literal(basePart.Size)}, {literal(basePart.CFrame)}, {materialName}, {color})`
+			)
+		else
+			table.insert(lines, `\t{declare}ensure({nameAndClass})`)
+			for _, entry in changed do
+				local written = literal(entry.value)
+				if written then
+					table.insert(lines, `\t{variable}.{entry.name} = {written}`)
+				end
 			end
 		end
 
-		if wantTags then
-			for name, value in instance:GetAttributes() do
-				local written = literal(value)
-				if written then
-					table.insert(lines, `\t{variable}:SetAttribute({string.format("%q", name)}, {written})`)
-				end
+		for name, value in attributes do
+			local written = literal(value)
+			if written then
+				table.insert(lines, `\t{variable}:SetAttribute({string.format("%q", name)}, {written})`)
 			end
-			for _, tag in CollectionService:GetTags(instance) do
-				table.insert(
-					lines,
-					`\tgame:GetService("CollectionService"):AddTag({variable}, {string.format("%q", tag)})`
-				)
-			end
+		end
+		for _, tag in tags do
+			table.insert(lines, `\tgame:GetService("CollectionService"):AddTag({variable}, {string.format("%q", tag)})`)
 		end
 
 		if fresh then
@@ -2319,7 +2405,9 @@ function Build.Geometry(root: Instance, maxParts: number?): (Geometry, { BasePar
 		take(root)
 	end
 	for _, descendant in root:GetDescendants() do
-		if descendant:IsA("BasePart") then
+		-- Terrain is a BasePart the size of the world; on a Workspace root it would swallow the
+		-- bounds and the picture.
+		if descendant:IsA("BasePart") and not descendant:IsA("Terrain") then
 			take(descendant)
 		end
 	end
@@ -2397,6 +2485,32 @@ function Build.ResolveViews(views: { any }): ({ any }, { string })
 		table.insert(resolved, view)
 	end
 	return resolved, missing
+end
+
+-- The parts a set of views can actually show: everything, unless every panel is clipped to a
+-- radius, in which case only what's inside one of them. Drives whether badges make sense and
+-- which parts the legend bothers listing.
+function Build.Shown(parts: { BasePart }, views: { any }): { [BasePart]: boolean }
+	local shown: { [BasePart]: boolean } = {}
+	local clipped = {}
+	for _, view in views do
+		if type(view) ~= "table" or view.clip ~= true or type(view.at) ~= "table" or type(view.radius) ~= "number" then
+			for _, part in parts do
+				shown[part] = true
+			end
+			return shown
+		end
+		table.insert(clipped, { at = Vector3.new(view.at[1], view.at[2], view.at[3]), radius = view.radius })
+	end
+	for _, part in parts do
+		for _, view in clipped do
+			if (part.Position - view.at).Magnitude <= view.radius then
+				shown[part] = true
+				break
+			end
+		end
+	end
+	return shown
 end
 
 function Build.Problems(root: Instance, maxParts: number?, known: { BasePart }?): { Problem }
@@ -2520,7 +2634,9 @@ end
 
 local function span(min: Vector3, max: Vector3): string
 	local size = max - min
-	return `{fmt(size.X)}x{fmt(size.Y)}x{fmt(size.Z)} spanning x {fmt(min.X)}..{fmt(max.X)}, y {fmt(min.Y)}..{fmt(max.Y)}, z {fmt(min.Z)}..{fmt(max.Z)}`
+	return `{fmt(size.X)}x{fmt(size.Y)}x{fmt(size.Z)} spanning x {fmt(min.X)}..{fmt(max.X)}, y {fmt(min.Y)}..{fmt(max.Y)}, z {fmt(
+		min.Z
+	)}..{fmt(max.Z)}`
 end
 
 local function shorten(instance: Instance, root: Instance): string
@@ -2544,7 +2660,14 @@ local function grow(extent: Extent?, min: Vector3, max: Vector3): Extent
 	return extent
 end
 
-function Build.Report(root: Instance, parts: { BasePart }, badges: boolean, problems: { Problem }?): string
+-- `legend` is the set of parts that carry a badge in the picture; nil means no badges, and then
+-- no per-part list either -- on a big build that list is most of the reply and points at nothing.
+function Build.Report(
+	root: Instance,
+	parts: { BasePart },
+	legend: { [BasePart]: boolean }?,
+	problems: { Problem }?
+): string
 	local lines = {}
 
 	local whole: Extent? = nil
@@ -2579,7 +2702,7 @@ function Build.Report(root: Instance, parts: { BasePart }, badges: boolean, prob
 	if problems then
 		table.insert(lines, "")
 		if #problems == 0 then
-			table.insert(lines, "nothing looks wrong with the geometry")
+			table.insert(lines, "no problems found")
 		else
 			table.insert(lines, `{#problems} thing(s) worth a look:`)
 			for _, problem in problems do
@@ -2588,11 +2711,18 @@ function Build.Report(root: Instance, parts: { BasePart }, badges: boolean, prob
 		end
 	end
 
-	table.insert(lines, "")
-	table.insert(lines, if badges then "legend (the number in the picture):" else "parts:")
-	for index, part in parts do
-		local size = part.Size
-		table.insert(lines, `  #{index} {shorten(part, root)}  {fmt(size.X)}x{fmt(size.Y)}x{fmt(size.Z)} at {v3(part.Position)}`)
+	if legend then
+		table.insert(lines, "")
+		table.insert(lines, "legend (the number in the picture):")
+		for index, part in parts do
+			if legend[part] then
+				local size = part.Size
+				table.insert(
+					lines,
+					`  #{index} {shorten(part, root)}  {fmt(size.X)}x{fmt(size.Y)}x{fmt(size.Z)} at {v3(part.Position)}`
+				)
+			end
+		end
 	end
 
 	return table.concat(lines, "\n")
@@ -2606,6 +2736,7 @@ return Build
         <Properties>
           <string name="Name">Canvas</string>
           <string name="Source"><![CDATA[--!strict
+--!native
 
 -- An EditableImage that writes everything down.
 --
@@ -2613,12 +2744,21 @@ return Build
 -- faster than anything written here would be. What earns this module its place is the recording:
 -- the same list of operations goes back to Node, which replays it into a PNG. So one snippet
 -- gives a live preview in Studio and a file on disk, from one description.
+--
+-- Render also ships the real pixels (ReadPixelsBuffer, base64) when the image is small enough,
+-- so anything drawn straight on `canvas.image` -- DrawImage, WritePixelsBuffer -- lands in the
+-- PNG too. The recording stays as the portable description and the fallback for big images.
 
 local AssetService = game:GetService("AssetService")
 
 -- The engine's hard cap. An EditableImage can't be resized either, so a bigger one means a new
 -- image and a DrawImageTransformed into it.
 local MAX_SIZE = 1024
+-- Past this many bytes of RGBA the base64 alone is most of the socket's message budget, so the
+-- server replays the recording instead. 512x512 is 1 MB raw, 1.4 MB encoded.
+local MAX_PIXEL_BYTES = 512 * 512 * 4
+
+local BLEND = Enum.ImageCombineType.AlphaBlend
 
 local Canvas = {}
 
@@ -2629,11 +2769,14 @@ export type Canvas = {
 	width: number,
 	height: number,
 	ops: { Op },
+	assetId: number?,
 	Clear: (self: Canvas, color: Color3, alpha: number?) -> Canvas,
 	Rect: (self: Canvas, x: number, y: number, w: number, h: number, color: Color3, alpha: number?) -> Canvas,
 	Circle: (self: Canvas, x: number, y: number, radius: number, color: Color3, alpha: number?) -> Canvas,
 	Line: (self: Canvas, x1: number, y1: number, x2: number, y2: number, color: Color3, thickness: number?) -> Canvas,
 	Content: (self: Canvas) -> Content,
+	Pixels: (self: Canvas) -> string?,
+	Upload: (self: Canvas, name: string, description: string?) -> (number?, string?),
 	Recording: (self: Canvas) -> { [string]: any },
 }
 
@@ -2645,39 +2788,50 @@ local function record(self: any, op: Op): any
 	return self
 end
 
+local function rgb(color: Color3): { number }
+	return { color.R, color.G, color.B }
+end
+
 function Methods.Clear(self: any, color: Color3, alpha: number?): any
-	self.image:DrawRectangle(Vector2.zero, Vector2.new(self.width, self.height), color, 1 - (alpha or 1))
-	return record(self, { kind = "clear", color = { color.R, color.G, color.B }, alpha = alpha or 1 })
+	self.image:DrawRectangle(
+		Vector2.zero,
+		Vector2.new(self.width, self.height),
+		color,
+		1 - (alpha or 1),
+		Enum.ImageCombineType.Overwrite
+	)
+	return record(self, { kind = "clear", color = rgb(color), alpha = alpha or 1 })
 end
 
 function Methods.Rect(self: any, x: number, y: number, w: number, h: number, color: Color3, alpha: number?): any
-	self.image:DrawRectangle(Vector2.new(x, y), Vector2.new(w, h), color, 1 - (alpha or 1))
-	return record(
-		self,
-		{ kind = "rect", x = x, y = y, w = w, h = h, color = { color.R, color.G, color.B }, alpha = alpha or 1 }
-	)
+	self.image:DrawRectangle(Vector2.new(x, y), Vector2.new(w, h), color, 1 - (alpha or 1), BLEND)
+	return record(self, { kind = "rect", x = x, y = y, w = w, h = h, color = rgb(color), alpha = alpha or 1 })
 end
 
 function Methods.Circle(self: any, x: number, y: number, radius: number, color: Color3, alpha: number?): any
-	self.image:DrawCircle(Vector2.new(x, y), radius, color, 1 - (alpha or 1))
-	return record(
-		self,
-		{ kind = "circle", x = x, y = y, r = radius, color = { color.R, color.G, color.B }, alpha = alpha or 1 }
-	)
+	self.image:DrawCircle(Vector2.new(x, y), radius, color, 1 - (alpha or 1), BLEND)
+	return record(self, { kind = "circle", x = x, y = y, r = radius, color = rgb(color), alpha = alpha or 1 })
 end
 
+-- DrawLine is one pixel wide and refuses an endpoint outside the image, so a thick line is a
+-- stack of parallel ones, each clamped inside.
 function Methods.Line(self: any, x1: number, y1: number, x2: number, y2: number, color: Color3, thickness: number?): any
-	local width = thickness or 1
-	self.image:DrawLine(Vector2.new(x1, y1), Vector2.new(x2, y2), color, 0, Enum.ImageCombineType.Overwrite, width)
-	return record(self, {
-		kind = "line",
-		x1 = x1,
-		y1 = y1,
-		x2 = x2,
-		y2 = y2,
-		color = { color.R, color.G, color.B },
-		thickness = width,
-	})
+	local width = math.max(1, math.round(thickness or 1))
+	local dx, dy = x2 - x1, y2 - y1
+	local length = math.max(1e-3, math.sqrt(dx * dx + dy * dy))
+	local nx, ny = -dy / length, dx / length
+	local maxX, maxY = self.width - 1, self.height - 1
+	for i = 1, width do
+		local offset = (i - 1) - (width - 1) / 2
+		self.image:DrawLine(
+			Vector2.new(math.clamp(x1 + nx * offset, 0, maxX), math.clamp(y1 + ny * offset, 0, maxY)),
+			Vector2.new(math.clamp(x2 + nx * offset, 0, maxX), math.clamp(y2 + ny * offset, 0, maxY)),
+			color,
+			0,
+			BLEND
+		)
+	end
+	return record(self, { kind = "line", x1 = x1, y1 = y1, x2 = x2, y2 = y2, color = rgb(color), thickness = width })
 end
 
 -- Assign to an ImageLabel's ImageContent to see it. Only one EditableImage refreshes per frame on
@@ -2686,10 +2840,91 @@ function Methods.Content(self: any): Content
 	return Content.fromObject(self.image)
 end
 
--- What vmcp.Render sends to the VMCP server, which replays it to a PNG. Returning it from a
--- run_luau snippet as `postProcess` does the same thing on the way out.
+local ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local ENCODE = table.create(64)
+for i = 1, 64 do
+	ENCODE[i - 1] = string.byte(ALPHABET, i)
+end
+
+-- JSON has no bytes, so the RGBA buffer goes over as base64. Three input bytes to four output
+-- bytes, written straight into a second buffer; no string concatenation on the way.
+local function base64(bytes: buffer): string
+	local length = buffer.len(bytes)
+	local out = buffer.create(math.ceil(length / 3) * 4)
+	local o = 0
+	local full = length - length % 3
+	for i = 0, full - 1, 3 do
+		local a, b, c = buffer.readu8(bytes, i), buffer.readu8(bytes, i + 1), buffer.readu8(bytes, i + 2)
+		local n = a * 65536 + b * 256 + c
+		buffer.writeu8(out, o, ENCODE[n // 262144])
+		buffer.writeu8(out, o + 1, ENCODE[n // 4096 % 64])
+		buffer.writeu8(out, o + 2, ENCODE[n // 64 % 64])
+		buffer.writeu8(out, o + 3, ENCODE[n % 64])
+		o += 4
+	end
+	local rest = length - full
+	if rest == 1 then
+		local a = buffer.readu8(bytes, full)
+		buffer.writeu8(out, o, ENCODE[a // 4])
+		buffer.writeu8(out, o + 1, ENCODE[a % 4 * 16])
+		buffer.writeu8(out, o + 2, 61)
+		buffer.writeu8(out, o + 3, 61)
+	elseif rest == 2 then
+		local a, b = buffer.readu8(bytes, full), buffer.readu8(bytes, full + 1)
+		buffer.writeu8(out, o, ENCODE[a // 4])
+		buffer.writeu8(out, o + 1, ENCODE[a % 4 * 16 + b // 16])
+		buffer.writeu8(out, o + 2, ENCODE[b % 16 * 4])
+		buffer.writeu8(out, o + 3, 61)
+	end
+	return buffer.tostring(out)
+end
+
+-- The image's real RGBA as base64, or nil when it's over the size the socket is happy carrying.
+function Methods.Pixels(self: any): string?
+	if self.width * self.height * 4 > MAX_PIXEL_BYTES then
+		return nil
+	end
+	local ok, bytes = pcall(function()
+		return self.image:ReadPixelsBuffer(Vector2.zero, Vector2.new(self.width, self.height))
+	end)
+	if not ok then
+		return nil
+	end
+	return base64(bytes)
+end
+
+-- Publishes the image as an Image asset owned by whoever is logged into Studio and remembers the
+-- id, so a script can use rbxassetid://id with no EditableImage at runtime. Moderation runs after
+-- upload, so the id exists at once and the picture follows a little later.
+function Methods.Upload(self: any, name: string, description: string?): (number?, string?)
+	local ok, result, id = pcall(function()
+		return AssetService:CreateAssetAsync(self.image, Enum.AssetType.Image, {
+			Name = name,
+			Description = description or "Generated with VMCP Canvas",
+		})
+	end)
+	if not ok then
+		return nil, `upload failed: {result}`
+	end
+	if result ~= Enum.CreateAssetResult.Success then
+		return nil, `upload refused: {result}`
+	end
+	self.assetId = id
+	return id, nil
+end
+
+-- What vmcp.Render sends to the VMCP server, which writes it as a PNG. Returning it from a
+-- run_luau snippet as `postProcess` does the same thing on the way out. Carries the real pixels
+-- when they fit, and the op list either way.
 function Methods.Recording(self: any): { [string]: any }
-	return { kind = "png", width = self.width, height = self.height, ops = self.ops }
+	return {
+		kind = "png",
+		width = self.width,
+		height = self.height,
+		ops = self.ops,
+		pixels = self:Pixels(),
+		assetId = self.assetId,
+	}
 end
 
 function Canvas.new(width: number, height: number): (Canvas?, string?)
@@ -2712,6 +2947,301 @@ return Canvas
         </Properties>
       </Item>
       <Item class="ModuleScript" referent="16">
+        <Properties>
+          <string name="Name">Equiv</string>
+          <string name="Source"><![CDATA[--!strict
+--!optimize 2
+
+-- Proves two functions behave the same: same inputs in, same returns, same errors, same state
+-- left behind. This is what makes "the fix doesn't change behaviour" a measured claim.
+--
+-- No dependencies on the rest of the plugin, on purpose: GameVm copies this module into the
+-- playtest so it can run against functions that live in the game's own VM (where the plugin
+-- can't reach them), and it's the same file either side.
+
+local Equiv = {}
+
+export type Mismatch = {
+	-- The call index, or a probe label like "arg 2: nil".
+	input: string,
+	-- returns | error | state | outcome
+	kind: string,
+	detail: string,
+}
+
+export type Options = {
+	-- Calls to make. Defaults to 100.
+	n: number?,
+	-- Snapshot of whatever the functions mutate, taken after each call and compared.
+	state: (() -> any)?,
+	-- Also feed both functions broken arguments and compare how they fail. Defaults to true.
+	probes: boolean?,
+	-- Relative tolerance for numbers. Defaults to 1e-9.
+	tolerance: number?,
+	-- Stop after this many mismatches. Defaults to 10.
+	limit: number?,
+}
+
+export type Result = {
+	passed: boolean,
+	checked: number,
+	probed: number,
+	mismatches: { Mismatch },
+	text: string,
+}
+
+local DEFAULT_N = 100
+local DEFAULT_LIMIT = 10
+local DEFAULT_TOLERANCE = 1e-9
+
+local function describe(value: any, depth: number?): string
+	local kind = typeof(value)
+	if kind == "string" then
+		return string.format("%q", if #value > 60 then string.sub(value, 1, 60) .. "…" else value)
+	end
+	if kind == "table" then
+		if (depth or 0) >= 2 then
+			return "{…}"
+		end
+		local parts = {}
+		local count = 0
+		for key, entry in value do
+			count += 1
+			if count > 6 then
+				table.insert(parts, "…")
+				break
+			end
+			table.insert(parts, `{tostring(key)} = {describe(entry, (depth or 0) + 1)}`)
+		end
+		return "{ " .. table.concat(parts, ", ") .. " }"
+	end
+	if kind == "Instance" then
+		return `<{value.ClassName} {value:GetFullName()}>`
+	end
+	return tostring(value)
+end
+
+local function deepCopy(value: any, seen: { [any]: any }?): any
+	if type(value) ~= "table" then
+		return value
+	end
+	local memo = seen or {}
+	if memo[value] then
+		return memo[value]
+	end
+	local out = {}
+	memo[value] = out
+	for key, entry in value do
+		out[deepCopy(key, memo)] = deepCopy(entry, memo)
+	end
+	return setmetatable(out, getmetatable(value)) :: any
+end
+
+-- Returns nil when equal, otherwise a path plus what differed.
+local function diff(a: any, b: any, tolerance: number, path: string, seen: { [any]: boolean }): string?
+	local ka, kb = typeof(a), typeof(b)
+	if ka ~= kb then
+		return `{path}: {ka} vs {kb} ({describe(a)} vs {describe(b)})`
+	end
+	if ka == "number" then
+		if a ~= a and b ~= b then
+			return nil
+		end
+		local scale = math.max(math.abs(a), math.abs(b), 1)
+		if math.abs(a - b) > tolerance * scale then
+			return `{path}: {a} vs {b}`
+		end
+		return nil
+	end
+	if ka == "table" then
+		if a == b or seen[a] then
+			return nil
+		end
+		seen[a] = true
+		for key, entry in a do
+			local problem = diff(entry, b[key], tolerance, `{path}.{tostring(key)}`, seen)
+			if problem then
+				return problem
+			end
+		end
+		for key in b do
+			if a[key] == nil then
+				return `{path}.{tostring(key)}: nil vs {describe(b[key])}`
+			end
+		end
+		return nil
+	end
+	if ka == "function" or ka == "thread" then
+		return nil
+	end
+	if a ~= b then
+		return `{path}: {describe(a)} vs {describe(b)}`
+	end
+	return nil
+end
+
+-- Script paths and line numbers differ between the original and a candidate module by
+-- construction, so they can't be part of "the same error".
+local function stripLocation(message: any): string
+	local text = tostring(message)
+	return (string.gsub(text, "^[%w%._:%- ]-:%d+: ", ""))
+end
+
+local function call(fn: (...any) -> ...any, args: { any }, count: number): (boolean, { any })
+	local packed = table.pack(pcall(fn, table.unpack(args, 1, count)))
+	local ok = packed[1]
+	local rest: { any } = table.create(packed.n - 1)
+	for index = 2, packed.n do
+		rest[index - 1] = packed[index]
+	end
+	(rest :: any).n = packed.n - 1
+	return ok, rest
+end
+
+-- What to swap an argument for to see whether both versions refuse it the same way.
+type Probe = { label: string, value: any }
+
+local function probesFor(value: any): { Probe }
+	local kind = typeof(value)
+	local out: { Probe } = { { label = "nil", value = nil } }
+	if kind == "number" then
+		table.insert(out, { label = "string instead of number", value = tostring(value) })
+		table.insert(out, { label = "negative", value = -math.abs(value) - 1 })
+		table.insert(out, { label = "nan", value = 0 / 0 })
+	elseif kind == "string" then
+		table.insert(out, { label = "number instead of string", value = 7 })
+		table.insert(out, { label = "empty string", value = "" })
+	elseif kind == "table" then
+		table.insert(out, { label = "number instead of table", value = 7 })
+		table.insert(out, { label = "empty table", value = {} })
+	elseif kind == "Instance" then
+		table.insert(out, { label = "string instead of instance", value = value:GetFullName() })
+	elseif kind == "boolean" then
+		table.insert(out, { label = "number instead of boolean", value = 1 })
+	else
+		table.insert(out, { label = "number instead of " .. kind, value = 7 })
+	end
+	return out
+end
+
+-- Runs one input through both and records how they disagree, if they do.
+local function compareOne(
+	old: (...any) -> ...any,
+	new: (...any) -> ...any,
+	args: { any },
+	count: number,
+	label: string,
+	options: Options,
+	tolerance: number,
+	mismatches: { Mismatch }
+)
+	local oldOk, oldOut = call(old, deepCopy(args), count)
+	local oldState = if options.state then deepCopy((options.state :: () -> any)()) else nil
+	local newOk, newOut = call(new, deepCopy(args), count)
+	local newState = if options.state then deepCopy((options.state :: () -> any)()) else nil
+
+	if oldOk ~= newOk then
+		table.insert(mismatches, {
+			input = label,
+			kind = "outcome",
+			detail = if oldOk
+				then `old returned {describe(oldOut[1])}, new errored: {stripLocation(newOut[1])}`
+				else `old errored: {stripLocation(oldOut[1])}, new returned {describe(newOut[1])}`,
+		})
+		return
+	end
+	if not oldOk then
+		local oldMessage, newMessage = stripLocation(oldOut[1]), stripLocation(newOut[1])
+		if oldMessage ~= newMessage then
+			table.insert(mismatches, { input = label, kind = "error", detail = `"{oldMessage}" vs "{newMessage}"` })
+		end
+		return
+	end
+
+	local problem = diff(oldOut, newOut, tolerance, "return", {})
+	if problem then
+		table.insert(mismatches, { input = label, kind = "returns", detail = problem })
+		return
+	end
+	if options.state then
+		local stateProblem = diff(oldState, newState, tolerance, "state", {})
+		if stateProblem then
+			table.insert(mismatches, { input = label, kind = "state", detail = stateProblem })
+		end
+	end
+end
+
+-- `generate(i)` returns the argument list for call i; it's called once per call and the
+-- arguments are copied before each version sees them, so a function that mutates its input
+-- can't leak that into the other version's run.
+function Equiv.Check(
+	old: (...any) -> ...any,
+	new: (...any) -> ...any,
+	generate: (index: number) -> { any },
+	options: Options?
+): Result
+	local settings: Options = options or {}
+	local n = settings.n or DEFAULT_N
+	local limit = settings.limit or DEFAULT_LIMIT
+	local tolerance = settings.tolerance or DEFAULT_TOLERANCE
+	local mismatches: { Mismatch } = {}
+	local checked = 0
+	local probed = 0
+
+	for index = 1, n do
+		if #mismatches >= limit then
+			break
+		end
+		local args = generate(index)
+		local count = if type(args) == "table" then (args :: any).n or #args else 0
+		compareOne(old, new, args, count, `call {index}`, settings, tolerance, mismatches)
+		checked += 1
+	end
+
+	if settings.probes ~= false and #mismatches < limit then
+		local base = generate(1)
+		local count = (base :: any).n or #base
+		for position = 1, count do
+			for _, probe in probesFor(base[position]) do
+				if #mismatches >= limit then
+					break
+				end
+				local args = deepCopy(base)
+				args[position] = probe.value
+				compareOne(old, new, args, count, `arg {position}: {probe.label}`, settings, tolerance, mismatches)
+				probed += 1
+			end
+		end
+		if #mismatches < limit then
+			compareOne(old, new, {}, 0, "no arguments", settings, tolerance, mismatches)
+			probed += 1
+		end
+	end
+
+	local lines = {}
+	if #mismatches == 0 then
+		table.insert(lines, `identical over {checked} inputs and {probed} broken-argument probes`)
+	else
+		table.insert(lines, `{#mismatches} mismatch(es) over {checked} inputs and {probed} probes:`)
+		for _, mismatch in mismatches do
+			table.insert(lines, `  [{mismatch.kind}] {mismatch.input}: {mismatch.detail}`)
+		end
+	end
+
+	return {
+		passed = #mismatches == 0,
+		checked = checked,
+		probed = probed,
+		mismatches = mismatches,
+		text = table.concat(lines, "\n"),
+	}
+end
+
+return Equiv
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="17">
         <Properties>
           <string name="Name">Exploit</string>
           <string name="Source"><![CDATA[--!strict
@@ -3222,7 +3752,1900 @@ return Exploit
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="17">
+      <Item class="ModuleScript" referent="18">
+        <Properties>
+          <string name="Name">Instrument</string>
+          <string name="Source"><![CDATA[--!strict
+--!optimize 2
+
+-- Puts a debug.profilebegin/profileend scope around every named function in a script, so one
+-- capture says which function in a module the time went to -- the engine only ever reports
+-- "$Script" on its own.
+--
+-- The end has to run on every way out, so each `return` that belongs to the function is rewritten
+-- as `do debug.profileend() return ... end` (a `return` is always the last statement in its block,
+-- so wrapping it in do/end is always legal) and one more profileend goes before the closing `end`
+-- for the fall-through case. Errors leave the scope open; the engine closes it when the thread
+-- ends, which is fine for a profile and wrong for nothing else.
+
+local LuauScan = require(script.Parent.LuauScan)
+
+local Instrument = {}
+
+local BLOCK_CLOSERS = { ["end"] = true, ["else"] = true, ["elseif"] = true, ["until"] = true, [";"] = true }
+local BLOCK_OPENERS = { ["function"] = true, ["if"] = true, ["do"] = true, ["repeat"] = true }
+
+type Edit = { at: number, text: string, sequence: number? }
+
+-- Index of the last token of the return statement starting at `from`. A `function`, `do` or
+-- `repeat` inside the expression is balanced so its `end` isn't taken for the block's; an
+-- if-expression has no `end` of its own.
+local function returnEnd(tokens: { LuauScan.Token }, from: number): number
+	local depth = 0
+	local index = from + 1
+	while index <= #tokens do
+		local token = tokens[index]
+		local text = token.text
+		if token.kind == "keyword" and BLOCK_OPENERS[text] then
+			-- `if` as an expression has no `end`; only a `function`, `do` or `repeat` opens here.
+			if text ~= "if" then
+				depth += 1
+			end
+		elseif depth > 0 and (text == "end" or text == "until") then
+			depth -= 1
+		elseif depth == 0 and BLOCK_CLOSERS[text] then
+			return index - 1
+		end
+		index += 1
+	end
+	return #tokens
+end
+
+-- Rewrites `source` and returns it with the list of labels it introduced. Anonymous functions
+-- (event handlers, callbacks) are skipped: they have no name to label, and a name is the point.
+function Instrument.Functions(source: string, prefix: string): (string, { string })
+	local scan = LuauScan.Scan(source)
+	local tokens = scan.tokens
+	local edits: { Edit } = {}
+	local labels: { string } = {}
+	local functionOf: { [number]: number } = {}
+
+	for blockIndex, block in scan.blocks do
+		if block.kind ~= "function" or not block.close or not block.body or block.name == "" then
+			continue
+		end
+		local name = (block.name :: string):gsub("^local ", "")
+		local label = `{prefix}.{name}`
+		table.insert(labels, label)
+		functionOf[blockIndex] = #labels
+
+		local bodyToken = tokens[block.body :: number]
+		local closeToken = tokens[block.close :: number]
+		table.insert(edits, { at = bodyToken.start, text = `debug.profilebegin({string.format("%q", label)}) ` })
+		table.insert(edits, { at = closeToken.start, text = "debug.profileend() " })
+	end
+
+	for index, token in tokens do
+		if token.text ~= "return" or token.kind ~= "keyword" then
+			continue
+		end
+		local owner = LuauScan.Enclosing(scan, index, "function")
+		if not owner then
+			continue
+		end
+		local ownerIndex = table.find(scan.blocks, owner) :: number
+		if not functionOf[ownerIndex] then
+			continue
+		end
+		local last = returnEnd(tokens, index)
+		table.insert(edits, { at = token.start, text = "do debug.profileend() " })
+		table.insert(edits, { at = tokens[last].stop + 1, text = " end" })
+	end
+
+	-- Same offset, same order they were added: a begin before an end on an empty body, " end"
+	-- before the fall-through profileend when a return sits right at the close.
+	for sequence, edit in edits do
+		edit.sequence = sequence
+	end
+	table.sort(edits, function(a, b)
+		if a.at ~= b.at then
+			return a.at < b.at
+		end
+		return a.sequence < b.sequence
+	end)
+	local pieces = {}
+	local cursor = 1
+	for _, edit in edits do
+		table.insert(pieces, string.sub(source, cursor, edit.at - 1))
+		table.insert(pieces, edit.text)
+		cursor = edit.at
+	end
+	table.insert(pieces, string.sub(source, cursor))
+	local out = table.concat(pieces)
+	return out, labels
+end
+
+return Instrument
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="19">
+        <Properties>
+          <string name="Name">Lint</string>
+          <string name="Source"><![CDATA[--!strict
+--!optimize 2
+
+-- Finds the shapes that cost frame time, with the context that makes them cost it: a
+-- GetDescendants is a fact, a GetDescendants inside a Heartbeat handler is a finding. Everything
+-- here is a token pattern plus "which block is it in", so it's fast and it's shallow -- it hands
+-- the profiler a shortlist, it doesn't replace it.
+
+local LuauScan = require(script.Parent.LuauScan)
+
+local Lint = {}
+
+export type Finding = {
+	line: number,
+	-- high | medium | low
+	severity: string,
+	pattern: string,
+	-- per-frame | hot-event | loop | function | top
+	context: string,
+	detail: string,
+}
+
+local PER_FRAME = {
+	Heartbeat = true,
+	RenderStepped = true,
+	Stepped = true,
+	PreRender = true,
+	PreSimulation = true,
+	PostSimulation = true,
+	PreAnimation = true,
+	BindToRenderStep = true,
+}
+local HOT_EVENT = { Touched = true, TouchEnded = true, Changed = true, GetPropertyChangedSignal = true }
+
+local TREE_WALKS =
+	{ GetDescendants = true, GetChildren = true, FindFirstChildWhichIsA = true, FindFirstChildOfClass = true }
+local ALLOCATORS = { Clone = true }
+local PHYSICS_QUERIES = {
+	Raycast = true,
+	Blockcast = true,
+	Spherecast = true,
+	Shapecast = true,
+	GetPartBoundsInBox = true,
+	GetPartBoundsInRadius = true,
+	GetPartsInPart = true,
+}
+local LEGACY = { wait = "wait", spawn = "spawn", delay = "delay" }
+
+-- What the innermost meaningful block around a token is. Loops beat functions because a loop
+-- inside a per-frame handler is worse than the handler, and the label says so either way.
+local function contextOf(scan: LuauScan.Scan, index: number): (string, string?)
+	local at = scan.blockOf[index]
+	local sawLoop = false
+	local sawFunction = false
+	while at do
+		local block = scan.blocks[at]
+		if block.kind == "loop" or block.kind == "repeat" then
+			sawLoop = true
+		elseif block.kind == "function" then
+			local connect = block.connect
+			if connect and PER_FRAME[connect] then
+				return "per-frame", connect
+			end
+			if connect and HOT_EVENT[connect] then
+				return "hot-event", connect
+			end
+			-- A handler wrapped in a named function connected elsewhere isn't traced; the loop
+			-- inside a function is still the more useful label.
+			if sawLoop then
+				return "loop", nil
+			end
+			-- Keep walking: an anonymous function inside a Heartbeat handler still counts.
+			sawFunction = true
+			at = block.parent
+			continue
+		end
+		at = block.parent
+	end
+	return if sawLoop then "loop" elseif sawFunction then "function" else "top", nil
+end
+
+local function inFunction(scan: LuauScan.Scan, index: number): boolean
+	return LuauScan.Enclosing(scan, index, "function") ~= nil
+end
+
+-- Depth of a `game.A.B.C` / `workspace.A.B.C` chain starting at token `index`.
+local function pathDepth(tokens: { LuauScan.Token }, index: number): number
+	local depth = 0
+	local at = index + 1
+	while tokens[at] and tokens[at].text == "." and tokens[at + 1] and tokens[at + 1].kind == "name" do
+		depth += 1
+		at += 2
+	end
+	return depth
+end
+
+local function literalArgs(tokens: { LuauScan.Token }, paren: number): boolean
+	local at = paren + 1
+	while tokens[at] and tokens[at].text ~= ")" do
+		local token = tokens[at]
+		if not (token.kind == "number" or token.text == "," or token.text == "-") then
+			return false
+		end
+		at += 1
+	end
+	return tokens[at] ~= nil
+end
+
+function Lint.Script(source: string): { Finding }
+	local scan = LuauScan.Scan(source)
+	local tokens = scan.tokens
+	local findings: { Finding } = {}
+
+	local function add(index: number, severity: string, pattern: string, detail: string)
+		local context, signal = contextOf(scan, index)
+		table.insert(findings, {
+			line = tokens[index].line,
+			severity = severity,
+			pattern = pattern,
+			context = if signal then `{context} ({signal})` else context,
+			detail = detail,
+		})
+	end
+
+	-- Severity for a thing that's bad in proportion to how often it runs.
+	local function rate(index: number, whenHot: string, whenLoop: string, otherwise: string?): string?
+		local context = contextOf(scan, index)
+		if context == "per-frame" or context == "hot-event" then
+			return whenHot
+		end
+		if context == "loop" then
+			return whenLoop
+		end
+		return otherwise
+	end
+
+	for index, token in tokens do
+		local text = token.text
+		local previous = tokens[index - 1]
+		local following = tokens[index + 1]
+		local method = previous and previous.text == ":"
+		local call = following and following.text == "("
+
+		if token.kind == "name" and method and call then
+			if TREE_WALKS[text] then
+				local severity = rate(index, "high", "high", if inFunction(scan, index) then "low" else nil)
+				if severity then
+					add(index, severity, "tree walk", `{text}() walks the tree every time this runs`)
+				end
+			elseif text == "FindFirstChild" then
+				-- Recursive form: FindFirstChild(name, true)
+				local comma = tokens[index + 3]
+				local flag = tokens[index + 4]
+				if comma and comma.text == "," and flag and flag.text == "true" then
+					local severity = rate(index, "high", "high", "medium")
+					add(index, severity :: string, "tree walk", "FindFirstChild(name, true) is a recursive search")
+				end
+			elseif ALLOCATORS[text] then
+				local severity = rate(index, "high", "medium", nil)
+				if severity then
+					add(index, severity, "allocation", `:{text}() creates instances each time this runs`)
+				end
+			elseif PHYSICS_QUERIES[text] then
+				local severity = rate(index, "medium", "medium", nil)
+				if severity then
+					add(index, severity, "physics query", `:{text}() per run; check the params filter and MaxParts`)
+				end
+			elseif text == "FireAllClients" or text == "FireClient" or text == "FireServer" then
+				local severity = rate(index, "high", "medium", nil)
+				if severity then
+					add(index, severity, "network", `:{text}() at this rate is a replication cost every frame`)
+				end
+			elseif text == "Create" and previous and tokens[index - 2] and tokens[index - 2].text == "TweenService" then
+				local severity = rate(index, "medium", "low", nil)
+				if severity then
+					add(index, severity, "allocation", "TweenService:Create per run; reuse tweens or tween once")
+				end
+			elseif text == "GetService" then
+				local severity = rate(index, "low", "low", nil)
+				if severity then
+					add(index, severity, "hoist", "GetService inside a hot path; hoist to the top of the script")
+				end
+			elseif text == "Connect" or text == "ConnectParallel" then
+				local severity = rate(index, "high", "medium", nil)
+				if severity then
+					add(index, severity, "leak", "a new connection made each run; these accumulate")
+				end
+			end
+		elseif token.kind == "name" and text == "new" and previous and previous.text == "." and call then
+			local owner = tokens[index - 2]
+			if owner and owner.text == "Instance" then
+				local severity = rate(index, "high", "medium", nil)
+				if severity then
+					add(index, severity, "allocation", "Instance.new each time this runs")
+				end
+			elseif
+				owner
+				and (
+					owner.text == "Vector3"
+					or owner.text == "CFrame"
+					or owner.text == "Color3"
+					or owner.text == "UDim2"
+				)
+			then
+				if literalArgs(tokens, index + 1) then
+					local severity = rate(index, "low", "low", nil)
+					if severity then
+						add(index, severity, "hoist", `{owner.text}.new with constant arguments; build it once outside`)
+					end
+				end
+			end
+		elseif
+			token.kind == "name"
+			and LEGACY[text]
+			and call
+			and not (previous and (previous.text == "." or previous.text == ":"))
+		then
+			add(index, "medium", "legacy scheduler", `{text}() -- use task.{LEGACY[text]}`)
+		elseif token.kind == "name" and text == "require" and call and inFunction(scan, index) then
+			add(index, "low", "hoist", "require inside a function; move it to the top of the script")
+		elseif token.kind == "name" and (text == "game" or text == "workspace") and inFunction(scan, index) then
+			local depth = pathDepth(tokens, index)
+			if depth >= 3 then
+				local severity = rate(index, "medium", "medium", "low")
+				add(index, severity :: string, "deep path", `{depth}-segment path lookup each run; cache the instance`)
+			end
+		elseif token.kind == "name" and text == "format" and previous and previous.text == "." then
+			local owner = tokens[index - 2]
+			if owner and owner.text == "string" and contextOf(scan, index) == "per-frame" then
+				add(index, "low", "allocation", "string.format every frame allocates a new string")
+			end
+		elseif token.kind == "op" and text == ".." then
+			local severity = rate(index, "medium", "low", nil)
+			if severity then
+				add(index, severity, "allocation", "string concat in a hot path; each .. makes a new string")
+			end
+		elseif token.kind == "name" and text == "pcall" and call then
+			local severity = rate(index, "low", "low", nil)
+			if severity then
+				add(index, severity, "call overhead", "pcall per run; wrap the batch instead of the element")
+			end
+		elseif token.kind == "keyword" and text == "while" and following and following.text == "true" then
+			add(
+				index,
+				"medium",
+				"polling loop",
+				"while true do ... wait -- an event would run only when something changes"
+			)
+		elseif token.kind == "name" and text == "GetPropertyChangedSignal" and call then
+			local argument = tokens[index + 2]
+			if
+				argument
+				and (argument.text == '"CFrame"' or argument.text == '"Position"' or argument.text == '"Velocity"')
+			then
+				add(index, "medium", "hot event", `{argument.text} changes every physics step for a moving part`)
+			end
+		elseif token.kind == "keyword" and text == "function" and following and following.text == "(" then
+			local block = scan.blocks[scan.blockOf[index + 1] :: number]
+			if block and block.connect and HOT_EVENT[block.connect] and block.connect ~= "GetPropertyChangedSignal" then
+				add(index, "low", "hot event", `{block.connect} handler; fires far more often than it looks`)
+			end
+		end
+	end
+
+	return findings
+end
+
+local RANK = { high = 3, medium = 2, low = 1 }
+
+-- Worst first, then by line.
+function Lint.Sort(findings: { Finding })
+	table.sort(findings, function(a, b)
+		local ra, rb = RANK[a.severity], RANK[b.severity]
+		if ra ~= rb then
+			return ra > rb
+		end
+		return a.line < b.line
+	end)
+end
+
+Lint.Rank = RANK
+
+return Lint
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="20">
+        <Properties>
+          <string name="Name">Load</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Makes a test client behave like a player for a while, so a profile taken meanwhile has real
+-- movement, animation, replication and remote traffic in it -- and with several clients doing
+-- it at once, the per-player loops that only blow up at eight players show up at eight players.
+--
+-- Client-side only: it drives `input`, the timeline's real input path, and fires remotes the way
+-- the game's own UI would.
+
+local Load = {}
+
+export type RemoteSpec = { remote: Instance, args: { any }?, perSecond: number? }
+
+export type Options = {
+	-- Seconds to keep going. Defaults to 5.
+	seconds: number?,
+	-- Remotes to fire while wandering, each with the arguments to send and how often per second.
+	remotes: { RemoteSpec }?,
+	-- Chance per step of a jump. Defaults to 0.15.
+	jump: number?,
+	-- Seed, so eight clients don't all walk the same line. Defaults to the peer index if the
+	-- caller passes it, else time.
+	seed: number?,
+}
+
+local MOVE_KEYS = { "W", "A", "S", "D" }
+
+-- Walks, turns, jumps and fires remotes until `seconds` are up. `input` is the timeline's input
+-- object for this client event. Returns how many steps and remote calls were made.
+function Load.Wander(input: any, options: Options?): { steps: number, remoteCalls: number }
+	local settings: Options = options or {}
+	local random = Random.new(settings.seed or math.floor(os.clock() * 1000))
+	local deadline = os.clock() + (settings.seconds or 5)
+	local jumpChance = settings.jump or 0.15
+	local remotes: { RemoteSpec } = settings.remotes or {}
+	local nextFire: { number } = {}
+	for index in remotes do
+		nextFire[index] = 0
+	end
+
+	local steps, remoteCalls = 0, 0
+	local held: string? = nil
+	while os.clock() < deadline do
+		local key = MOVE_KEYS[random:NextInteger(1, #MOVE_KEYS)]
+		if held then
+			input:Release(held)
+		end
+		input:Hold(key)
+		held = key
+		if random:NextNumber() < jumpChance then
+			input:Tap("Space", 0.05)
+		end
+		steps += 1
+
+		local now = os.clock()
+		for index, spec in remotes do
+			if now < nextFire[index] then
+				continue
+			end
+			nextFire[index] = now + 1 / (spec.perSecond or 2)
+			local remote: any = spec.remote
+			local args = spec.args or {}
+			local ok = pcall(function()
+				if remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent") then
+					remote:FireServer(table.unpack(args))
+				elseif remote:IsA("RemoteFunction") then
+					remote:InvokeServer(table.unpack(args))
+				end
+			end)
+			if ok then
+				remoteCalls += 1
+			end
+		end
+
+		task.wait(random:NextNumber(0.2, 0.7))
+	end
+	if held then
+		input:Release(held)
+	end
+	return { steps = steps, remoteCalls = remoteCalls }
+end
+
+return Load
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="21">
+        <Properties>
+          <string name="Name">LuauScan</string>
+          <string name="Source"><![CDATA[--!strict
+--!native
+--!optimize 2
+
+-- A token stream for Luau source with block structure on top: which function, loop or `if` each
+-- token sits inside. Not a parser -- it knows nothing about expressions -- but it's exactly enough
+-- to answer "is this call inside a per-frame handler" (Lint) and "where does this function's body
+-- start, and which returns are its own" (Instrument) without either of them lexing strings and
+-- comments themselves.
+
+local LuauScan = {}
+
+export type Token = {
+	kind: "name" | "keyword" | "number" | "string" | "op",
+	text: string,
+	line: number,
+	-- Byte range in the source, inclusive.
+	start: number,
+	stop: number,
+}
+
+export type Block = {
+	-- function | loop | if | do | repeat
+	kind: string,
+	-- Index of the opening token (the `function`, `do`, `if`, `repeat`, or the `while`/`for`).
+	open: number,
+	-- Index of the closing `end`/`until`, filled in when it's found.
+	close: number?,
+	-- Functions only: the declared name ("Combat.ResolveHit", "local step", "" for anonymous),
+	-- and the signal name when it's the argument of `:Connect(` ("Heartbeat").
+	name: string?,
+	connect: string?,
+	-- Functions only: index of the first token of the body.
+	body: number?,
+	parent: number?,
+}
+
+export type Scan = {
+	tokens: { Token },
+	blocks: { Block },
+	-- blockOf[i] is the index into blocks of the innermost block containing token i, or nil at
+	-- top level.
+	blockOf: { number? },
+}
+
+local KEYWORDS = {}
+for _, word in
+	{
+		"and",
+		"break",
+		"do",
+		"else",
+		"elseif",
+		"end",
+		"false",
+		"for",
+		"function",
+		"if",
+		"in",
+		"local",
+		"nil",
+		"not",
+		"or",
+		"repeat",
+		"return",
+		"then",
+		"true",
+		"until",
+		"while",
+		"continue",
+	}
+do
+	KEYWORDS[word] = true
+end
+
+-- Longest first, so `...` beats `..` beats `.`.
+local OPS = {
+	"...",
+	"..=",
+	"//=",
+	"..",
+	"==",
+	"~=",
+	"<=",
+	">=",
+	"->",
+	"::",
+	"+=",
+	"-=",
+	"*=",
+	"/=",
+	"%=",
+	"^=",
+	"//",
+	"+",
+	"-",
+	"*",
+	"/",
+	"%",
+	"^",
+	"#",
+	"=",
+	"<",
+	">",
+	"(",
+	")",
+	"{",
+	"}",
+	"[",
+	"]",
+	";",
+	":",
+	",",
+	".",
+	"?",
+	"|",
+	"&",
+}
+
+local function longBracketLevel(source: string, at: number): number?
+	-- `[` then `=`* then `[`
+	if string.byte(source, at) ~= 91 then
+		return nil
+	end
+	local index = at + 1
+	local level = 0
+	while string.byte(source, index) == 61 do
+		level += 1
+		index += 1
+	end
+	return if string.byte(source, index) == 91 then level else nil
+end
+
+local function closeLongBracket(source: string, from: number, level: number): number
+	local pattern = "]" .. string.rep("=", level) .. "]"
+	local _, stop = string.find(source, pattern, from, true)
+	return stop or #source
+end
+
+function LuauScan.Tokenize(source: string): { Token }
+	local tokens: { Token } = {}
+	local index = 1
+	local length = #source
+	local line = 1
+
+	local function push(kind: string, start: number, stop: number)
+		table.insert(tokens, {
+			kind = kind :: any,
+			text = string.sub(source, start, stop),
+			line = line,
+			start = start,
+			stop = stop,
+		})
+	end
+
+	while index <= length do
+		local byte = string.byte(source, index)
+
+		if byte == 10 then
+			line += 1
+			index += 1
+			continue
+		end
+		if byte == 32 or byte == 9 or byte == 13 then
+			index += 1
+			continue
+		end
+
+		-- Comments, line and block. Newlines inside still count.
+		if byte == 45 and string.byte(source, index + 1) == 45 then
+			local level = longBracketLevel(source, index + 2)
+			local stop
+			if level then
+				stop = closeLongBracket(source, index + 2, level)
+			else
+				stop = (string.find(source, "\n", index, true) or length + 1) - 1
+			end
+			for _ in string.gmatch(string.sub(source, index, stop), "\n") do
+				line += 1
+			end
+			index = stop + 1
+			continue
+		end
+
+		-- Strings: quoted, backtick (interpolated -- treated as opaque), long bracket.
+		if byte == 34 or byte == 39 or byte == 96 then
+			local quote = byte
+			local at = index + 1
+			while at <= length do
+				local current = string.byte(source, at)
+				if current == 92 then
+					at += 2
+					continue
+				end
+				if current == quote then
+					break
+				end
+				if current == 10 then
+					line += 1
+				end
+				at += 1
+			end
+			push("string", index, math.min(at, length))
+			index = at + 1
+			continue
+		end
+		local level = longBracketLevel(source, index)
+		if level then
+			local stop = closeLongBracket(source, index, level)
+			for _ in string.gmatch(string.sub(source, index, stop), "\n") do
+				line += 1
+			end
+			push("string", index, stop)
+			index = stop + 1
+			continue
+		end
+
+		-- Names and keywords.
+		if (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 95 then
+			local _, stop = string.find(source, "^[%w_]+", index)
+			local text = string.sub(source, index, stop :: number)
+			push(if KEYWORDS[text] then "keyword" else "name", index, stop :: number)
+			index = (stop :: number) + 1
+			continue
+		end
+
+		-- Numbers, loosely: 0x..., 1e-5, 1_000, 3.5
+		if
+			byte >= 48 and byte <= 57
+			or (
+				byte == 46
+				and (string.byte(source, index + 1) or 0) >= 48
+				and (string.byte(source, index + 1) or 0) <= 57
+			)
+		then
+			local _, stop = string.find(source, "^[%w_%.]+", index)
+			-- `1e-5`: the sign belongs to the number.
+			local tail = string.byte(source, (stop :: number) + 1)
+			if (string.match(string.sub(source, index, stop :: number), "[eE]$")) and (tail == 45 or tail == 43) then
+				local _, more = string.find(source, "^[%d_]+", (stop :: number) + 2)
+				stop = more or (stop :: number) + 1
+			end
+			push("number", index, stop :: number)
+			index = (stop :: number) + 1
+			continue
+		end
+
+		local matched = false
+		for _, op in OPS do
+			if string.sub(source, index, index + #op - 1) == op then
+				push("op", index, index + #op - 1)
+				index += #op
+				matched = true
+				break
+			end
+		end
+		if not matched then
+			-- Something we don't know (unicode in an identifier, say). Skip the byte.
+			index += 1
+		end
+	end
+
+	return tokens
+end
+
+-- Tokens after which an `if` is an expression, not a statement.
+local EXPRESSION_LEAD = { ["return"] = true, ["and"] = true, ["or"] = true, ["not"] = true, ["in"] = true }
+local CLOSERS = { [")"] = true, ["}"] = true, ["]"] = true }
+
+local STATEMENT_START = {
+	["local"] = true,
+	["if"] = true,
+	["for"] = true,
+	["while"] = true,
+	["return"] = true,
+	["do"] = true,
+	["repeat"] = true,
+	["function"] = true,
+	["end"] = true,
+	["break"] = true,
+	["continue"] = true,
+}
+
+-- Where a function body starts, given the index of its `(`. Skips the parameter list and, if
+-- there is one, the return type -- which has no terminator of its own, so this reads on until a
+-- token that can only be the start of a statement.
+local function bodyStart(tokens: { Token }, paren: number): number
+	local depth = 0
+	local index = paren
+	while index <= #tokens do
+		local text = tokens[index].text
+		if text == "(" then
+			depth += 1
+		elseif text == ")" then
+			depth -= 1
+			if depth == 0 then
+				break
+			end
+		end
+		index += 1
+	end
+	index += 1
+	local after = tokens[index]
+	if not after or after.text ~= ":" then
+		return index
+	end
+	-- A return type. Balance brackets; at depth 0 the body begins at a statement keyword, or at a
+	-- name that directly follows something a type can end with.
+	index += 1
+	depth = 0
+	while index <= #tokens do
+		local token = tokens[index]
+		local text = token.text
+		if depth == 0 then
+			if token.kind == "keyword" and STATEMENT_START[text] then
+				return index
+			end
+			if token.kind == "name" or text == "(" then
+				local previous = tokens[index - 1]
+				if
+					previous.kind == "name"
+					or previous.kind == "number"
+					or previous.text == ")"
+					or previous.text == "}"
+					or previous.text == "]"
+					or previous.text == "?"
+					or previous.text == ">"
+				then
+					return index
+				end
+			end
+		end
+		if text == "(" or text == "{" or text == "[" or text == "<" then
+			depth += 1
+		elseif text == ")" or text == "}" or text == "]" or text == ">" then
+			depth -= 1
+		end
+		index += 1
+	end
+	return index
+end
+
+-- The declared name of a function statement, read backwards from its `function` keyword and
+-- forwards to its `(`.
+local function functionName(tokens: { Token }, at: number): string
+	local parts = {}
+	local index = at + 1
+	while tokens[index] and tokens[index].text ~= "(" do
+		table.insert(parts, tokens[index].text)
+		index += 1
+	end
+	local name = table.concat(parts)
+	local before = tokens[at - 1]
+	if before and before.text == "local" then
+		return `local {name}`
+	end
+	return name
+end
+
+-- The signal an anonymous function is connected to, when it's the first argument of `:Connect(`
+-- / `:Once(` / `:ConnectParallel(`: the name just before the `:`.
+local function connectedTo(tokens: { Token }, at: number): string?
+	local paren = tokens[at - 1]
+	local method = tokens[at - 2]
+	local colon = tokens[at - 3]
+	local signal = tokens[at - 4]
+	if not (paren and paren.text == "(" and colon and colon.text == ":" and signal) then
+		return nil
+	end
+	if
+		method.text == "Connect"
+		or method.text == "Once"
+		or method.text == "ConnectParallel"
+		or method.text == "BindToRenderStep"
+	then
+		return signal.text
+	end
+	return nil
+end
+
+function LuauScan.Scan(source: string): Scan
+	local tokens = LuauScan.Tokenize(source)
+	local blocks: { Block } = {}
+	local blockOf: { number? } = table.create(#tokens)
+	local stack: { number } = {}
+	local pendingLoop = false
+
+	local function open(kind: string, index: number): Block
+		local block: Block = { kind = kind, open = index, parent = stack[#stack] }
+		table.insert(blocks, block)
+		table.insert(stack, #blocks)
+		return block
+	end
+
+	for index, token in tokens do
+		blockOf[index] = stack[#stack]
+		if token.kind ~= "keyword" then
+			continue
+		end
+		local text = token.text
+
+		if text == "function" then
+			local block = open("function", index)
+			local next = tokens[index + 1]
+			if next and next.text == "(" then
+				block.name = ""
+				block.connect = connectedTo(tokens, index)
+				block.body = bodyStart(tokens, index + 1)
+			else
+				block.name = functionName(tokens, index)
+				local paren = index + 1
+				while tokens[paren] and tokens[paren].text ~= "(" do
+					paren += 1
+				end
+				block.body = bodyStart(tokens, paren)
+			end
+		elseif text == "while" or text == "for" then
+			pendingLoop = true
+		elseif text == "do" then
+			if pendingLoop then
+				pendingLoop = false
+				open("loop", index)
+			else
+				open("do", index)
+			end
+		elseif text == "if" then
+			-- `x = if a then b else c` is an expression and has no `end`.
+			local previous = tokens[index - 1]
+			local expression = previous ~= nil
+				and ((previous.kind == "op" and not CLOSERS[previous.text]) or EXPRESSION_LEAD[previous.text])
+			if not expression then
+				open("if", index)
+			end
+		elseif text == "repeat" then
+			open("repeat", index)
+		elseif text == "end" or text == "until" then
+			local top = stack[#stack]
+			if top then
+				blocks[top].close = index
+				table.remove(stack)
+			end
+		end
+	end
+
+	return { tokens = tokens, blocks = blocks, blockOf = blockOf }
+end
+
+-- The innermost enclosing block of `kind` for token `index`, walking parents.
+function LuauScan.Enclosing(scan: Scan, index: number, kind: string): Block?
+	local at = scan.blockOf[index]
+	while at do
+		local block = scan.blocks[at]
+		if block.kind == kind then
+			return block
+		end
+		at = block.parent
+	end
+	return nil
+end
+
+return LuauScan
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="22">
+        <Properties>
+          <string name="Name">Profile</string>
+          <string name="Source"><![CDATA[--!strict
+--!native
+--!optimize 2
+
+-- MicroProfiler captures through LibMP (github.com/Roblox/libmp), and the reading of them.
+--
+-- LibMP is the user's module, not ours: it's a few hundred KB of Luau wrapping a WASM blob, so it
+-- lives in the place (ReplicatedStorage.LibMP by convention) and this just finds and requires it.
+-- The MicroProfiler is per process, so a capture sees every DataModel in that process -- run the
+-- capture in the context whose scripts you're loading and the load shows up.
+--
+-- The last capture stays in `Profile.LastBuffer` so a run_luau snippet in the same context can
+-- open it again with `vmcp.Profile.Session()` and dig deeper than the summary went.
+
+local CollectionService = game:GetService("CollectionService")
+local HttpService = game:GetService("HttpService")
+local InsertService = game:GetService("InsertService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local Bridge = require(script.Parent.Parent.Bridge)
+local GameVm = require(script.Parent.Parent.Exec.GameVm)
+local Inject = require(script.Parent.Parent.Exec.Inject)
+
+local Profile = {}
+
+-- The Creator Store asset LibMP's README points at.
+local LIBMP_ASSET_ID = 109009378620272
+local MAX_FRAME_LIMIT = 256
+local DEFAULT_TOP = 15
+local DEFAULT_CALLS = 500
+local DEFAULT_SECONDS = 2
+local DEFAULT_WARMUP = 5
+local DEFAULT_FRAME_LIMIT = 128
+local RESULT_NAME = "__VMCP_ProfileResult"
+-- Base64 of the capture has to fit one socket message (VMCP_MAX_MESSAGE_MB, 8 by default).
+local MAX_DUMP_BYTES = 4_500_000
+
+Profile.LastBuffer = nil :: buffer?
+
+export type TimerRow = {
+	timerId: number,
+	name: string,
+	group: string,
+	selfMs: number,
+	inclusiveMs: number,
+	count: number,
+	maxMs: number,
+	worstFrameMs: number,
+	worstFrameId: number,
+	worstFrameAbsoluteId: number,
+}
+
+export type FrameRow = {
+	frameId: number,
+	absoluteId: number,
+	cpuMs: number,
+	top: { { name: string, selfMs: number } },
+}
+
+export type Target = {
+	label: string,
+	setup: string,
+	calls: number?,
+	seconds: number?,
+	perFrame: number?,
+	warmup: number?,
+}
+
+export type HammerOptions = {
+	vm: string?,
+	-- What a plugin-VM setup sees as `vmcp`. Ignored for the game VM.
+	env: any?,
+	frameLimit: number?,
+	top: number?,
+	dump: boolean?,
+	name: string?,
+	-- Extra scope names to report alongside the targets' own labels (section labels, usually).
+	labels: { string }?,
+}
+
+-- One target's outcome: the load line's facts plus the capture's report.
+export type Outcome = {
+	label: string,
+	calls: number,
+	errors: number,
+	seconds: number,
+	allocatedKbPerCall: number,
+	report: Report?,
+	error: string?,
+}
+
+export type Report = {
+	frames: number,
+	spanMs: number,
+	frameMeanMs: number,
+	frameP95Ms: number,
+	frameMaxMs: number,
+	frameMaxId: number,
+	frameMaxAbsoluteId: number,
+	heapStartMb: number?,
+	heapEndMb: number?,
+	labels: { TimerRow },
+	top: { TimerRow },
+	spikes: { FrameRow },
+}
+
+local cached: any = nil
+
+-- The LibMP ModuleScript in this place, if there is one.
+function Profile.Find(): ModuleScript?
+	local direct = ReplicatedStorage:FindFirstChild("LibMP")
+	if direct and direct:IsA("ModuleScript") then
+		return direct
+	end
+	return game:QueryDescendants("ModuleScript#LibMP")[1] :: ModuleScript?
+end
+
+-- Requires LibMP, once. Returns the module table or the reason there isn't one.
+function Profile.LibMP(): (any?, string?)
+	if cached then
+		return cached, nil
+	end
+	local module = Profile.Find()
+	if not module then
+		return nil,
+			"LibMP isn't in this place. Put the LibMP ModuleScript in ReplicatedStorage (Creator Store "
+				.. `asset {LIBMP_ASSET_ID}, or github.com/Roblox/libmp/releases), or pass installLibMP = true.`
+	end
+	local ok, lib = pcall(require, module)
+	if not ok then
+		return nil, `LibMP failed to load: {lib}`
+	end
+	if type(lib) ~= "table" or type(lib.Control) ~= "table" then
+		return nil, `{module:GetFullName()} loaded but doesn't look like LibMP`
+	end
+	if not lib.Control:IsBackendReady() then
+		return nil,
+			"LibMP loaded but the MicroProfiler backend isn't reachable from here (version mismatch, "
+				.. "or this build of Studio doesn't expose it)"
+	end
+	cached = lib
+	return lib, nil
+end
+
+-- Edit mode only: pulls the module off the Creator Store into ReplicatedStorage. Tagged excludeLOC
+-- so count_lines doesn't report LibMP as the biggest script in the game.
+function Profile.Install(): (ModuleScript?, string?)
+	local existing = Profile.Find()
+	if existing then
+		return existing, nil
+	end
+	local ok, container = pcall(InsertService.LoadAsset, InsertService, LIBMP_ASSET_ID)
+	if not ok then
+		return nil, `couldn't insert LibMP from the Creator Store: {container}`
+	end
+	local module = container:FindFirstChildWhichIsA("ModuleScript", true)
+	if not module then
+		container:Destroy()
+		return nil, "the LibMP asset didn't contain a ModuleScript"
+	end
+	module.Name = "LibMP"
+	module.Parent = ReplicatedStorage
+	CollectionService:AddTag(module, "excludeLOC")
+	container:Destroy()
+	cached = nil
+	return module, nil
+end
+
+-- Turns the profiler on, runs `load`, and snapshots the last `frameLimit` frames. The buffer is
+-- what everything else reads; the live session is never touched after this.
+function Profile.Capture(frameLimit: number?, load: () -> ()): (buffer?, string?)
+	local lib, why = Profile.LibMP()
+	if not lib then
+		return nil, why
+	end
+	local control = lib.Control
+	local limit = math.clamp(frameLimit or 128, 8, MAX_FRAME_LIMIT)
+
+	control:EnableProfiler(true)
+	control:SetFrameLimit(limit)
+	control:EnableCapture(true)
+	-- Two frames so the first frame of the load isn't also the frame the profiler woke up in.
+	RunService.Heartbeat:Wait()
+	RunService.Heartbeat:Wait()
+
+	local ok, failure = pcall(load :: any)
+
+	-- The last call's scope closes in the frame after it ran.
+	RunService.Heartbeat:Wait()
+	local captured, buf = pcall(function()
+		return control:CaptureToBufferSync()
+	end)
+	if not ok then
+		return nil, `the load errored: {failure}`
+	end
+	if not captured or typeof(buf) ~= "buffer" then
+		return nil, `CaptureToBufferSync failed: {buf}`
+	end
+	Profile.LastBuffer = buf
+	return buf, nil
+end
+
+-- A fresh session over the last capture (or a buffer you pass). Dispose it when you're done.
+function Profile.Session(buf: buffer?): (any?, string?)
+	local lib, why = Profile.LibMP()
+	if not lib then
+		return nil, why
+	end
+	local source = buf or Profile.LastBuffer
+	if not source then
+		return nil, "nothing captured yet -- run profile_scripts first"
+	end
+	local session = lib.Session.OpenFromBuffer(source)
+	if not session or not session:IsValid() then
+		return nil, "LibMP couldn't open the capture"
+	end
+	return session, nil
+end
+
+local function percentile(sorted: { number }, fraction: number): number
+	if #sorted == 0 then
+		return 0
+	end
+	return sorted[math.clamp(math.ceil(fraction * #sorted), 1, #sorted)]
+end
+
+-- Walks every CPU thread's log frame by frame and attributes each scope's time to the frame it ran
+-- in -- the frame-local iteration from LibMP's own SKILL.md, plus a self-time pass on top, because
+-- inclusive time makes every parent scope look as expensive as its slowest child.
+type AnalyzeOptions = { labels: { string }?, top: number? }
+
+function Profile.Analyze(buf: buffer, options: AnalyzeOptions?): (Report?, string?)
+	local settings: AnalyzeOptions = options or {}
+	local session, why = Profile.Session(buf)
+	if not session then
+		return nil, why
+	end
+
+	local tickToMs = session:FetchGlobalDesc().TickToMsCpu
+	local frameMin = session:GetFrameIdMin()
+	local frameMax = session:GetFrameIdMax()
+	if frameMin == 0 and frameMax == 0 then
+		session:Dispose()
+		return nil, "the capture holds no frames"
+	end
+
+	local frameDescs: { [number]: any } = {}
+	local frameTimes: { number } = {}
+	local spanMs = 0
+	for id = frameMin, frameMax do
+		local desc = session:FetchFrameDesc(id)
+		frameDescs[id] = desc
+		local ms = (desc.TickEndCpu - desc.TickStartCpu) * tickToMs
+		table.insert(frameTimes, ms)
+		spanMs += ms
+	end
+
+	-- Per timer totals, and per frame per timer so spikes can say what filled them.
+	local rows: { [number]: TimerRow } = {}
+	local selfByFrame: { [number]: { [number]: number } } = {}
+	local inclByFrame: { [number]: { [number]: number } } = {}
+	-- childAcc[thread][level] is how much of the scope currently open at that level went to its
+	-- children, so self = inclusive - children when it closes.
+	local childAcc: { [number]: { [number]: number } } = {}
+
+	local function rowFor(timerId: number): TimerRow
+		local known = rows[timerId]
+		if known then
+			return known
+		end
+		local desc = session:FetchTimerDesc(timerId)
+		local groupOk, group = pcall(function()
+			return session:FetchGroupDesc(desc.GroupId).GroupName
+		end)
+		local row: TimerRow = {
+			timerId = timerId,
+			name = desc.TimerName,
+			group = if groupOk then group else "?",
+			selfMs = 0,
+			inclusiveMs = 0,
+			count = 0,
+			maxMs = 0,
+			worstFrameMs = 0,
+			worstFrameId = 0,
+			worstFrameAbsoluteId = 0,
+		}
+		rows[timerId] = row
+		return row
+	end
+
+	local function account(
+		frameId: number,
+		threadId: number,
+		level: number,
+		timerId: number,
+		ms: number,
+		closed: boolean
+	)
+		local acc = childAcc[threadId]
+		if not acc then
+			acc = {}
+			childAcc[threadId] = acc
+		end
+		local children = acc[level + 1] or 0
+		acc[level + 1] = 0
+		acc[level] = (acc[level] or 0) + ms
+		local selfMs = math.max(ms - children, 0)
+
+		local row = rowFor(timerId)
+		row.inclusiveMs += ms
+		row.selfMs += selfMs
+		if closed then
+			row.count += 1
+			if ms > row.maxMs then
+				row.maxMs = ms
+			end
+		end
+
+		local frameSelf = selfByFrame[frameId]
+		if not frameSelf then
+			frameSelf = {}
+			selfByFrame[frameId] = frameSelf
+			inclByFrame[frameId] = {}
+		end
+		frameSelf[timerId] = (frameSelf[timerId] or 0) + selfMs
+		local frameIncl = inclByFrame[frameId]
+		frameIncl[timerId] = (frameIncl[timerId] or 0) + ms
+	end
+
+	local iter = session:CreateLogIterator()
+	iter:Configure({ SkipGpuThreads = true, SkipEvents = true, EmitThreadFrameEnd = true })
+	local state = iter:GetState()
+	iter:RewindTo(frameMin, frameMax)
+
+	while iter:Step() do
+		if state:IsThreadFrameEnd() then
+			local frameId = state:FrameId()
+			local threadId = state:ThreadId()
+			local exitAt = state:Timestamp()
+			local depth = state:ThreadStackDepth()
+			for level = depth - 1, 0, -1 do
+				local element = iter:GetCurrentThreadStackElement(level)
+				if element then
+					local ms = (exitAt - element:EnterTimestampFrameLocal()) * tickToMs
+					account(frameId, threadId, level, element:EnterTimerId(), ms, false)
+				end
+			end
+			-- Whatever is still open starts the next frame with no children counted against it.
+			childAcc[threadId] = nil
+		elseif state:IsExit() and not state:ThreadStackWasOverflowed() then
+			local frameId = state:FrameId()
+			local depth = state:ThreadStackDepth()
+			local enterAt
+			if state:ThreadStackIsUnderflowed() then
+				enterAt = frameDescs[frameId].TickStartCpu
+			else
+				enterAt = iter:GetCurrentThreadStackElement(depth):EnterTimestampFrameLocal()
+			end
+			local ms = (state:Timestamp() - enterAt) * tickToMs
+			account(frameId, state:ThreadId(), depth, state:TimerId(), ms, true)
+		end
+	end
+	iter:Dispose()
+
+	-- Worst single frame for every timer, by inclusive time -- that's the number that maps to a
+	-- hitch a player felt.
+	for frameId, perTimer in inclByFrame do
+		local desc = frameDescs[frameId]
+		for timerId, ms in perTimer do
+			local row = rows[timerId]
+			if ms > row.worstFrameMs then
+				row.worstFrameMs = ms
+				row.worstFrameId = frameId
+				row.worstFrameAbsoluteId = desc.FrameAbsoluteId
+			end
+		end
+	end
+
+	local all: { TimerRow } = {}
+	for _, row in rows do
+		table.insert(all, row)
+	end
+	table.sort(all, function(a, b)
+		return a.selfMs > b.selfMs
+	end)
+
+	local wanted: { [string]: boolean } = {}
+	for _, label in settings.labels or ({} :: { string }) do
+		wanted[label] = true
+	end
+	-- The engine files debug.profilebegin scopes under "::label".
+	local labels: { TimerRow } = {}
+	for _, row in all do
+		if wanted[row.name] or wanted[string.gsub(row.name, "^::", "")] then
+			table.insert(labels, row)
+		end
+	end
+
+	local top: { TimerRow } = {}
+	for index = 1, math.min(settings.top or DEFAULT_TOP, #all) do
+		top[index] = all[index]
+	end
+
+	-- The three slowest frames and what filled them.
+	local order = {}
+	for id = frameMin, frameMax do
+		table.insert(order, id)
+	end
+	table.sort(order, function(a, b)
+		return frameTimes[a - frameMin + 1] > frameTimes[b - frameMin + 1]
+	end)
+	local spikes: { FrameRow } = {}
+	for index = 1, math.min(3, #order) do
+		local frameId = order[index]
+		local perTimer = selfByFrame[frameId] or ({} :: { [number]: number })
+		local filled = {}
+		for timerId, ms in perTimer do
+			table.insert(filled, { name = rows[timerId].name, selfMs = ms })
+		end
+		table.sort(filled, function(a, b)
+			return a.selfMs > b.selfMs
+		end)
+		for trim = #filled, 5, -1 do
+			filled[trim] = nil
+		end
+		table.insert(spikes, {
+			frameId = frameId,
+			absoluteId = frameDescs[frameId].FrameAbsoluteId,
+			cpuMs = frameTimes[frameId - frameMin + 1],
+			top = filled,
+		})
+	end
+
+	local heapStart, heapEnd
+	local heapId = session:FindCounterId("**/Luau/heap", false)
+	if heapId ~= 0 then
+		local samples = session:FetchCounterSamples(heapId)
+		if #samples > 0 then
+			heapStart = samples[1].Value / (1024 * 1024)
+			heapEnd = samples[#samples].Value / (1024 * 1024)
+		end
+	end
+
+	local sorted = table.clone(frameTimes)
+	table.sort(sorted)
+	local worst = order[1]
+
+	session:Dispose()
+
+	return {
+		frames = #frameTimes,
+		spanMs = spanMs,
+		frameMeanMs = spanMs / #frameTimes,
+		frameP95Ms = percentile(sorted, 0.95),
+		frameMaxMs = frameTimes[worst - frameMin + 1],
+		frameMaxId = worst,
+		frameMaxAbsoluteId = frameDescs[worst].FrameAbsoluteId,
+		heapStartMb = heapStart,
+		heapEndMb = heapEnd,
+		labels = labels,
+		top = top,
+		spikes = spikes,
+	},
+		nil
+end
+
+local function fmtMs(value: number): string
+	return string.format("%.2fms", value)
+end
+
+function Profile.Summarise(report: Report): string
+	local lines = {
+		string.format(
+			"capture: %d frames over %.0fms -- CPU frame mean %s, p95 %s, max %s (frame %d / abs %d)",
+			report.frames,
+			report.spanMs,
+			fmtMs(report.frameMeanMs),
+			fmtMs(report.frameP95Ms),
+			fmtMs(report.frameMaxMs),
+			report.frameMaxId,
+			report.frameMaxAbsoluteId
+		),
+	}
+	if report.heapStartMb and report.heapEndMb then
+		table.insert(
+			lines,
+			string.format(
+				"Luau heap: %.1f MB -> %.1f MB (%+.1f)",
+				report.heapStartMb,
+				report.heapEndMb,
+				report.heapEndMb - report.heapStartMb
+			)
+		)
+	end
+
+	if #report.labels > 0 then
+		table.insert(lines, "")
+		table.insert(lines, "your labels (inclusive):")
+		for _, row in report.labels do
+			local avg = if row.count > 0 then row.inclusiveMs / row.count else 0
+			table.insert(
+				lines,
+				string.format(
+					"  %-32s %5d calls  total %s  avg %s  max %s  worst frame %s (frame %d / abs %d)",
+					row.name,
+					row.count,
+					fmtMs(row.inclusiveMs),
+					fmtMs(avg),
+					fmtMs(row.maxMs),
+					fmtMs(row.worstFrameMs),
+					row.worstFrameId,
+					row.worstFrameAbsoluteId
+				)
+			)
+		end
+	end
+
+	table.insert(lines, "")
+	table.insert(lines, `top {#report.top} scopes by self time, all CPU threads (inclusive in brackets):`)
+	for index, row in report.top do
+		table.insert(
+			lines,
+			string.format(
+				"  %2d. %9s  %-36s [%s]  (incl %s)  n=%d  max %s",
+				index,
+				fmtMs(row.selfMs),
+				row.name,
+				row.group,
+				fmtMs(row.inclusiveMs),
+				row.count,
+				fmtMs(row.maxMs)
+			)
+		)
+	end
+
+	table.insert(lines, "")
+	table.insert(lines, "slowest frames and what filled them (self time):")
+	for _, frame in report.spikes do
+		local parts = {}
+		for _, entry in frame.top do
+			table.insert(parts, `{entry.name} {fmtMs(entry.selfMs)}`)
+		end
+		table.insert(
+			lines,
+			string.format(
+				"  frame %d / abs %d: %s -- %s",
+				frame.frameId,
+				frame.absoluteId,
+				fmtMs(frame.cpuMs),
+				table.concat(parts, ", ")
+			)
+		)
+	end
+
+	return table.concat(lines, "\n")
+end
+
+-- The load loop as source, because it runs in the game VM where nothing of ours is in scope.
+local function loadSource(target: Target): string
+	local calls = target.calls or DEFAULT_CALLS
+	local seconds = target.seconds or DEFAULT_SECONDS
+	local perFrame = target.perFrame or math.max(1, math.ceil(calls / (seconds * 60)))
+	local warmup = target.warmup or DEFAULT_WARMUP
+	return string.format(
+		[[
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local label = %q
+local result = { label = label }
+local function setup()
+%s
+end
+local ok, fn = pcall(setup)
+if not ok then
+	result.error = "setup errored: " .. tostring(fn)
+elseif type(fn) ~= "function" then
+	result.error = "setup must return a function, it returned " .. typeof(fn)
+else
+	for _ = 1, %d do
+		pcall(fn, 0)
+	end
+	local made, errors, firstError = 0, 0, nil
+	local allocatedKb = 0
+	local inFrame = 0
+	local started = os.clock()
+	local deadline = started + %s
+	while made < %d and os.clock() < deadline do
+		made += 1
+		local heapBefore = collectgarbage("count")
+		debug.setmemorycategory(label)
+		debug.profilebegin(label)
+		local passed, failure = pcall(fn, made)
+		debug.profileend()
+		debug.resetmemorycategory()
+		local grew = collectgarbage("count") - heapBefore
+		if grew > 0 then
+			allocatedKb += grew
+		end
+		if not passed then
+			errors += 1
+			firstError = firstError or tostring(failure)
+		end
+		inFrame += 1
+		if inFrame >= %d then
+			inFrame = 0
+			RunService.Heartbeat:Wait()
+		end
+	end
+	result.calls = made
+	result.errors = errors
+	result.firstError = firstError
+	result.seconds = os.clock() - started
+	result.allocatedKbPerCall = if made > 0 then allocatedKb / made else 0
+end
+local holder = game:GetService("ReplicatedStorage"):FindFirstChild(%q) or Instance.new("StringValue")
+holder.Name = %q
+holder.Archivable = false
+holder.Value = HttpService:JSONEncode(result)
+holder.Parent = game:GetService("ReplicatedStorage")
+]],
+		target.label,
+		target.setup,
+		warmup,
+		tostring(seconds),
+		calls,
+		perFrame,
+		RESULT_NAME,
+		RESULT_NAME
+	)
+end
+
+local function runLoad(target: Target, vm: string?, env: any?): (any?, string?)
+	local source = loadSource(target)
+	local ok, failure
+	if vm == "plugin" then
+		ok, failure = Inject.Run(source, env or {}, (target.seconds or DEFAULT_SECONDS) + 30)
+	else
+		ok, failure = GameVm.Run(source)
+	end
+	if not ok then
+		return nil, tostring(failure)
+	end
+	local holder = ReplicatedStorage:FindFirstChild(RESULT_NAME)
+	if not holder or not holder:IsA("StringValue") then
+		return nil, "the load ran but left no result behind"
+	end
+	local decoded, result = pcall(HttpService.JSONDecode, HttpService, holder.Value)
+	holder:Destroy()
+	if not decoded then
+		return nil, `couldn't read the load's result: {result}`
+	end
+	return result, nil
+end
+
+local function safeName(name: string): string
+	return (string.gsub(name, "[^%w_%-]", "_"):sub(1, 48))
+end
+
+-- Runs every target under its own capture, one after another, and hands back the report text for
+-- all of them. This is what profile_scripts does in the playtest; a timeline `server` event calls
+-- it directly as vmcp.Profile.Hammer so old-vs-new plus the output check fit in one run.
+function Profile.Hammer(targets: { Target }, options: HammerOptions?): (string, boolean, { [string]: Outcome })
+	local settings: HammerOptions = options or {}
+	local outcomes: { [string]: Outcome } = {}
+	local labels: { string } = {}
+	for _, target in targets do
+		table.insert(labels, target.label)
+	end
+	for _, label in settings.labels or ({} :: { string }) do
+		table.insert(labels, label)
+	end
+
+	local prefix = safeName(settings.name or os.date("%Y%m%d-%H%M%S"))
+	local parts = {}
+	local failed = false
+
+	for _, target in targets do
+		local loadResult: any = nil
+		local loadProblem: string? = nil
+		local buf, why = Profile.Capture(settings.frameLimit or DEFAULT_FRAME_LIMIT, function()
+			loadResult, loadProblem = runLoad(target, settings.vm, settings.env)
+		end)
+
+		local outcome: Outcome = {
+			label = target.label,
+			calls = 0,
+			errors = 0,
+			seconds = 0,
+			allocatedKbPerCall = 0,
+		}
+		outcomes[target.label] = outcome
+
+		local header = { `== {target.label} ==` }
+		if loadProblem then
+			outcome.error = `load failed: {loadProblem}`
+			table.insert(header, outcome.error :: string)
+			failed = true
+		elseif loadResult.error then
+			outcome.error = loadResult.error
+			table.insert(header, loadResult.error)
+			failed = true
+		else
+			outcome.calls = loadResult.calls
+			outcome.errors = loadResult.errors
+			outcome.seconds = loadResult.seconds
+			outcome.allocatedKbPerCall = loadResult.allocatedKbPerCall or 0
+			local line = string.format(
+				"%d calls in %.2fs, ~%.1f KB allocated per call",
+				loadResult.calls,
+				loadResult.seconds,
+				outcome.allocatedKbPerCall
+			)
+			if loadResult.errors > 0 then
+				line ..= ` -- {loadResult.errors} errored, first: {loadResult.firstError}`
+			end
+			table.insert(header, line)
+		end
+
+		if not buf then
+			table.insert(header, `no capture: {why}`)
+			table.insert(parts, table.concat(header, "\n"))
+			failed = true
+			continue
+		end
+
+		local report, analyzeProblem = Profile.Analyze(buf, { labels = labels, top = settings.top })
+		if not report then
+			table.insert(header, `couldn't read the capture: {analyzeProblem}`)
+		else
+			outcome.report = report
+			table.insert(header, Profile.Summarise(report))
+		end
+
+		if settings.dump ~= false then
+			local size = buffer.len(buf)
+			if size > MAX_DUMP_BYTES then
+				table.insert(
+					header,
+					`(capture is {math.floor(size / 1024)} KB, too big to ship as one message -- lower frameLimit, or raise VMCP_MAX_MESSAGE_MB)`
+				)
+			else
+				local posted, written = Bridge.Post({
+					kind = "gprx",
+					name = `{prefix}-{safeName(target.label)}`,
+					data = Profile.Base64(buf),
+				})
+				table.insert(header, if posted then written else `dump failed: {written}`)
+			end
+		end
+
+		table.insert(parts, table.concat(header, "\n"))
+	end
+
+	return table.concat(parts, "\n\n"), failed, outcomes
+end
+
+-- The label's own row in a report, with or without the engine's "::" prefix.
+local function labelRow(report: Report, label: string): TimerRow?
+	for _, row in report.labels do
+		if row.name == label or row.name == `::{label}` then
+			return row
+		end
+	end
+	return nil
+end
+
+export type Delta = {
+	-- Fractions: 0.4 means "new is 40% of old", so under 1 is faster/smaller.
+	perCall: number?,
+	worstFrame: number?,
+	frameP95: number,
+	heap: number?,
+	allocation: number?,
+	text: string,
+	-- True when nothing got worse and something got meaningfully better.
+	better: boolean,
+}
+
+local function ratio(after: number, before: number): number?
+	if before <= 0 then
+		return nil
+	end
+	return after / before
+end
+
+local function pct(fraction: number?): string
+	if not fraction then
+		return "n/a"
+	end
+	return string.format("%+.0f%%", (fraction - 1) * 100)
+end
+
+-- Two outcomes from the same Hammer call, old against new. Everything is a ratio so a timeline
+-- assertion can say `ctx.delta.worstFrame < 0.8` and mean it.
+function Profile.Compare(old: Outcome, new: Outcome): Delta
+	local oldReport, newReport = old.report, new.report
+	local oldRow = if oldReport then labelRow(oldReport, old.label) else nil
+	local newRow = if newReport then labelRow(newReport, new.label) else nil
+
+	local perCall
+	if oldRow and newRow and oldRow.count > 0 and newRow.count > 0 then
+		perCall = ratio(newRow.inclusiveMs / newRow.count, oldRow.inclusiveMs / oldRow.count)
+	end
+	local worstFrame = if oldRow and newRow then ratio(newRow.worstFrameMs, oldRow.worstFrameMs) else nil
+	local frameP95 = if oldReport and newReport then ratio(newReport.frameP95Ms, oldReport.frameP95Ms) else nil
+	local heap
+	if oldReport and newReport and oldReport.heapStartMb and newReport.heapStartMb then
+		local oldGrowth = (oldReport.heapEndMb :: number) - oldReport.heapStartMb
+		local newGrowth = (newReport.heapEndMb :: number) - newReport.heapStartMb
+		heap = if oldGrowth > 0.05 then newGrowth / oldGrowth else nil
+	end
+	local allocation = ratio(new.allocatedKbPerCall, old.allocatedKbPerCall)
+
+	local worse = (perCall or 1) > 1.05 or (worstFrame or 1) > 1.1 or (allocation or 1) > 1.25
+	local gained = (perCall or 1) < 0.85 or (worstFrame or 1) < 0.85 or (allocation or 1) < 0.75
+	local lines = {
+		`{old.label} -> {new.label}:`,
+		`  per call    {pct(perCall)}` .. (if oldRow and newRow
+			then string.format(
+				"  (%.3fms -> %.3fms)",
+				oldRow.inclusiveMs / math.max(oldRow.count, 1),
+				newRow.inclusiveMs / math.max(newRow.count, 1)
+			)
+			else ""),
+		`  worst frame {pct(worstFrame)}` .. (if oldRow and newRow
+			then string.format("  (%.2fms -> %.2fms)", oldRow.worstFrameMs, newRow.worstFrameMs)
+			else ""),
+		`  frame p95   {pct(frameP95)}`,
+		`  allocation  {pct(allocation)}`
+			.. string.format("  (%.1f KB -> %.1f KB per call)", old.allocatedKbPerCall, new.allocatedKbPerCall),
+		`  heap growth {pct(heap)}`,
+		if worse
+			then "  verdict: REGRESSION on at least one axis"
+			elseif gained then "  verdict: better"
+			else "  verdict: no meaningful change",
+	}
+	return {
+		perCall = perCall,
+		worstFrame = worstFrame,
+		frameP95 = frameP95 or 1,
+		heap = heap,
+		allocation = allocation,
+		text = table.concat(lines, "\n"),
+		better = gained and not worse,
+	}
+end
+
+-- A capture of whatever the game is doing on its own for `seconds` -- the real-load baseline.
+-- Nothing is hammered; whatever drives the game (the user, a client timeline event walking and
+-- firing remotes) is the load. Returns the report text and the report.
+export type ObserveOptions = { frameLimit: number?, top: number?, labels: { string }?, dump: boolean?, name: string? }
+
+function Profile.Observe(seconds: number?, options: ObserveOptions?): (string, Report?)
+	local settings: ObserveOptions = options or {}
+	local hold = math.max(seconds or 3, 0.1)
+	local buf, why = Profile.Capture(settings.frameLimit or MAX_FRAME_LIMIT, function()
+		task.wait(hold)
+	end)
+	if not buf then
+		return `no capture: {why}`, nil
+	end
+	local report, problem = Profile.Analyze(buf, { labels = settings.labels, top = settings.top or 25 })
+	if not report then
+		return `couldn't read the capture: {problem}`, nil
+	end
+	local text = `== observed {string.format("%.1f", hold)}s of the game as it runs ==\n` .. Profile.Summarise(report)
+	if settings.dump then
+		local size = buffer.len(buf)
+		if size <= MAX_DUMP_BYTES then
+			local posted, outcome = Bridge.Post({
+				kind = "gprx",
+				name = `{safeName(settings.name or os.date("%Y%m%d-%H%M%S"))}-observe`,
+				data = Profile.Base64(buf),
+			})
+			text ..= "\n" .. (if posted then outcome else `dump failed: {outcome}`)
+		else
+			text ..= `\n(capture is {math.floor(size / 1024)} KB, too big to ship -- lower frameLimit)`
+		end
+	end
+	return text, report
+end
+
+local ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local CHARS = {}
+for index = 1, 64 do
+	CHARS[index - 1] = string.sub(ALPHABET, index, index)
+end
+
+-- The capture has to cross the socket as JSON to get written to disk, and JSON has no bytes.
+function Profile.Base64(buf: buffer): string
+	local length = buffer.len(buf)
+	local out = table.create(math.ceil(length / 3))
+	local index = 0
+	while index + 3 <= length do
+		local a, b, c = buffer.readu8(buf, index), buffer.readu8(buf, index + 1), buffer.readu8(buf, index + 2)
+		local word = a * 65536 + b * 256 + c
+		table.insert(
+			out,
+			CHARS[bit32.rshift(word, 18)]
+				.. CHARS[bit32.band(bit32.rshift(word, 12), 63)]
+				.. CHARS[bit32.band(bit32.rshift(word, 6), 63)]
+				.. CHARS[bit32.band(word, 63)]
+		)
+		index += 3
+	end
+	local rest = length - index
+	if rest == 1 then
+		local a = buffer.readu8(buf, index)
+		table.insert(out, CHARS[bit32.rshift(a, 2)] .. CHARS[bit32.band(bit32.lshift(a, 4), 63)] .. "==")
+	elseif rest == 2 then
+		local a, b = buffer.readu8(buf, index), buffer.readu8(buf, index + 1)
+		local word = a * 256 + b
+		table.insert(
+			out,
+			CHARS[bit32.rshift(word, 10)]
+				.. CHARS[bit32.band(bit32.rshift(word, 4), 63)]
+				.. CHARS[bit32.band(bit32.lshift(word, 2), 63)]
+				.. "="
+		)
+	end
+	return table.concat(out)
+end
+
+return Profile
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="23">
         <Properties>
           <string name="Name">Remotes</string>
           <string name="Source"><![CDATA[--!strict
@@ -3459,7 +5882,7 @@ return Remotes
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="18">
+      <Item class="ModuleScript" referent="24">
         <Properties>
           <string name="Name">Rig</string>
           <string name="Source"><![CDATA[--!strict
@@ -3597,7 +6020,7 @@ return Rig
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="19">
+      <Item class="ModuleScript" referent="25">
         <Properties>
           <string name="Name">Style</string>
           <string name="Source"><![CDATA[--!strict
@@ -3669,16 +6092,31 @@ function Style.Selector(rule: StyleRule, selector: string): string?
 	return if complaint ~= "" then complaint else nil
 end
 
+-- A styled value never shows up in a plain property read: `frame.BackgroundColor3` keeps saying
+-- the default while the rule renders fine. GetStyled is the read that sees the rules, and this
+-- is the same thing for several properties at once. A name the class doesn't have comes back
+-- as the error string instead of a value.
+function Style.Read(instance: Instance, names: { string }): { [string]: any }
+	local out = {}
+	for _, name in names do
+		local ok, value = pcall(function()
+			return (instance :: any):GetStyled(name)
+		end)
+		out[name] = if ok then value else `no property "{name}"`
+	end
+	return out
+end
+
 return Style
 ]]></string>
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="20">
+    <Item class="Folder" referent="26">
       <Properties>
         <string name="Name">Log</string>
       </Properties>
-      <Item class="ModuleScript" referent="21">
+      <Item class="ModuleScript" referent="27">
         <Properties>
           <string name="Name">Buffer</string>
           <string name="Source"><![CDATA[--!strict
@@ -3763,7 +6201,7 @@ return Buffer
         </Properties>
       </Item>
     </Item>
-    <Item class="ModuleScript" referent="22">
+    <Item class="ModuleScript" referent="28">
       <Properties>
         <string name="Name">Panel</string>
         <string name="Source"><![CDATA[--!strict
@@ -4131,7 +6569,7 @@ end
 return Panel
 ]]></string>
       </Properties>
-      <Item class="ModuleScript" referent="23">
+      <Item class="ModuleScript" referent="29">
         <Properties>
           <string name="Name">Style</string>
           <string name="Source"><![CDATA[--!strict
@@ -4418,7 +6856,7 @@ return Style
         </Properties>
       </Item>
     </Item>
-    <Item class="ModuleScript" referent="24">
+    <Item class="ModuleScript" referent="30">
       <Properties>
         <string name="Name">Path</string>
         <string name="Source"><![CDATA[--!strict
@@ -4459,11 +6897,11 @@ return Path
 ]]></string>
       </Properties>
     </Item>
-    <Item class="Folder" referent="25">
+    <Item class="Folder" referent="31">
       <Properties>
         <string name="Name">Playtest</string>
       </Properties>
-      <Item class="ModuleScript" referent="26">
+      <Item class="ModuleScript" referent="32">
         <Properties>
           <string name="Name">Session</string>
           <string name="Source"><![CDATA[--!strict
@@ -4539,12 +6977,143 @@ return Session
 ]]></string>
         </Properties>
       </Item>
+      <Item class="ModuleScript" referent="33">
+        <Properties>
+          <string name="Name">Swap</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Starts a playtest that runs different Source in some scripts than the place has, without the
+-- place ever holding it.
+--
+-- A playtest copies every script at start, so the trick is timing: write the replacement Source
+-- in the edit DataModel, start the test, wait until its server is up, put the original back. The
+-- playtest keeps the swapped copies until it stops; Studio's copy was different for a few
+-- seconds and is untouched again by the time anyone reads it. Nothing is saved, and nothing lands
+-- on disk -- Rojo only syncs toward Studio.
+--
+-- profile_scripts uses this to get its debug.profilebegin sections in; try_scripts uses it to let
+-- the user play the candidate fix before it's applied anywhere.
+
+local Bridge = require(script.Parent.Parent.Bridge)
+local Session = require(script.Parent.Session)
+
+local PEER_TIMEOUT = 90
+local STOP_TIMEOUT = 30
+
+local Swap = {}
+
+export type Replacement = { instance: Instance, source: string }
+
+local function stopRunning(): string?
+	Bridge.Invoke("peer", { action = "stop", context = "server" }, 20)
+	Session.Forget()
+	local deadline = os.clock() + STOP_TIMEOUT
+	while Session.IsRunning() and os.clock() < deadline do
+		task.wait(0.25)
+	end
+	return if Session.IsRunning() then "the running playtest wouldn't stop" else nil
+end
+
+-- A playtest DataModel takes a few seconds to boot and connect, and there's no event for it.
+function Swap.WaitFor(context: string, player: number?): string?
+	local deadline = os.clock() + PEER_TIMEOUT
+	local last = "never answered"
+	repeat
+		local reached, result = Bridge.Invoke("peer", { action = "ping", context = context, player = player }, 10)
+		if reached and result ~= nil and result.isError ~= true then
+			return nil
+		end
+		last = if reached then "not up yet" else tostring(result)
+		task.wait(0.5)
+	until os.clock() >= deadline
+	return `the {context} never came up ({last})`
+end
+
+-- Reads each script once so the caller gets the text to build a replacement from, and the exact
+-- text to restore.
+function Swap.ReadSource(instance: Instance): (string?, string?)
+	if not instance:IsA("LuaSourceContainer") then
+		return nil, `{instance:GetFullName()} is a {instance.ClassName}, not a script`
+	end
+	local readable, source = pcall(function()
+		return (instance :: any).Source
+	end)
+	if not readable or type(source) ~= "string" then
+		return nil, `couldn't read {instance:GetFullName()} -- allow script injection for VMCP in Plugin Management`
+	end
+	return source, nil
+end
+
+-- Swaps, starts, waits for `context` to answer, restores. `restarted` says whether a playtest
+-- that was already running had to be stopped first. `temporary` instances ride along the same
+-- way: parented for the boot, destroyed once the playtest has its copy.
+function Swap.Start(
+	replacements: { Replacement },
+	players: number,
+	context: string,
+	player: number?,
+	temporary: { Instance }?
+): (string?, boolean)
+	local restarted = false
+	if Session.IsRunning() then
+		local failure = stopRunning()
+		if failure then
+			return failure, false
+		end
+		restarted = true
+	end
+
+	local originals: { Replacement } = {}
+	local function restore()
+		for _, original in originals do
+			pcall(function()
+				(original.instance :: any).Source = original.source
+			end)
+		end
+		if temporary then
+			for _, instance in temporary do
+				instance:Destroy()
+			end
+		end
+	end
+
+	for _, replacement in replacements do
+		local current, why = Swap.ReadSource(replacement.instance)
+		if not current then
+			restore()
+			return why, restarted
+		end
+		table.insert(originals, { instance = replacement.instance, source = current })
+		local written = pcall(function()
+			(replacement.instance :: any).Source = replacement.source
+		end)
+		if not written then
+			restore()
+			return `couldn't write {replacement.instance:GetFullName()}`, restarted
+		end
+	end
+
+	local failure = Session.Start(math.clamp(players, 1, 8))
+	if failure then
+		restore()
+		return failure, restarted
+	end
+
+	local notUp = Swap.WaitFor(context, player)
+	restore()
+	return notUp, restarted
+end
+
+return Swap
+]]></string>
+        </Properties>
+      </Item>
     </Item>
-    <Item class="Folder" referent="27">
+    <Item class="Folder" referent="34">
       <Properties>
         <string name="Name">Timeline</string>
       </Properties>
-      <Item class="ModuleScript" referent="28">
+      <Item class="ModuleScript" referent="35">
         <Properties>
           <string name="Name">Runtime</string>
           <string name="Source"><![CDATA[--!strict
@@ -4827,11 +7396,11 @@ return Runtime
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="29">
+    <Item class="Folder" referent="36">
       <Properties>
         <string name="Name">Tools</string>
       </Properties>
-      <Item class="ModuleScript" referent="30">
+      <Item class="ModuleScript" referent="37">
         <Properties>
           <string name="Name">ApplyBuild</string>
           <string name="Source"><![CDATA[--!strict
@@ -4846,6 +7415,31 @@ local Path = require(script.Parent.Parent.Path)
 
 local BADGE_LIMIT = 40
 local MAX_PARTS = 1500
+
+-- Problem lines from the last apply, per root. Intentional ones (rubble sunk into the ground)
+-- would otherwise be printed again on every pass for the rest of the build.
+local remembered: { [Instance]: { [string]: boolean } } = setmetatable({}, { __mode = "k" }) :: any
+
+local function newProblems(root: Instance, problems: { Build.Problem }): ({ Build.Problem }, number, number)
+	local seen: { [string]: boolean } = remembered[root] or {}
+	local current: { [string]: boolean } = {}
+	local fresh = {}
+	for _, problem in problems do
+		local key = `{problem.part:GetFullName()} -- {problem.kind}: {problem.detail}`
+		current[key] = true
+		if not seen[key] then
+			table.insert(fresh, problem)
+		end
+	end
+	local resolved = 0
+	for key in seen do
+		if not current[key] then
+			resolved += 1
+		end
+	end
+	remembered[root] = current
+	return fresh, #problems - #fresh, resolved
+end
 
 type Result = {
 	content: { { type: "text", text: string } },
@@ -4873,6 +7467,13 @@ Tool.Definition = {
 				type = "string",
 				description = "Luau source ending in `return function(root) ... end`. `ensure(parent, "
 					.. "name, class)` inside it updates by name, so re-applying moves only what changed.",
+			},
+			file = {
+				type = "string",
+				description = "Path to a file holding the source, read by the VMCP server on the machine "
+					.. "it runs on; absolute or relative to the server's working directory. Use this "
+					.. "instead of code once the build lives in a file: edit the file, apply by path, "
+					.. "and the source never has to be re-sent.",
 			},
 			root = {
 				type = "string",
@@ -4911,10 +7512,11 @@ Tool.Definition = {
 			},
 			badges = {
 				type = "boolean",
-				description = `Number each part in the picture. On by default up to {BADGE_LIMIT} parts.`,
+				description = `Number each part in the picture and list it in the legend. On by default when the panels show up to {BADGE_LIMIT} parts (clipped panels count only what's in frame).`,
 			},
 		},
-		required = { "code" },
+		-- One of code or file; the server turns file into code before it gets here.
+		required = {},
 	},
 	tags = { title = "Apply Build", destructive = true },
 	timeoutMs = 60000,
@@ -4951,7 +7553,7 @@ function Tool.Run(arguments: {
 }): Result
 	local code = arguments.code
 	if type(code) ~= "string" or code == "" then
-		return { content = { { type = "text", text = "code must be a non-empty string" } }, isError = true }
+		return { content = { { type = "text", text = "pass code or file" } }, isError = true }
 	end
 
 	local root: Instance = workspace
@@ -4973,7 +7575,10 @@ function Tool.Run(arguments: {
 
 	local lines = {}
 	if ok then
-		table.insert(lines, `applied: {#root:GetDescendants()} instance(s) under {root:GetFullName()}, {count} of them parts`)
+		table.insert(
+			lines,
+			`applied: {#root:GetDescendants()} instance(s) under {root:GetFullName()}, {count} of them parts`
+		)
 	else
 		-- The failure line comes first and the report still follows: whatever ran before the
 		-- error is in the place now, and knowing what that looks like is how you fix the code.
@@ -4989,10 +7594,22 @@ function Tool.Run(arguments: {
 		return { content = { { type = "text", text = table.concat(lines, "\n") } }, isError = not ok }
 	end
 
-	local badges = if arguments.badges ~= nil then arguments.badges else count <= BADGE_LIMIT
 	local render = arguments.render ~= false
-	table.insert(lines, Build.Report(root, instances, badges and render, Build.Problems(root, MAX_PARTS, instances)))
 	local views, missing = Build.ResolveViews(arguments.views or { "iso" })
+	local shown = Build.Shown(instances, views)
+	local shownCount = 0
+	for _ in shown do
+		shownCount += 1
+	end
+	local badges = if arguments.badges ~= nil then arguments.badges else shownCount <= BADGE_LIMIT
+	local problems, unchanged, resolved = newProblems(root, Build.Problems(root, MAX_PARTS, instances))
+	table.insert(lines, Build.Report(root, instances, if badges and render then shown else nil, problems))
+	if unchanged > 0 then
+		table.insert(lines, `{unchanged} from the last apply still there, not repeated`)
+	end
+	if resolved > 0 then
+		table.insert(lines, `{resolved} from the last apply gone`)
+	end
 	for _, problem in missing do
 		table.insert(lines, `view target not found, drawing the whole build instead: {problem}`)
 	end
@@ -5017,7 +7634,389 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="31">
+      <Item class="ModuleScript" referent="38">
+        <Properties>
+          <string name="Name">ApplyFix</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- The one step that changes the game, with a net under it: write the script's file on disk, wait
+-- for Rojo to carry it into Studio, start a fresh playtest with the previous version planted next
+-- to it, run the caller's check in the game VM, and put the old file back if anything failed.
+--
+-- Everything before this in the loop was reversible by stopping a playtest. This is reversible
+-- by the same tool, automatically, which is what lets it run unattended.
+
+local ServerStorage = game:GetService("ServerStorage")
+
+local Bridge = require(script.Parent.Parent.Bridge)
+local Path = require(script.Parent.Parent.Path)
+local Session = require(script.Parent.Parent.Playtest.Session)
+local Swap = require(script.Parent.Parent.Playtest.Swap)
+
+local SYNC_TIMEOUT = 20
+local PREVIOUS_PREFIX = "__VMCP_Previous_"
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "apply_fix",
+	description = "Applies a candidate to the real script: writes the file Rojo syncs it from, waits "
+		.. "for Studio to pick it up, restarts the playtest, and runs your `check` in the game VM "
+		.. "with the previous version available as ServerStorage.__VMCP_Previous_<Name> for an "
+		.. "Equiv.Check against the live one. If the sync never lands, the check errors or returns "
+		.. "anything but true, or the server logs an error, the old file is written back and the "
+		.. "reply says why. On success the playtest stays up running the applied code -- hand it to "
+		.. "the user. Only call this after the user has said yes.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			script = { type = "string", description = 'Dotted path, like "ServerScriptService.Combat".' },
+			source = { type = "string", description = "The complete new Source." },
+			check = {
+				type = "string",
+				description = "Luau body run in the game VM after the restart. Return true to pass; "
+					.. "anything else (a string, an Equiv result's text) fails and reverts. "
+					.. "`require(game.ServerStorage.__VMCP_Previous_<Name>)` is the old module; "
+					.. "`require(game.ServerScriptService.<path>.__VMCP_Equiv)` next to the game bridge "
+					.. "has Equiv.Check. Optional but strongly encouraged.",
+			},
+			players = {
+				type = "integer",
+				minimum = 1,
+				maximum = 8,
+				description = "Players for the playtest. Defaults to 1.",
+			},
+		},
+		required = { "script", "source" },
+	},
+	tags = { title = "Apply Fix", destructive = true },
+	timeoutMs = 240000,
+}
+
+local function text(body: string, isError: boolean?): Result
+	return { content = { { type = "text", text = body } }, isError = isError }
+end
+
+local function normalise(source: string): string
+	return (source:gsub("\r\n", "\n"):gsub("%s+$", ""))
+end
+
+-- Rojo pushes disk changes into Studio on its own clock; this is the only way to know it did.
+local function waitForSync(instance: Instance, wanted: string): boolean
+	local target = normalise(wanted)
+	local deadline = os.clock() + SYNC_TIMEOUT
+	repeat
+		local current = Swap.ReadSource(instance)
+		if current and normalise(current) == target then
+			return true
+		end
+		task.wait(0.5)
+	until os.clock() >= deadline
+	return false
+end
+
+local function writeFile(path: string, className: string, source: string): (boolean, any)
+	return Bridge.Request("source/write", { path = path, className = className, source = source }, 15)
+end
+
+function Tool.Run(arguments: { script: string?, source: string?, check: string?, players: number? }): Result
+	if type(arguments.script) ~= "string" or type(arguments.source) ~= "string" or arguments.source == "" then
+		return text("apply_fix needs script and source", true)
+	end
+	local instance, why = Path.Resolve(arguments.script :: string)
+	if not instance then
+		return text(why :: string, true)
+	end
+	local before, unreadable = Swap.ReadSource(instance)
+	if not before then
+		return text(unreadable :: string, true)
+	end
+
+	local written, reply = writeFile(instance:GetFullName(), instance.ClassName, arguments.source :: string)
+	if not written then
+		return text(`couldn't write the file: {tostring(reply)}`, true)
+	end
+	local file: string = reply.file
+	local previousOnDisk: string = reply.previous
+
+	local function revert(reason: string): Result
+		local restored, failure = writeFile(instance:GetFullName(), instance.ClassName, previousOnDisk)
+		local note = if restored
+			then `{file} is back to what it was`
+			else `AND the revert failed ({tostring(failure)}) -- {file} holds the candidate, restore it by hand`
+		if Session.IsRunning() then
+			Bridge.Invoke("peer", { action = "stop", context = "server" }, 20)
+			Session.Forget()
+		end
+		return text(`NOT applied: {reason}\n{note}`, true)
+	end
+
+	if not waitForSync(instance, arguments.source :: string) then
+		return revert(
+			`wrote {file} but Studio's copy didn't change within {SYNC_TIMEOUT}s -- is the Rojo plugin connected?`
+		)
+	end
+
+	-- The previous version rides into the playtest as a sibling module, so a check can require
+	-- both and compare them in the same VM. Archivable stays on: the playtest copies the place the
+	-- way a save would, and Swap destroys it the moment the copy exists.
+	local previous: Instance = Instance.new("ModuleScript")
+	previous.Name = PREVIOUS_PREFIX .. instance.Name;
+	(previous :: ModuleScript).Source = before
+	previous.Parent = ServerStorage
+
+	local failure = Swap.Start({}, math.clamp(arguments.players or 1, 1, 8), "server", nil, { previous })
+	if failure then
+		return revert(`the playtest wouldn't start: {failure}`)
+	end
+
+	local lines = { `applied to {file}; Studio synced; playtest restarted` }
+	if type(arguments.check) == "string" and arguments.check ~= "" then
+		local reached, result = Bridge.Invoke("run_luau", {
+			context = "server",
+			vm = "game",
+			code = arguments.check,
+			timeoutSeconds = 60,
+		}, 90)
+		if not reached then
+			return revert(`the check couldn't run: {tostring(result)}`)
+		end
+		local body = ""
+		for _, item in result.content or {} do
+			if type(item.text) == "string" then
+				body ..= item.text
+			end
+		end
+		if result.isError or not string.match(body, "^returned: true") then
+			return revert(`the check didn't pass:\n{body}`)
+		end
+		table.insert(lines, "check passed")
+	end
+
+	local _, logs = Bridge.Invoke("get_logs", { context = "server", severity = "error", sinceSeconds = 30 }, 10)
+	local errorText = ""
+	for _, item in (logs and logs.content) or {} do
+		if type(item.text) == "string" then
+			errorText ..= item.text
+		end
+	end
+	if errorText ~= "" and not string.find(errorText, "^no log lines") then
+		return revert(`the server logged errors after the restart:\n{errorText}`)
+	end
+
+	table.insert(lines, "no server errors since the restart")
+	table.insert(lines, "The playtest is running the applied code -- have the user play it now.")
+	return text(table.concat(lines, "\n"))
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="39">
+        <Properties>
+          <string name="Name">CountLines</string>
+          <string name="Source"><![CDATA[--!strict
+
+local Path = require(script.Parent.Parent.Path)
+
+local DEFAULT_MAX_RESULTS = 50
+local HARD_MAX_RESULTS = 500
+local EXCLUDE_TAG = "excludeLOC"
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "count_lines",
+	description = "Lines of code for every script under a root, biggest first, with totals and a hot "
+		.. "column (per-frame connections, while-true loops, connect count) since a 40-line Heartbeat "
+		.. "handler outranks a 2000-line shop. Skips any "
+		.. `script tagged {EXCLUDE_TAG} and anything under an instance with that tag -- tag LibMP, `
+		.. "vendored libraries and the VMCP plugin itself so they don't dominate the list. This is "
+		.. "the first step of a performance pass: the long scripts are where the frame time usually "
+		.. "is, so read the top of this list and hand the suspects to profile_scripts.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			root = {
+				type = "string",
+				description = 'Dotted path to count under, like "ServerScriptService". Defaults to game.',
+			},
+			maxResults = {
+				type = "integer",
+				description = "How many scripts to list. Defaults to 50. Totals always cover everything.",
+				minimum = 1,
+				maximum = HARD_MAX_RESULTS,
+			},
+			minLines = {
+				type = "integer",
+				description = "Leave out scripts shorter than this. Defaults to 0.",
+				minimum = 0,
+			},
+		},
+	},
+	tags = { title = "Count Lines", readOnly = true, idempotent = true },
+}
+
+type Entry = {
+	path: string,
+	className: string,
+	lines: number,
+	code: number,
+	perFrame: number,
+	polling: number,
+	connects: number,
+}
+
+-- Cheap signals that a script does per-frame work, which ranks better than length does.
+local PER_FRAME_PATTERNS = {
+	"Heartbeat:Connect",
+	"RenderStepped:Connect",
+	"Stepped:Connect",
+	"PreSimulation:Connect",
+	"PostSimulation:Connect",
+	"PreRender:Connect",
+	"PreAnimation:Connect",
+	"BindToRenderStep",
+}
+
+local function countHot(source: string): (number, number, number)
+	local perFrame = 0
+	for _, pattern in PER_FRAME_PATTERNS do
+		local _, hits = string.gsub(source, pattern, "")
+		perFrame += hits
+	end
+	local _, polling = string.gsub(source, "while%s+true%s+do", "")
+	local _, connects = string.gsub(source, ":Connect%(", "")
+	return perFrame, polling, connects
+end
+
+-- Total lines and lines that aren't blank or a bare comment, so a script that's half header
+-- comments doesn't outrank one that's all logic.
+local function measure(source: string): (number, number)
+	local lines, code = 0, 0
+	for line in string.gmatch(source .. "\n", "([^\n]*)\n") do
+		lines += 1
+		local trimmed = string.match(line, "^%s*(.-)%s*$") :: string
+		if trimmed ~= "" and string.sub(trimmed, 1, 2) ~= "--" then
+			code += 1
+		end
+	end
+	return lines, code
+end
+
+function Tool.Run(arguments: { root: string?, maxResults: number?, minLines: number? }): Result
+	local root: Instance = game
+	if type(arguments.root) == "string" and arguments.root ~= "" then
+		local found, why = Path.Resolve(arguments.root :: string)
+		if not found then
+			return { content = { { type = "text", text = why :: string } }, isError = true }
+		end
+		root = found
+	end
+
+	local excluded: { [Instance]: boolean } = {}
+	for _, instance in root:QueryDescendants(`.{EXCLUDE_TAG} >> LuaSourceContainer`) do
+		excluded[instance] = true
+	end
+
+	local entries: { Entry } = {}
+	local unreadable = 0
+	local totalLines, totalCode = 0, 0
+	for _, instance in root:QueryDescendants(`LuaSourceContainer:not(.{EXCLUDE_TAG})`) do
+		if excluded[instance] then
+			continue
+		end
+		-- Reading Source needs script injection allowed for the plugin.
+		local readable, source = pcall(function()
+			return (instance :: any).Source
+		end)
+		if not readable or type(source) ~= "string" then
+			unreadable += 1
+			continue
+		end
+		local lines, code = measure(source)
+		local perFrame, polling, connects = countHot(source)
+		totalLines += lines
+		totalCode += code
+		table.insert(entries, {
+			path = instance:GetFullName(),
+			className = instance.ClassName,
+			lines = lines,
+			code = code,
+			perFrame = perFrame,
+			polling = polling,
+			connects = connects,
+		})
+	end
+
+	table.sort(entries, function(a, b)
+		return a.lines > b.lines
+	end)
+
+	local minLines = arguments.minLines or 0
+	local limit = math.clamp(arguments.maxResults or DEFAULT_MAX_RESULTS, 1, HARD_MAX_RESULTS)
+	local out = {
+		`{#entries} script(s) under {root:GetFullName()}: {totalLines} lines, {totalCode} of them code`,
+		"",
+	}
+	local shown = 0
+	for _, entry in entries do
+		if entry.lines < minLines then
+			break
+		end
+		if shown >= limit then
+			table.insert(out, `-- {#entries - shown} more; raise maxResults or set minLines`)
+			break
+		end
+		shown += 1
+		local hot = {}
+		if entry.perFrame > 0 then
+			table.insert(hot, `{entry.perFrame} per-frame`)
+		end
+		if entry.polling > 0 then
+			table.insert(hot, `{entry.polling} while-true`)
+		end
+		if entry.connects > 0 then
+			table.insert(hot, `{entry.connects} connect`)
+		end
+		table.insert(
+			out,
+			string.format(
+				"%6d  (%5d code)  %-12s %s%s",
+				entry.lines,
+				entry.code,
+				entry.className,
+				entry.path,
+				if #hot > 0 then "  [" .. table.concat(hot, ", ") .. "]" else ""
+			)
+		)
+	end
+	if unreadable > 0 then
+		table.insert(
+			out,
+			`-- {unreadable} script(s) couldn't be read (allow script injection for VMCP in Plugin Management)`
+		)
+	end
+
+	return { content = { { type = "text", text = table.concat(out, "\n") } } }
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="40">
         <Properties>
           <string name="Name">GetBuild</string>
           <string name="Source"><![CDATA[--!strict
@@ -5098,7 +8097,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="32">
+      <Item class="ModuleScript" referent="41">
         <Properties>
           <string name="Name">GetLogs</string>
           <string name="Source"><![CDATA[--!strict
@@ -5202,7 +8201,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="33">
+      <Item class="ModuleScript" referent="42">
         <Properties>
           <string name="Name">GetTree</string>
           <string name="Source"><![CDATA[--!strict
@@ -5336,7 +8335,290 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="34">
+      <Item class="ModuleScript" referent="43">
+        <Properties>
+          <string name="Name">LintHotpaths</string>
+          <string name="Source"><![CDATA[--!strict
+
+local Lint = require(script.Parent.Parent.Lib.Lint)
+local Path = require(script.Parent.Parent.Path)
+
+local DEFAULT_MAX_RESULTS = 60
+local HARD_MAX_RESULTS = 400
+local MAX_LINES = 15000
+local EXCLUDE_TAG = "excludeLOC"
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "lint_hotpaths",
+	description = "Static pass over every script under a root for the shapes that cost frame time, "
+		.. "ranked by how often they'd run: tree walks, Instance.new/Clone, string building and "
+		.. "physics queries inside Heartbeat/RenderStepped/Touched handlers or loops; polling "
+		.. "while-true loops; legacy wait/spawn; deep game.X.Y.Z paths and require inside "
+		.. "functions; connections made per run. Reads Studio's Source, so it sees Studio-only "
+		.. "scripts too. No playtest needed. It's a shortlist for profile_scripts, not a verdict -- a "
+		.. "high finding in code that runs once a match is fine. Skips anything tagged excludeLOC.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			root = {
+				type = "string",
+				description = 'Dotted path to scan under, like "ServerScriptService". Defaults to game.',
+			},
+			minSeverity = {
+				type = "string",
+				description = "Lowest severity to list. Defaults to medium.",
+				enum = { "high", "medium", "low" },
+			},
+			maxResults = {
+				type = "integer",
+				description = "Findings to list. Defaults to 60.",
+				minimum = 1,
+				maximum = HARD_MAX_RESULTS,
+			},
+		},
+	},
+	tags = { title = "Lint Hot Paths", readOnly = true, idempotent = true },
+	timeoutMs = 60000,
+}
+
+type Row = { path: string, finding: Lint.Finding }
+
+function Tool.Run(arguments: { root: string?, minSeverity: string?, maxResults: number? }): Result
+	local root: Instance = game
+	if type(arguments.root) == "string" and arguments.root ~= "" then
+		local found, why = Path.Resolve(arguments.root :: string)
+		if not found then
+			return { content = { { type = "text", text = why :: string } }, isError = true }
+		end
+		root = found
+	end
+	local floor = Lint.Rank[arguments.minSeverity or "medium"] or 2
+	local limit = math.clamp(arguments.maxResults or DEFAULT_MAX_RESULTS, 1, HARD_MAX_RESULTS)
+
+	local excluded: { [Instance]: boolean } = {}
+	for _, instance in root:QueryDescendants(`.{EXCLUDE_TAG} >> LuaSourceContainer`) do
+		excluded[instance] = true
+	end
+
+	local rows: { Row } = {}
+	local scanned, unreadable, skipped = 0, 0, 0
+	local perScript: { [string]: number } = {}
+	for _, instance in root:QueryDescendants(`LuaSourceContainer:not(.{EXCLUDE_TAG})`) do
+		if excluded[instance] then
+			continue
+		end
+		local readable, source = pcall(function()
+			return (instance :: any).Source
+		end)
+		if not readable or type(source) ~= "string" then
+			unreadable += 1
+			continue
+		end
+		local _, newlines = string.gsub(source, "\n", "")
+		if newlines > MAX_LINES then
+			skipped += 1
+			continue
+		end
+		scanned += 1
+		local path = instance:GetFullName()
+		for _, finding in Lint.Script(source) do
+			if Lint.Rank[finding.severity] >= floor then
+				table.insert(rows, { path = path, finding = finding })
+				perScript[path] = (perScript[path] or 0) + Lint.Rank[finding.severity]
+			end
+		end
+	end
+
+	table.sort(rows, function(a, b)
+		local ra, rb = Lint.Rank[a.finding.severity], Lint.Rank[b.finding.severity]
+		if ra ~= rb then
+			return ra > rb
+		end
+		if a.path ~= b.path then
+			return a.path < b.path
+		end
+		return a.finding.line < b.finding.line
+	end)
+
+	local out = {
+		`{#rows} finding(s) at {arguments.minSeverity or "medium"} or worse across {scanned} script(s) under {root:GetFullName()}`,
+	}
+	if #rows > 0 then
+		-- Which scripts to open first: the sum of their severities.
+		local ranked = {}
+		for path, score in perScript do
+			table.insert(ranked, { path = path, score = score })
+		end
+		table.sort(ranked, function(a, b)
+			return a.score > b.score
+		end)
+		local names = {}
+		for index = 1, math.min(8, #ranked) do
+			table.insert(names, `{ranked[index].path} ({ranked[index].score})`)
+		end
+		table.insert(out, "scripts by weight: " .. table.concat(names, ", "))
+		table.insert(out, "")
+	end
+	for index, row in rows do
+		if index > limit then
+			table.insert(out, `-- {#rows - limit} more; raise maxResults or minSeverity`)
+			break
+		end
+		local finding = row.finding
+		table.insert(
+			out,
+			string.format(
+				"%-6s %s:%d  %s [%s] -- %s",
+				finding.severity,
+				row.path,
+				finding.line,
+				finding.pattern,
+				finding.context,
+				finding.detail
+			)
+		)
+	end
+	if skipped > 0 then
+		table.insert(
+			out,
+			`-- {skipped} script(s) over {MAX_LINES} lines skipped; tag them {EXCLUDE_TAG} or lint them alone`
+		)
+	end
+	if unreadable > 0 then
+		table.insert(out, `-- {unreadable} script(s) couldn't be read (allow script injection for VMCP)`)
+	end
+	return { content = { { type = "text", text = table.concat(out, "\n") } } }
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="44">
+        <Properties>
+          <string name="Name">OptimizationLedger</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- The memory of an optimization pass, kept on the VMCP server per place: what's been profiled,
+-- what was found, what was proposed, what the user said. Read it at the start of a pass so a
+-- second session doesn't redo the first one's work, and write it as each script is closed out.
+
+local Bridge = require(script.Parent.Parent.Bridge)
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "optimization_ledger",
+	description = "Per-place record of the optimization pass, stored by the VMCP server under "
+		.. "~/.vmcp/optimization/<place>.json. read lists every script touched so far with its status "
+		.. "and numbers; write merges fields into one script's entry (status: profiled | proposed | "
+		.. "tried | applied | rejected | skipped, plus whatever else is worth keeping -- worst frame "
+		.. "before/after, the fix in one line, why it was rejected); clear removes an entry. Read it "
+		.. "before starting a pass and write it before moving to the next script, so the final report "
+		.. "can total what the pass saved.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			action = { type = "string", enum = { "read", "write", "clear" } },
+			script = { type = "string", description = "Dotted path of the script the entry is about (write/clear)." },
+			entry = {
+				type = "object",
+				description = "Fields to merge for write. Free-form; `status` and `summary` are the ones the "
+					.. "listing shows.",
+				additionalProperties = true,
+			},
+		},
+		required = { "action" },
+	},
+	tags = { title = "Optimization Ledger", idempotent = true },
+}
+
+local function text(body: string, isError: boolean?): Result
+	return { content = { { type = "text", text = body } }, isError = isError }
+end
+
+local function render(entries: { [string]: any }): string
+	local keys = {}
+	for key in entries do
+		table.insert(keys, key)
+	end
+	if #keys == 0 then
+		return "the ledger is empty for this place"
+	end
+	table.sort(keys)
+	local lines = { `{#keys} script(s) in the ledger:` }
+	for _, key in keys do
+		local entry = entries[key]
+		local extras = {}
+		for field, value in entry do
+			if field ~= "status" and field ~= "summary" and field ~= "updatedAt" then
+				table.insert(extras, `{field}={tostring(value)}`)
+			end
+		end
+		table.sort(extras)
+		table.insert(
+			lines,
+			string.format(
+				"  %-10s %s -- %s%s",
+				tostring(entry.status or "?"),
+				key,
+				tostring(entry.summary or ""),
+				if #extras > 0 then " (" .. table.concat(extras, ", ") .. ")" else ""
+			)
+		)
+	end
+	return table.concat(lines, "\n")
+end
+
+function Tool.Run(arguments: { action: string?, script: string?, entry: { [string]: any }? }): Result
+	local action = arguments.action
+	if action == "read" then
+		local ok, payload = Bridge.Request("ledger/read", {}, 10)
+		if not ok then
+			return text(tostring(payload), true)
+		end
+		return text(render(payload.entries or {}))
+	end
+
+	if type(arguments.script) ~= "string" or arguments.script == "" then
+		return text(`{tostring(action)} needs a script path`, true)
+	end
+	if action == "write" then
+		if type(arguments.entry) ~= "table" then
+			return text("write needs an entry object", true)
+		end
+	elseif action ~= "clear" then
+		return text(`action must be read, write or clear -- got "{tostring(action)}"`, true)
+	end
+
+	local ok, payload = Bridge.Request("ledger/write", {
+		key = arguments.script,
+		-- Absent on the wire for clear; the server reads that as "delete".
+		entry = if action == "clear" then nil else arguments.entry,
+	}, 10)
+	if not ok then
+		return text(tostring(payload), true)
+	end
+	return text(render(payload.entries or {}))
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="45">
         <Properties>
           <string name="Name">Peer</string>
           <string name="Source"><![CDATA[--!strict
@@ -5393,7 +8675,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="35">
+      <Item class="ModuleScript" referent="46">
         <Properties>
           <string name="Name">Playtest</string>
           <string name="Source"><![CDATA[--!strict
@@ -5489,7 +8771,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="36">
+      <Item class="ModuleScript" referent="47">
         <Properties>
           <string name="Name">Print</string>
           <string name="Source"><![CDATA[--!strict
@@ -5588,7 +8870,502 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="37">
+      <Item class="ModuleScript" referent="48">
+        <Properties>
+          <string name="Name">ProfileScripts</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Hammers functions in the running game under the MicroProfiler and says what the frame time went
+-- on. Two halves in one module, told apart by which DataModel it's running in:
+--
+--   edit session   builds instrumented Source for the sections, starts a playtest running it
+--                  (Playtest/Swap -- the place never keeps it), hands the run to the live context.
+--   playtest       builds the load loop, runs it in the game's own VM under a LibMP capture,
+--                  reads the capture, and posts it to the VMCP server as a .gprx dump.
+--
+-- Nothing here changes what the game does. Instrumentation is a pair of profiler calls around
+-- lines you chose, applied in Studio only for as long as the tool is running, and the load calls
+-- the same functions the game would with arguments you made up in `setup`.
+
+local RunService = game:GetService("RunService")
+
+local Bridge = require(script.Parent.Parent.Bridge)
+local Env = require(script.Parent.Parent.Env)
+local Instrument = require(script.Parent.Parent.Lib.Instrument)
+local Path = require(script.Parent.Parent.Path)
+local Profile = require(script.Parent.Parent.Lib.Profile)
+local Session = require(script.Parent.Parent.Playtest.Session)
+local Swap = require(script.Parent.Parent.Playtest.Swap)
+
+local DEFAULT_SECONDS = 2
+local MAX_TARGETS = 8
+local MAX_TOTAL_SECONDS = 120
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+}
+
+type Section = {
+	script: string,
+	fromLine: number,
+	toLine: number,
+	label: string,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "profile_scripts",
+	description = "Profiles the live game with the MicroProfiler. Two modes, usable together: `observe` "
+		.. "captures the game running on its own for N seconds (the real-load baseline -- what "
+		.. "actually costs frame time while someone plays), and `targets` hammer specific functions "
+		.. "thousands of times with fake data. Reports your labels with per-call, allocation-per-call "
+		.. "and worst-frame numbers, "
+		.. "the top scopes by self time across every thread, the slowest frames and what filled them, "
+		.. "and the Luau heap delta. Each target is a `setup` Luau body that runs once in the game's "
+		.. "own VM (so require() returns the live module with its real state) and returns the "
+		.. "function to hammer; the tool wraps every call in debug.profilebegin(label). `sections` "
+		.. "additionally brackets line ranges inside scripts with profilebegin/profileend so a slow "
+		.. "loop inside a function shows up as its own scope, and `autoSections` does that for every "
+		.. "named function in a script at once -- the edits live only in the playtest, never the place. "
+		.. "Needs LibMP in the place (pass "
+		.. "installLibMP to insert it). Starts a playtest if none is running; if sections are given "
+		.. "and one is already running, restarts it so the instrumented code is what runs. Each "
+		.. "capture is also written to disk as a .gprx dump for LibMP under Lute. Batch: put every "
+		.. "function you want numbers for in one call's targets, and for old-vs-new comparisons or "
+		.. "anything that also needs setup, output checks or state reads, call vmcp.Profile.Hammer "
+		.. "from a run_timeline server event instead so the whole pass is one call. Load the "
+		.. "vmcp-optimization skill before using this.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			observe = {
+				type = "object",
+				description = "Capture the game as it runs, no hammering. Drive it yourself (play, or a "
+					.. "client timeline event) during the window. Runs before any targets.",
+				properties = {
+					seconds = {
+						type = "number",
+						description = "How long to watch. Defaults to 3; 256 frames is the cap.",
+						minimum = 0.5,
+					},
+				},
+			},
+			autoSections = {
+				type = "array",
+				description = "Scripts to instrument function-by-function: every named function gets its own "
+					.. 'scope, labelled <ScriptName>.<function>. The fastest way from "this script is slow" to '
+					.. '"it\'s this function".',
+				items = { type = "string", description = 'Dotted path, like "ServerScriptService.Combat".' },
+			},
+			targets = {
+				type = "array",
+				description = "What to hammer. Each runs as its own capture, one after another. Optional when "
+					.. "observe is given.",
+				minItems = 1,
+				maxItems = MAX_TARGETS,
+				items = {
+					type = "object",
+					properties = {
+						label = {
+							type = "string",
+							description = "Scope name in the profiler. Keep it short and unique, like Combat.ResolveHit.",
+						},
+						setup = {
+							type = "string",
+							description = "Luau body. Runs once, in the game VM by default, and must `return` the "
+								.. "function to call. Build fake arguments here. The function gets the call "
+								.. "index (1..calls) as its only argument, so it can vary its data.",
+						},
+						calls = {
+							type = "integer",
+							description = "How many calls. Defaults to 500. Stops early when seconds runs out.",
+							minimum = 1,
+						},
+						seconds = {
+							type = "number",
+							description = "Spread the calls over this long. Defaults to 2 -- the capture only "
+								.. "holds frameLimit frames (~2s at 60fps), so longer loads lose their start.",
+							minimum = 0.1,
+						},
+						perFrame = {
+							type = "integer",
+							description = "Calls per frame before yielding. Defaults to calls / (seconds * 60), "
+								.. "which spreads them evenly.",
+							minimum = 1,
+						},
+						warmup = {
+							type = "integer",
+							description = "Calls thrown away first so lazy init isn't in the numbers. Defaults to 5.",
+							minimum = 0,
+						},
+					},
+					required = { "label", "setup" },
+				},
+			},
+			sections = {
+				type = "array",
+				description = "Line ranges to wrap in debug.profilebegin(label)/profileend() while the run "
+					.. "happens. Lines are 1-based and inclusive, in the script's current Source. Pick "
+					.. "whole statements: a range that ends inside a block or contains an early return "
+					.. "reads wrong.",
+				items = {
+					type = "object",
+					properties = {
+						script = { type = "string", description = 'Dotted path, like "ServerScriptService.Combat".' },
+						fromLine = { type = "integer", minimum = 1 },
+						toLine = { type = "integer", minimum = 1 },
+						label = { type = "string" },
+					},
+					required = { "script", "fromLine", "toLine", "label" },
+				},
+			},
+			where = {
+				type = "string",
+				description = "Which live context runs the load. Defaults to server.",
+				enum = { "server", "client" },
+			},
+			player = {
+				type = "integer",
+				description = "Which test client, 1-based, when where is client.",
+				minimum = 1,
+				maximum = 8,
+			},
+			vm = {
+				type = "string",
+				description = "game (default) runs setup in the game's VM, sharing the require cache with the "
+					.. "running scripts. plugin runs it in VMCP's VM with `vmcp` in scope -- fresh module "
+					.. "copies, so only for pure functions.",
+				enum = { "game", "plugin" },
+			},
+			frameLimit = {
+				type = "integer",
+				description = "Frames the profiler keeps, 8-256. Defaults to 128. More frames, bigger dump.",
+				minimum = 8,
+				maximum = 256,
+			},
+			top = {
+				type = "integer",
+				description = "How many scopes to list by self time. Defaults to 15.",
+				minimum = 1,
+				maximum = 60,
+			},
+			dump = {
+				type = "boolean",
+				description = "Write each capture to ~/.vmcp/profiles/<name>-<label>.gprx. Defaults to true.",
+			},
+			name = {
+				type = "string",
+				description = "Dump file prefix. Defaults to a timestamp.",
+			},
+			installLibMP = {
+				type = "boolean",
+				description = "Insert LibMP from the Creator Store into ReplicatedStorage if it isn't there.",
+			},
+			players = {
+				type = "integer",
+				description = "Players for the playtest this starts, if it has to. Defaults to 1.",
+				minimum = 1,
+				maximum = 8,
+			},
+		},
+	},
+	tags = { title = "Profile Scripts", destructive = true },
+	timeoutMs = 240000,
+}
+
+local function text(body: string, isError: boolean?): Result
+	return { content = { { type = "text", text = body } }, isError = isError }
+end
+
+local function checkTargets(targets: any, observing: boolean): (string?, number)
+	if targets == nil and observing then
+		return nil, 0
+	end
+	if type(targets) ~= "table" or #targets == 0 then
+		return "targets must be a non-empty array (or pass observe)", 0
+	end
+	if #targets > MAX_TARGETS then
+		return `at most {MAX_TARGETS} targets per call`, 0
+	end
+	local total = 0
+	for index, target in targets do
+		if type(target.label) ~= "string" or target.label == "" then
+			return `target {index} needs a label`, 0
+		end
+		if type(target.setup) ~= "string" or target.setup == "" then
+			return `target "{target.label}" needs a setup body`, 0
+		end
+		total += target.seconds or DEFAULT_SECONDS
+	end
+	if total > MAX_TOTAL_SECONDS then
+		return `the targets add up to {total}s of load; keep it under {MAX_TOTAL_SECONDS}s per call`, 0
+	end
+	return nil, total
+end
+
+-- The playtest half. Everything real is Profile.Hammer, so a timeline event can do the same thing
+-- without a tool call per target.
+local function capture(arguments: any): Result
+	local observe = arguments.observe
+	local problem = checkTargets(arguments.targets, observe ~= nil)
+	if problem then
+		return text(problem, true)
+	end
+	local labels = {}
+	for _, section in arguments.sections or {} do
+		table.insert(labels, section.label)
+	end
+	for _, label in arguments.autoLabels or {} do
+		table.insert(labels, label)
+	end
+
+	local parts = {}
+	local failed = false
+	if observe then
+		local watched = Profile.Observe(observe.seconds, {
+			frameLimit = arguments.frameLimit,
+			top = arguments.top,
+			labels = labels,
+			dump = arguments.dump ~= false,
+			name = arguments.name,
+		})
+		table.insert(parts, watched)
+	end
+	if arguments.targets then
+		local body, hammerFailed = Profile.Hammer(arguments.targets, {
+			vm = arguments.vm,
+			env = Env,
+			frameLimit = arguments.frameLimit,
+			top = arguments.top,
+			dump = arguments.dump,
+			name = arguments.name,
+			labels = labels,
+		})
+		table.insert(parts, body)
+		failed = hammerFailed
+	end
+	table.insert(
+		parts,
+		"The last capture is still open in this context: a run_luau or timeline event here can "
+			.. "reopen it with vmcp.Profile.Session() and walk it with LibMP directly."
+	)
+	return text(table.concat(parts, "\n\n"), failed)
+end
+
+local function splitLines(source: string): { string }
+	local lines = {}
+	for line in string.gmatch(source .. "\n", "([^\n]*)\n") do
+		table.insert(lines, line)
+	end
+	return lines
+end
+
+-- Builds each script's Source with the profiler calls in. Sections on one script are merged in a
+-- single pass over the original line numbers, so they can nest or overlap without shifting each
+-- other. Nothing is written here -- Swap does that, briefly.
+local function instrument(sections: { Section }, autoScripts: { string }): ({ Swap.Replacement }, { string }, string?)
+	local byScript: { [Instance]: { Section } } = {}
+	local autoLabels: { string } = {}
+	local autoOn: { [Instance]: boolean } = {}
+	for _, path in autoScripts do
+		local instance, why = Path.Resolve(path)
+		if not instance then
+			return {}, {}, why
+		end
+		if not instance:IsA("LuaSourceContainer") then
+			return {}, {}, `{path} is a {instance.ClassName}, not a script`
+		end
+		autoOn[instance] = true
+		byScript[instance] = byScript[instance] or {}
+	end
+	for index, section in sections do
+		local instance, why = Path.Resolve(section.script)
+		if not instance then
+			return {}, {}, why
+		end
+		if not instance:IsA("LuaSourceContainer") then
+			return {}, {}, `{section.script} is a {instance.ClassName}, not a script`
+		end
+		if type(section.label) ~= "string" or section.label == "" then
+			return {}, {}, `section {index} needs a label`
+		end
+		local list = byScript[instance]
+		if not list then
+			list = {}
+			byScript[instance] = list
+		end
+		table.insert(list, section)
+	end
+
+	local replacements: { Swap.Replacement } = {}
+	for instance, list in byScript do
+		local source, why = Swap.ReadSource(instance)
+		if not source then
+			return {}, {}, why
+		end
+		-- Function scopes go in first; they're inserted inline, so the line numbers the sections
+		-- were written against still hold.
+		if autoOn[instance] then
+			local labels
+			source, labels = Instrument.Functions(source :: string, instance.Name)
+			for _, label in labels do
+				table.insert(autoLabels, label)
+			end
+		end
+		local lines = splitLines(source :: string)
+		for _, section in list do
+			if section.fromLine > section.toLine or section.toLine > #lines then
+				return {},
+					{},
+					`section "{section.label}" wants lines {section.fromLine}-{section.toLine} but {instance:GetFullName()} has {#lines}`
+			end
+		end
+
+		local out = {}
+		for number, line in lines do
+			-- Outer sections open first, and close last.
+			local opening = {}
+			for _, section in list do
+				if section.fromLine == number then
+					table.insert(opening, section)
+				end
+			end
+			table.sort(opening, function(a, b)
+				return a.toLine > b.toLine
+			end)
+			for _, section in opening do
+				table.insert(out, `debug.profilebegin({string.format("%q", section.label)})`)
+			end
+			table.insert(out, line)
+			local closing = {}
+			for _, section in list do
+				if section.toLine == number then
+					table.insert(closing, section)
+				end
+			end
+			table.sort(closing, function(a, b)
+				return a.fromLine > b.fromLine
+			end)
+			for _ in closing do
+				table.insert(out, "debug.profileend()")
+			end
+		end
+
+		table.insert(replacements, { instance = instance, source = table.concat(out, "\n") })
+	end
+	return replacements, autoLabels, nil
+end
+
+local function orchestrate(arguments: any): Result
+	local problem, totalSeconds = checkTargets(arguments.targets, arguments.observe ~= nil)
+	if problem then
+		return text(problem, true)
+	end
+	if arguments.observe then
+		totalSeconds += (arguments.observe.seconds or 3)
+	end
+
+	if not Profile.Find() then
+		if not arguments.installLibMP then
+			return text(
+				"LibMP isn't in this place. Put the LibMP ModuleScript in ReplicatedStorage (Creator "
+					.. "Store asset 109009378620272, or github.com/Roblox/libmp/releases), or call again "
+					.. "with installLibMP = true.",
+				true
+			)
+		end
+		local _, why = Profile.Install()
+		if why then
+			return text(why, true)
+		end
+	end
+
+	local notes = {}
+	local sections: { Section } = arguments.sections or {}
+	local autoScripts: { string } = arguments.autoSections or {}
+	local autoLabels: { string } = {}
+	local context = arguments.where or "server"
+	local players = math.clamp(arguments.players or 1, 1, 8)
+	local startedHere = false
+
+	if #sections > 0 or #autoScripts > 0 then
+		local replacements, labels, why = instrument(sections, autoScripts)
+		if why then
+			return text(why, true)
+		end
+		autoLabels = labels
+		local failure, restarted = Swap.Start(replacements, players, context, arguments.player)
+		if failure then
+			return text(failure, true)
+		end
+		startedHere = true
+		if restarted then
+			table.insert(notes, "stopped the running playtest so the instrumented scripts would be the ones that ran")
+		end
+		table.insert(
+			notes,
+			`{#replacements} script(s) run instrumented in this playtest only; Studio's Source was never left changed`
+		)
+	elseif Session.IsRunning() then
+		local notUp = Swap.WaitFor(context, arguments.player)
+		if notUp then
+			return text(notUp, true)
+		end
+	else
+		local failure = Swap.Start({}, players, context, arguments.player)
+		if failure then
+			return text(failure, true)
+		end
+		startedHere = true
+	end
+
+	local reached, result = Bridge.Invoke("profile_scripts", {
+		context = context,
+		player = arguments.player,
+		targets = arguments.targets,
+		sections = sections,
+		autoLabels = autoLabels,
+		observe = arguments.observe,
+		vm = arguments.vm,
+		frameLimit = arguments.frameLimit,
+		top = arguments.top,
+		dump = arguments.dump,
+		name = arguments.name,
+	}, totalSeconds + 60)
+
+	if not reached then
+		return text(`couldn't run the profile in the {context}: {tostring(result)}`, true)
+	end
+
+	local body = {}
+	for _, item in result.content or {} do
+		if type(item.text) == "string" then
+			table.insert(body, item.text)
+		end
+	end
+	if startedHere then
+		table.insert(notes, 'the playtest is still open -- stop it with playtest { action = "stop" } when you\'re done')
+	end
+	if #notes > 0 then
+		table.insert(body, "-- " .. table.concat(notes, "\n-- "))
+	end
+	return text(table.concat(body, "\n\n"), result.isError == true)
+end
+
+function Tool.Run(arguments: any): Result
+	if RunService:IsEdit() then
+		return orchestrate(arguments)
+	end
+	return capture(arguments)
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="49">
         <Properties>
           <string name="Name">RenderBuild</string>
           <string name="Source"><![CDATA[--!strict
@@ -5634,7 +9411,7 @@ Tool.Definition = {
 					.. "with at (an {x, y, z} or a dotted path to a part or model) and radius (studs "
 					.. "from at to the panel edge); that panel is centred and scaled on it instead of "
 					.. "the whole build. clip = true drops parts further than radius from at, so a "
-					.. "wall between the camera and the spot doesn't hide it. view = \"front\" picks "
+					.. 'wall between the camera and the spot doesn\'t hide it. view = "front" picks '
 					.. "a preset angle for a targeted view instead of yaw/pitch.",
 				items = { type = { "string", "object" } },
 				maxItems = 9,
@@ -5651,7 +9428,7 @@ Tool.Definition = {
 			},
 			badges = {
 				type = "boolean",
-				description = `Number each part in the picture. On by default up to {BADGE_LIMIT} parts.`,
+				description = `Number each part in the picture and list it in the legend. On by default when the panels show up to {BADGE_LIMIT} parts (clipped panels count only what's in frame).`,
 			},
 			problems = {
 				type = "boolean",
@@ -5699,12 +9476,17 @@ function Tool.Run(arguments: {
 	end
 
 	local views, missing = Build.ResolveViews(arguments.views or { "iso" })
-	local badges = if arguments.badges ~= nil then arguments.badges else count <= BADGE_LIMIT
+	local shown = Build.Shown(instances, views)
+	local shownCount = 0
+	for _ in shown do
+		shownCount += 1
+	end
+	local badges = if arguments.badges ~= nil then arguments.badges else shownCount <= BADGE_LIMIT
 	local note = if capped then `, stopped at {count} -- there are more` else ""
 	local problems = if arguments.problems ~= false then Build.Problems(root, arguments.maxParts, instances) else nil
 
 	local text = `{count} part(s) under {root:GetFullName()}, {#views} view(s){note}\n`
-		.. Build.Report(root, instances, badges, problems)
+		.. Build.Report(root, instances, if badges then shown else nil, problems)
 	for _, problem in missing do
 		text ..= `\nview target not found, drawing the whole build instead: {problem}`
 	end
@@ -5726,7 +9508,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="38">
+      <Item class="ModuleScript" referent="50">
         <Properties>
           <string name="Name">ReviewRemotes</string>
           <string name="Source"><![CDATA[--!strict
@@ -5785,7 +9567,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="39">
+      <Item class="ModuleScript" referent="51">
         <Properties>
           <string name="Name">RunLuau</string>
           <string name="Source"><![CDATA[--!strict
@@ -5918,7 +9700,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="40">
+      <Item class="ModuleScript" referent="52">
         <Properties>
           <string name="Name">RunTimeline</string>
           <string name="Source"><![CDATA[--!strict
@@ -6250,7 +10032,425 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="41">
+      <Item class="ModuleScript" referent="53">
+        <Properties>
+          <string name="Name">ScreenshotUi</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Draws a GUI tree as a picture. Studio has no screenshot a plugin can take, so this walks the
+-- GuiObjects in render order, reads every visual property through GetStyled (the only read that
+-- sees StyleRules), and hands the flat list to the VMCP server, which rasterizes it.
+--
+-- What comes back is a layout check, not a render: boxes, strokes, gradients, corner radii and
+-- rotation are exact; text is a bitmap font; EditableImage pixels are real, asset images are a
+-- placeholder, and a ViewportFrame is a box naming what's inside it.
+
+local Path = require(script.Parent.Parent.Path)
+
+local MAX_NODES = 4000
+-- Pixels for an ImageLabel backed by an EditableImage are shipped when it's this small or less;
+-- bigger ones (a wall of previews) get the placeholder so the payload stays sane.
+local MAX_IMAGE_SIDE = 128
+local DEFAULT_MAX_SIDE = 1024
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+	postProcess: { [string]: any }?,
+}
+
+type Rect = { x: number, y: number, w: number, h: number }
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "screenshot_ui",
+	description = "Draws a ScreenGui (or any GuiObject) as a PNG so you can look at the layout "
+		.. "instead of reading AbsolutePosition numbers. Reads styled values, so StyleSheet rules "
+		.. "show. Boxes, strokes, gradients, corners and rotation are exact; text is a bitmap "
+		.. "font (check overflow with TextFits, not by eye); EditableImage icons are real pixels, "
+		.. "asset images are a tinted placeholder, ViewportFrames are a box naming their contents. "
+		.. "context plugin draws StarterGui as Studio lays it out; context client draws the "
+		.. "player's live PlayerGui.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			root = {
+				type = "string",
+				description = 'Dotted path to a ScreenGui, GuiObject, or a container of ScreenGuis. '
+					.. "Defaults to StarterGui in the edit session and the local PlayerGui in a client.",
+			},
+			context = {
+				type = "string",
+				description = "Which DataModel. Defaults to plugin.",
+				enum = { "plugin", "server", "client" },
+			},
+			player = {
+				type = "integer",
+				description = "Which test client, 1-based. Only meaningful with context client.",
+				minimum = 1,
+				maximum = 8,
+			},
+			scale = {
+				type = "number",
+				description = "Output pixels per screen pixel, 0.1 to 1. Defaults to whatever fits the longer side into 1024.",
+				minimum = 0.1,
+				maximum = 1,
+			},
+			name = {
+				type = "string",
+				description = "File name, letters digits underscore hyphen. Defaults to a timestamp.",
+			},
+		},
+	},
+	tags = { title = "Screenshot UI", readOnly = true },
+	timeoutMs = 60000,
+}
+
+local function styled(instance: Instance, name: string): any
+	local ok, value = pcall(function()
+		return (instance :: any):GetStyled(name)
+	end)
+	if ok then
+		return value
+	end
+	return (instance :: any)[name]
+end
+
+local function rgb(color: Color3): { number }
+	return { color.R, color.G, color.B }
+end
+
+local function intersect(a: Rect?, b: Rect): Rect
+	if not a then
+		return b
+	end
+	local x1, y1 = math.max(a.x, b.x), math.max(a.y, b.y)
+	local x2, y2 = math.min(a.x + a.w, b.x + b.w), math.min(a.y + a.h, b.y + b.h)
+	return { x = x1, y = y1, w = math.max(x2 - x1, 0), h = math.max(y2 - y1, 0) }
+end
+
+local ALIGN_X = { [Enum.TextXAlignment.Left] = 0, [Enum.TextXAlignment.Center] = 0.5, [Enum.TextXAlignment.Right] = 1 }
+local ALIGN_Y = { [Enum.TextYAlignment.Top] = 0, [Enum.TextYAlignment.Center] = 0.5, [Enum.TextYAlignment.Bottom] = 1 }
+
+local base64: (buffer) -> string
+do
+	local ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	local ENCODE = table.create(64)
+	for i = 1, 64 do
+		ENCODE[i - 1] = string.byte(ALPHABET, i)
+	end
+	base64 = function(bytes: buffer): string
+		local length = buffer.len(bytes)
+		local out = buffer.create(math.ceil(length / 3) * 4)
+		local o = 0
+		local full = length - length % 3
+		for i = 0, full - 1, 3 do
+			local n = buffer.readu8(bytes, i) * 65536 + buffer.readu8(bytes, i + 1) * 256 + buffer.readu8(bytes, i + 2)
+			buffer.writeu8(out, o, ENCODE[n // 262144])
+			buffer.writeu8(out, o + 1, ENCODE[n // 4096 % 64])
+			buffer.writeu8(out, o + 2, ENCODE[n // 64 % 64])
+			buffer.writeu8(out, o + 3, ENCODE[n % 64])
+			o += 4
+		end
+		local rest = length - full
+		if rest == 1 then
+			local a = buffer.readu8(bytes, full)
+			buffer.writeu8(out, o, ENCODE[a // 4])
+			buffer.writeu8(out, o + 1, ENCODE[a % 4 * 16])
+			buffer.writeu8(out, o + 2, 61)
+			buffer.writeu8(out, o + 3, 61)
+		elseif rest == 2 then
+			local a, b = buffer.readu8(bytes, full), buffer.readu8(bytes, full + 1)
+			buffer.writeu8(out, o, ENCODE[a // 4])
+			buffer.writeu8(out, o + 1, ENCODE[a % 4 * 16 + b // 16])
+			buffer.writeu8(out, o + 2, ENCODE[b % 16 * 4])
+			buffer.writeu8(out, o + 3, 61)
+		end
+		return buffer.tostring(out)
+	end
+end
+
+-- One EditableImage's pixels are read once however many labels show it.
+local pixelCache: { [EditableImage]: { px: string, pw: number, ph: number }? } = {}
+
+local function imagePixels(image: EditableImage): { px: string, pw: number, ph: number }?
+	local cached = pixelCache[image]
+	if cached ~= nil then
+		return cached
+	end
+	local size = image.Size
+	local result = nil
+	if size.X <= MAX_IMAGE_SIDE and size.Y <= MAX_IMAGE_SIDE then
+		local ok, bytes = pcall(function()
+			return image:ReadPixelsBuffer(Vector2.zero, size)
+		end)
+		if ok then
+			result = { px = base64(bytes), pw = size.X, ph = size.Y }
+		end
+	end
+	pixelCache[image] = result
+	return result
+end
+
+type Walk = { nodes: { any }, origin: Vector2, count: number, skipped: number, global: boolean }
+
+local function describe(state: Walk, gui: GuiObject, clip: Rect?)
+	local pos = gui.AbsolutePosition - state.origin
+	local size = gui.AbsoluteSize
+	local node: { [string]: any } = {
+		k = "rect",
+		x = pos.X,
+		y = pos.Y,
+		w = size.X,
+		h = size.Y,
+		rot = gui.AbsoluteRotation,
+		bg = rgb(styled(gui, "BackgroundColor3")),
+		a = 1 - styled(gui, "BackgroundTransparency"),
+		clip = clip,
+		z = styled(gui, "ZIndex"),
+	}
+
+	for _, child in gui:GetChildren() do
+		if child:IsA("UIStroke") and styled(child, "Enabled") and styled(child, "ApplyStrokeMode") == Enum.ApplyStrokeMode.Border then
+			node.stroke = { color = rgb(styled(child, "Color")), a = 1 - styled(child, "Transparency"), t = styled(child, "Thickness") }
+		elseif child:IsA("UICorner") then
+			local radius: UDim = styled(child, "CornerRadius")
+			node.corner = radius.Offset + radius.Scale * math.min(size.X, size.Y)
+		elseif child:IsA("UIGradient") and styled(child, "Enabled") then
+			local colors, alphas = {}, {}
+			for _, key in (styled(child, "Color") :: ColorSequence).Keypoints do
+				table.insert(colors, { key.Time, key.Value.R, key.Value.G, key.Value.B })
+			end
+			for _, key in (styled(child, "Transparency") :: NumberSequence).Keypoints do
+				table.insert(alphas, { key.Time, key.Value })
+			end
+			node.grad = { rot = styled(child, "Rotation"), colors = colors, alphas = alphas }
+		end
+	end
+
+	if gui:IsA("TextLabel") or gui:IsA("TextButton") or gui:IsA("TextBox") then
+		node.k = "text"
+		local text: string = styled(gui, "Text")
+		if gui:IsA("TextBox") and text == "" then
+			text = styled(gui, "PlaceholderText")
+		end
+		local textSize: number = if styled(gui, "TextScaled") then math.min(gui.TextBounds.Y, size.Y) else styled(gui, "TextSize")
+		node.text = {
+			s = text,
+			size = textSize,
+			color = rgb(styled(gui, "TextColor3")),
+			a = 1 - styled(gui, "TextTransparency"),
+			ax = ALIGN_X[styled(gui, "TextXAlignment")] or 0.5,
+			ay = ALIGN_Y[styled(gui, "TextYAlignment")] or 0.5,
+			wrap = styled(gui, "TextWrapped") == true,
+		}
+	elseif gui:IsA("ImageLabel") or gui:IsA("ImageButton") then
+		node.k = "image"
+		local image: { [string]: any } = {
+			color = rgb(styled(gui, "ImageColor3")),
+			a = 1 - styled(gui, "ImageTransparency"),
+		}
+		local content: Content = styled(gui, "ImageContent")
+		local object = if content.SourceType == Enum.ContentSourceType.Object then content.Object else nil
+		if object and object:IsA("EditableImage") then
+			local pixels = imagePixels(object)
+			if pixels then
+				image.px, image.pw, image.ph = pixels.px, pixels.pw, pixels.ph
+			end
+		elseif content.SourceType == Enum.ContentSourceType.None and (styled(gui, "Image") :: string) == "" then
+			image.a = 0
+		end
+		if styled(gui, "ScaleType") == Enum.ScaleType.Tile then
+			local tile: UDim2 = styled(gui, "TileSize")
+			image.tile = { w = tile.X.Offset + tile.X.Scale * size.X, h = tile.Y.Offset + tile.Y.Scale * size.Y }
+		end
+		node.image = image
+	elseif gui:IsA("ViewportFrame") then
+		node.k = "viewport"
+		local parts = 0
+		for _, d in gui:GetDescendants() do
+			if d:IsA("BasePart") then
+				parts += 1
+			end
+		end
+		node.label = if parts > 0 then `VIEWPORT: {parts} PARTS` else "VIEWPORT: EMPTY"
+	end
+
+	return node
+end
+
+local function walk(state: Walk, gui: GuiObject, clip: Rect?, order: { any })
+	if state.count >= MAX_NODES then
+		state.skipped += 1
+		return
+	end
+	if not styled(gui, "Visible") then
+		return
+	end
+	state.count += 1
+	local node = describe(state, gui, clip)
+	table.insert(order, node)
+
+	local childClip = clip
+	if styled(gui, "ClipsDescendants") then
+		childClip = intersect(clip, { x = node.x, y = node.y, w = node.w, h = node.h })
+	end
+
+	local children = {}
+	for index, child in gui:GetChildren() do
+		if child:IsA("GuiObject") then
+			table.insert(children, { child = child, z = styled(child, "ZIndex"), index = index })
+		end
+	end
+	if not state.global then
+		table.sort(children, function(a, b)
+			if a.z ~= b.z then
+				return a.z < b.z
+			end
+			return a.index < b.index
+		end)
+	end
+	for _, entry in children do
+		walk(state, entry.child, childClip, order)
+	end
+end
+
+-- ScreenGuis in a container draw by DisplayOrder, then by the order they were added.
+local function screenGuisUnder(container: Instance): { ScreenGui }
+	local guis = {}
+	for _, child in container:GetChildren() do
+		if child:IsA("ScreenGui") and child.Enabled then
+			table.insert(guis, child)
+		end
+	end
+	table.sort(guis, function(a, b)
+		return a.DisplayOrder < b.DisplayOrder
+	end)
+	return guis
+end
+
+function Tool.Run(arguments: { root: string?, scale: number?, name: string? }): Result
+	local root: Instance
+	if type(arguments.root) == "string" and arguments.root ~= "" then
+		local found, problem = Path.Resolve(arguments.root)
+		if not found then
+			return { content = { { type = "text", text = problem :: string } }, isError = true }
+		end
+		root = found
+	else
+		local player = game:GetService("Players").LocalPlayer
+		local playerGui = if player then player:FindFirstChild("PlayerGui") else nil
+		root = playerGui or game:GetService("StarterGui")
+	end
+
+	-- Every list of GuiObjects to draw, each with the ScreenGui whose ZIndexBehavior governs it.
+	local layers: { { guis: { GuiObject }, global: boolean } } = {}
+	local reference: GuiBase2d? = nil
+	if root:IsA("GuiObject") then
+		local screen = root:FindFirstAncestorWhichIsA("ScreenGui")
+		local global = screen ~= nil and screen.ZIndexBehavior == Enum.ZIndexBehavior.Global
+		table.insert(layers, { guis = { root }, global = global })
+		reference = root
+	elseif root:IsA("ScreenGui") then
+		local guis = {}
+		for _, child in root:GetChildren() do
+			if child:IsA("GuiObject") then
+				table.insert(guis, child)
+			end
+		end
+		table.insert(layers, { guis = guis, global = root.ZIndexBehavior == Enum.ZIndexBehavior.Global })
+		reference = root
+	else
+		for _, screen in screenGuisUnder(root) do
+			local guis = {}
+			for _, child in screen:GetChildren() do
+				if child:IsA("GuiObject") then
+					table.insert(guis, child)
+				end
+			end
+			table.insert(layers, { guis = guis, global = screen.ZIndexBehavior == Enum.ZIndexBehavior.Global })
+			reference = reference or screen
+		end
+	end
+	if not reference then
+		return {
+			content = { { type = "text", text = `{root:GetFullName()} has no ScreenGui or GuiObject to draw` } },
+			isError = true,
+		}
+	end
+
+	local origin = reference.AbsolutePosition
+	local size = reference.AbsoluteSize
+	if size.X < 1 or size.Y < 1 then
+		return {
+			content = { { type = "text", text = `{reference:GetFullName()} has no size yet -- nothing is laid out` } },
+			isError = true,
+		}
+	end
+
+	table.clear(pixelCache)
+	local state: Walk = { nodes = {}, origin = origin, count = 0, skipped = 0, global = false }
+	for _, layer in layers do
+		state.global = layer.global
+		local order = {}
+		local children = {}
+		for index, gui in layer.guis do
+			table.insert(children, { child = gui, z = styled(gui, "ZIndex"), index = index })
+		end
+		table.sort(children, function(a, b)
+			if a.z ~= b.z then
+				return a.z < b.z
+			end
+			return a.index < b.index
+		end)
+		for _, entry in children do
+			walk(state, entry.child, nil, order)
+		end
+		if layer.global then
+			-- Global: every descendant sorts by ZIndex alone, ties keep tree order.
+			for index, node in order do
+				node.i = index
+			end
+			table.sort(order, function(a, b)
+				if a.z ~= b.z then
+					return a.z < b.z
+				end
+				return a.i < b.i
+			end)
+		end
+		for _, node in order do
+			node.z, node.i = nil, nil
+			table.insert(state.nodes, node)
+		end
+	end
+	table.clear(pixelCache)
+
+	local scale = arguments.scale or math.min(1, DEFAULT_MAX_SIDE / math.max(size.X, size.Y))
+	local note = if state.skipped > 0 then `, stopped after {MAX_NODES} elements` else ""
+	return {
+		content = {
+			{
+				type = "text",
+				text = `{state.count} element(s) under {root:GetFullName()}, {size.X}x{size.Y} at {string.format("%.2f", scale)}x{note}`,
+			},
+		},
+		postProcess = {
+			kind = "ui",
+			name = arguments.name,
+			width = size.X,
+			height = size.Y,
+			scale = scale,
+			nodes = state.nodes,
+		},
+	}
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="54">
         <Properties>
           <string name="Name">SearchScripts</string>
           <string name="Source"><![CDATA[--!strict
@@ -6481,7 +10681,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="42">
+      <Item class="ModuleScript" referent="55">
         <Properties>
           <string name="Name">TimelinePart</string>
           <string name="Source"><![CDATA[--!strict
@@ -6579,6 +10779,118 @@ function Tool.Run(arguments: { events: any, duration: number?, origin: string? }
 	end
 
 	return { content = { { type = "text", text = `{origin} ran {#compiled} event(s)` } } }
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="56">
+        <Properties>
+          <string name="Name">TryScripts</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Starts a playtest in which some scripts run replacement Source, so the user can play a
+-- candidate fix before it's written anywhere. The place, the file on disk and Studio's own copy
+-- are all untouched by the time this returns; stopping the playtest is the whole revert.
+
+local Path = require(script.Parent.Parent.Path)
+local Swap = require(script.Parent.Parent.Playtest.Swap)
+
+local MAX_SCRIPTS = 16
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "try_scripts",
+	description = "Starts a playtest that runs the Source you pass in place of the named scripts -- "
+		.. "for handing the user a candidate fix to play before anything is applied. The swap "
+		.. "happens only for the seconds the playtest takes to boot; Studio's Source is back to "
+		.. "the original before this returns, nothing is saved and nothing reaches disk. Stopping "
+		.. 'the playtest (playtest { action = "stop" }, or the user\'s Stop button) is the revert. '
+		.. "A playtest already running is stopped and restarted. Batch every script the fix "
+		.. "touches into one call; pass the whole Source, not a diff.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			scripts = {
+				type = "array",
+				minItems = 1,
+				maxItems = MAX_SCRIPTS,
+				items = {
+					type = "object",
+					properties = {
+						script = { type = "string", description = 'Dotted path, like "ServerScriptService.Combat".' },
+						source = { type = "string", description = "The complete replacement Source." },
+					},
+					required = { "script", "source" },
+				},
+			},
+			players = {
+				type = "integer",
+				description = "Test clients to launch. Defaults to 1 (Play Solo).",
+				minimum = 1,
+				maximum = 8,
+			},
+		},
+		required = { "scripts" },
+	},
+	tags = { title = "Try Scripts", destructive = true },
+	timeoutMs = 150000,
+}
+
+local function text(body: string, isError: boolean?): Result
+	return { content = { { type = "text", text = body } }, isError = isError }
+end
+
+function Tool.Run(arguments: { scripts: { { script: string, source: string } }?, players: number? }): Result
+	local scripts = arguments.scripts
+	if type(scripts) ~= "table" or #scripts == 0 then
+		return text("scripts must be a non-empty array of { script, source }", true)
+	end
+	if #scripts > MAX_SCRIPTS then
+		return text(`at most {MAX_SCRIPTS} scripts per call`, true)
+	end
+
+	local replacements: { Swap.Replacement } = {}
+	local names = {}
+	for index, entry in scripts do
+		if type(entry.source) ~= "string" or entry.source == "" then
+			return text(`script {index} needs a source`, true)
+		end
+		local instance, why = Path.Resolve(entry.script)
+		if not instance then
+			return text(why :: string, true)
+		end
+		local _, unreadable = Swap.ReadSource(instance)
+		if unreadable then
+			return text(unreadable, true)
+		end
+		table.insert(replacements, { instance = instance, source = entry.source })
+		table.insert(names, instance:GetFullName())
+	end
+
+	local failure, restarted = Swap.Start(replacements, arguments.players or 1, "server")
+	if failure then
+		return text(failure, true)
+	end
+
+	local lines = {
+		`Playtest running with replacement Source in {#replacements} script(s):`,
+		"  " .. table.concat(names, "\n  "),
+		"",
+		"Studio, the place and disk all still hold the originals. Tell the user to play it; stop "
+			.. 'the playtest with playtest { action = "stop" } to go back to the original everywhere.',
+	}
+	if restarted then
+		table.insert(lines, "(a playtest was already running and was restarted)")
+	end
+	return text(table.concat(lines, "\n"))
 end
 
 return Tool

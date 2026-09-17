@@ -20,6 +20,8 @@ export interface Recording {
 	width: number;
 	height: number;
 	ops: DrawOp[];
+	/** The image's real RGBA, base64. When present it wins over replaying `ops`. */
+	pixels?: string;
 }
 
 const MAX_SIZE = 1024;
@@ -107,6 +109,16 @@ export function rasterize(recording: Recording): Surface {
 	const width = Math.min(Math.max(Math.round(recording.width), 1), MAX_SIZE);
 	const height = Math.min(Math.max(Math.round(recording.height), 1), MAX_SIZE);
 	const surface = new Surface(width, height);
+
+	// The plugin sends the pixels it actually has when they fit the socket, so DrawImage and
+	// WritePixelsBuffer work show up too. A size mismatch means a different image than claimed.
+	if (typeof recording.pixels === "string") {
+		const bytes = Buffer.from(recording.pixels, "base64");
+		if (bytes.length === width * height * 4) {
+			surface.pixels.set(bytes);
+			return surface;
+		}
+	}
 
 	for (const op of recording.ops ?? []) {
 		switch (op.kind) {

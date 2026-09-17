@@ -35,6 +35,16 @@ if complaint then return complaint end
 
 Returns nil when the selector parsed.
 
+**A styled value never shows up in a plain property read.** `frame.BackgroundColor3` keeps
+returning what the instance holds while the rule renders fine, and a rule that seems to do
+nothing was usually working all along. `instance:GetStyled("BackgroundColor3")` is the read that
+sees rules; `vmcp.Style.Read(instance, { "BackgroundColor3", "TextSize" })` does several at
+once. Only computed properties like `AbsoluteSize` reflect styling on their own. A value set
+directly on the instance still wins over a rule.
+
+To look at the result rather than probe it, the `screenshot_ui` tool draws a ScreenGui as a PNG
+from styled values — see below.
+
 ## The rest is plain engine API
 
 ```lua
@@ -68,3 +78,13 @@ that is the whole theming mechanism.
 `SetPropertyTransition(property, tweenInfo)` is the CSS-transition equivalent. The `::` combinator
 spawns a phantom `UICorner` / `UIStroke` / `UIGradient` from a rule instead of parenting one by
 hand. `StyleDerive` chains one sheet onto another.
+
+## Looking at it
+
+`screenshot_ui` (root = a ScreenGui, GuiObject or StarterGui/PlayerGui; context plugin or
+client) walks the tree in render order, reads every visual property through `GetStyled`, and the
+server draws it as a PNG that comes back inline. Boxes, strokes, gradients, corners, rotation and
+clipping are exact; text is a 5x7 bitmap font so its width isn't the engine's (check overflow
+with `TextFits`); EditableImage icons are real pixels, asset images a tinted placeholder, and a
+ViewportFrame a box naming how many parts it holds. Good for "what overlaps what", not for
+judging a font.

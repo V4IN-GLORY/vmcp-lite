@@ -67,4 +67,19 @@ function Style.Selector(rule: StyleRule, selector: string): string?
 	return if complaint ~= "" then complaint else nil
 end
 
+-- A styled value never shows up in a plain property read: `frame.BackgroundColor3` keeps saying
+-- the default while the rule renders fine. GetStyled is the read that sees the rules, and this
+-- is the same thing for several properties at once. A name the class doesn't have comes back
+-- as the error string instead of a value.
+function Style.Read(instance: Instance, names: { string }): { [string]: any }
+	local out = {}
+	for _, name in names do
+		local ok, value = pcall(function()
+			return (instance :: any):GetStyled(name)
+		end)
+		out[name] = if ok then value else `no property "{name}"`
+	end
+	return out
+end
+
 return Style
