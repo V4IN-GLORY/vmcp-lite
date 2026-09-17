@@ -117,6 +117,38 @@ every angle negated; write one and mirror it. R6 has no knees, so the lifted pas
 drawn reference is just the trailing leg going 5 degrees past vertical. Leave the torso and head
 alone (see the checklist) -- the reference's bounce is for a drawn character, not a Humanoid.
 
+## Attacks: anticipation / action / recovery
+
+What makes a strike read as heavy (from fighting-game animation guides, confirmed on the
+ShoulderBash pass): **hold distinct extreme poses, snap between them.** Smooth even motion
+between poses is what reads as floaty.
+
+- **Anticipation** goes the *opposite* way with the whole body: lean back, twist away, crouch,
+  lead limb swung behind. `CubicV2/InOut` into it, then hold it 0.1s (duplicate the key).
+- **Launch** is a snap: `CubicV2/Out` over ~0.08s into an *overshoot* pose 10-15 deg past the
+  target, then `Elastic/Out` settles onto the held pose. That overshoot + settle is the "weight".
+- **Hit**: `CubicV2/In` accelerating into it, overshoot again, then `easing = "Constant"` on the
+  hit key so the pose freezes for ~0.1s (baked hitstop). Fire hitboxes/VFX on this key.
+- **Recovery**: `Elastic/Out` whip-back to a distinct, held recovery pose (not idle), then a fast
+  `CubicV2/Out` pop to idle. A linear fade to idle hides when the player can act again.
+- Everything moves on the big beats: head, both arms, both legs get a key at every beat.
+- Root travel is never baked in (above); a strike with forward reach is a velocity in the skill.
+
+### Leaning a torso on R6/R15 without the feet leaving the floor
+
+The legs are children of the torso, so a forward lean carries the hips up and swings the legs up
+behind the body. Two things fix the float:
+
+- **Legs counter-pitch by the lean**: `leg pitch = wanted world angle + torso lean`. A 40 deg
+  lean with legs striding +-35 world is leg keys of `5..75`, not `-35..35`.
+- **Root offset absorbs the lift**: hips rise `1 - cos(lean)` (torso half-height 1), and each leg
+  foreshortens `1 - cos(world angle)` per stud of leg; sum those and drop `offset.y` by it. A 40
+  deg lean with +-30 legs is about `-0.5`; a 52 deg slam with a planted front leg about `-0.7`.
+- **Cap the lean.** Past ~50 deg a blocky rig reads as diving/flying, not charging. Sell more
+  aggression with yaw (shoulder twist, 50-70 deg) and roll (dropped shoulder, 10-25 deg) instead.
+- A "tucked across the chest" R6 arm is modest pitch with big roll (`[45, 0, 60]`); big pitch
+  with big roll (`[80, 0, 55]`) sticks the arm out sideways.
+
 ## Easing
 
 `easing` goes on the key it *leaves from* and is `"Style/Direction"`. Real styles only
