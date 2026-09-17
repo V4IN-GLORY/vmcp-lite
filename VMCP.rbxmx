@@ -10083,7 +10083,7 @@ function Tool.Run(arguments: {
 	local _, extents = model:GetBoundingBox()
 	local columns = math.ceil(math.sqrt(#times))
 	local step = Vector3.new(1, 0, 1).Unit * extents.X * 2
-	local drop = Vector3.new(0, -extents.Y * 1.3, 0) + Vector3.new(-1, 0, 1).Unit * extents.Z * 1.5
+	local drop = Vector3.new(0, -extents.Y * 1.3, 0) + Vector3.new(-1, 0, 1).Unit * extents.X * 2
 	local facing = CFrame.Angles(0, math.pi, 0)
 	local parts = {}
 	local motion: { [string]: { { number } } } = {}

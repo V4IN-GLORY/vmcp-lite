@@ -31,6 +31,20 @@ render_anim {
 - Joint names are part names. R15: `UpperTorso LowerTorso Head RightUpperArm RightLowerArm
   RightHand RightUpperLeg RightLowerLeg RightFoot` and Left. R6: `Torso Head "Right Arm" "Left
   Arm" "Right Leg" "Left Leg"`. R6 arms only bend at the shoulder, so a punch is one joint.
+- `angles` and `offset` are in **character space** on every rig: +X right, +Y up, +Z back.
+  Pitch (X) + tips the top of a part back and swings a hanging limb forward; so a forward lean is
+  `angles = [-5,0,0]` on the torso, a leg stepping forward is `[35,0,0]`, and `offset = [0,-0.2,0]`
+  on the root-driven part (`Torso` on R6, `LowerTorso` on R15) is a crouch. Same numbers, same
+  meaning, R6 or R15.
+- The text under the picture is the check the picture can't do. Per keyed joint it prints the
+  range every channel covers across the frames:
+  ```
+  Torso: y -0.2..0.15, pitch -5° constant (never at rest)
+  Right Leg: pitch -35..35°
+  ```
+  Read it every time. `z` moving on a torso that was meant to bob is the wrong axis; a channel
+  marked `constant` on a part you didn't mean to hold is a whole-body tilt; `Head: pitch 1..6°`
+  is a nod that reads as wobble in motion. All three look fine on a filmstrip.
 - `holding = "ReplicatedStorage.Katana"` draws a Tool (or a Model with a Handle) in the right hand
   exactly as the engine grips it. Parts already welded to the rig (accessories, a sheath) come
   along on their own.
@@ -40,6 +54,20 @@ render_anim {
   its tracks as editable angles, so "make the walk bouncier" is read, edit, re-render.
 - `save = "ServerStorage.Animations"` also leaves the KeyframeSequence in the place. Right-click
   it in Explorer > Save to Roblox and it becomes a real asset id for the game.
+
+## What looks wrong in motion but fine on a sheet
+
+A sheet is eight still poses; a player sees the 60 frames between them, so small persistent
+things dominate. Before saving, ask of the motion readout:
+
+- Does anything drift on an axis it shouldn't? A cycle's root part should show `y` for a bob
+  and nothing on `z` -- forward/back on the root scrubs against the character's real movement
+  and reads as stutter.
+- Is anything `constant` that wasn't meant as a held pose? A 5 degree lean is a choice and gets
+  written once; a 5 degree lean you didn't write is an axis mistake.
+- Do the small joints stay still? In a cycle, head and hands either hold one value or do
+  nothing. A 3..6 degree nod on a walk is nervous wobble, not life; leave the head out.
+- Do both halves of a cycle mirror? Left/right ranges should match to the degree.
 
 ## Working an animation up
 
@@ -116,7 +144,9 @@ return built   -- { id = "rbxasset://...", length = 0.6, joints = {...}, keyfram
 `vmcp.Anim.Sequence(model, tracks, options)` returns the `KeyframeSequence` instance itself
 (unparented) when you want to put it in the place rather than register it.
 
-`angles` is degrees, XYZ. Pass `cframe = CFrame.new(...)` instead for anything angles can't say.
+`angles` is degrees XYZ and `offset` is studs XYZ, both in character space (above). Pass
+`cframe = CFrame.new(...)` instead for a raw `Motor6D.Transform` -- that's the joint's C0
+space, which is what Decompile hands back and what nobody should write by hand (see below).
 
 **Easing is written on the key it leaves from**, because `Pose.EasingStyle` describes how to reach
 the *next* keyframe. The last key's easing is never used. See Easing above.
@@ -148,6 +178,26 @@ local tracks = vmcp.Anim.Decompile(clip)
 Edit the tracks, recompile, preview. The whole loop stays in Studio.
 
 ## Gotchas
+
+- **`Motor6D.Transform` is applied inside C0, and C0 is rotated on most rigs.** Every R6 joint
+  has one: shoulders and hips are turned 90 about Y, RootJoint and Neck are -90 about X and 180
+  about Z. Raw angles there mean "Z swings the arm forward", and a raw `CFrame.new(0, 0.2, 0)`
+  on the torso slides it *backwards*, not up. That is exactly how a walk once shipped with the
+  body tilted back, the root sliding fore and aft, and a nodding head -- the sheet looked right
+  because the poses were all plausible, just on the wrong axes. `Anim` now conjugates
+  `angles`/`offset` by `C0.Rotation` so they mean the same thing on every rig, and `render_anim`
+  prints the per-joint ranges in that same space so a wrong axis shows up as text. Only
+  `cframe` keys bypass this.
+- **A saved sequence is whatever plugin was running when it was saved.** Studio does not
+  hot-reload a rebuilt `VMCP.rbxmx`; the plugin requires its tools from its own copy loaded at
+  startup, not from `ServerStorage.VMCP`. After changing `Anim` or `RenderAnim`: build, restart
+  Studio, then re-render and confirm the new output (the motion readout is a cheap tell) before
+  re-saving anything the user will play. Saving with the old plugin after re-authoring for the
+  new one is how "make the R6 walk" turned into a floss.
+- The sheet steps frames along `(1,0,1)`, which reads left-to-right in front, right and the
+  anim-specific iso/top presets. `left`, `back` and custom yaws can read right-to-left; the text
+  says so when they do. Rows also slide along `(-1,0,1)` so the top view is a grid, so a row's
+  frames sit at slightly different depths in the side views -- that is layout, not motion.
 
 - `KeyframeSequence.Length` reads 0 until the sequence is loaded. `Compile` returns the real length
   (the highest keyframe time) instead.
