@@ -21,21 +21,9 @@ local Env = {
 	Rig = require(script.Parent.Lib.Rig),
 	Style = require(script.Parent.Lib.Style),
 	Serialize = require(script.Parent.Exec.Serialize),
-	-- Eval and Require, against the running game's own script VM rather than the plugin's.
 	Game = require(script.Parent.Exec.GameVm),
 }
 
--- Calls another VMCP tool and gives back its text. `arguments.context` picks the DataModel, so a
--- client event can ask the server a question, or ask the edit session for a tree dump, without
--- the payload having to be split into three separate calls first.
---
--- Returns ok plus the text; a tool that reported an error comes back as false with its own words.
--- Writes a Canvas out as a PNG on the VMCP server, which is the only side with a filesystem.
--- Works from any context and from inside a timeline event, where returning a directive isn't an
--- option. `name` becomes the file name; leave it out and it gets a timestamped one.
--- `options.upload` publishes it as an Image asset too, and the reply carries the rbxassetid so
--- scripts can use the picture without EditableImage at runtime. `options.groupId` makes a group
--- the owner instead of the Studio user. The upload_image tool does the same for a finished PNG.
 function Env.Render(canvas: any, name: string?, options: { upload: boolean?, groupId: number? }?): (boolean, string)
 	local serverUpload = false
 	if options and options.upload then
