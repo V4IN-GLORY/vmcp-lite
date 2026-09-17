@@ -148,6 +148,9 @@ behind the body. Two things fix the float:
   aggression with yaw (shoulder twist, 50-70 deg) and roll (dropped shoulder, 10-25 deg) instead.
 - A "tucked across the chest" R6 arm is modest pitch with big roll (`[45, 0, 60]`); big pitch
   with big roll (`[80, 0, 55]`) sticks the arm out sideways.
+- Don't cock the trailing arm *behind* the body (pitch under -60 plus roll): the shoulder can't
+  do that and it reads as a broken arm from any angle but the side. For a tackle/charge both arms
+  brace across the chest, the trailing one mirrored (`[35, 0, -70]`).
 
 ## Easing
 
