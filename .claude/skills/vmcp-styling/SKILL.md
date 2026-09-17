@@ -50,6 +50,18 @@ class rule wants its own rule, and `TextLabel.Center` (class + tag) outranks the
 To look at the result rather than probe it, the `screenshot_ui` tool draws a ScreenGui as a PNG
 from styled values — see below.
 
+**A comma list in one rule parses but may match nothing.** `.A:Hover > .X, .A.Active > .X`
+reported no `SelectorError` and applied to neither; one selector per rule did. Cheap to split,
+expensive to debug.
+
+**`.Name` is a tag, `#Name` is the instance name.** A label called `Value` with tags
+`{ "ValueXL" }` does not match `.Value`. When a rule "matches nothing", check `GetTags()` first.
+
+**A transition can bake a value into the instance.** After a rule with `SetPropertyTransition`
+was replaced live, the tweened `ImageColor3` was left set directly on the label, and from then
+on no rule could change it (direct beats rule). Reset the property to its class default and the
+rules take over again. Watch for it when editing rules in a live sheet.
+
 ## The rest is plain engine API
 
 ```lua
