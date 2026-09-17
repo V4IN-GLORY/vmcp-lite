@@ -188,3 +188,14 @@ bar in a row/bar, and make the centers equal. Things that have gone wrong on the
 
 Anything that looked right in Oswald needs this re-check after a font swap: wider glyphs move
 `TextBounds`, not positions, so the frames still "line up" while the ink doesn't.
+
+Equal box centers still aren't equal baselines across fonts: `TextYAlignment = Center` centers
+the font's line box (ascent + descent), and BuilderMono's caps sit high in its box while Jura's
+sit low. Side by side, the mono number floats ~3px above the Jura caption even with identical
+centers. There's no baseline API, so after the numeric pass nudge the mono label down (or the
+Jura label up) 2–3px and confirm by eye in Studio — the screenshot tool's bitmap font can't show it.
+
+**A `UIListLayout` sorts by Name unless told otherwise**, and Name sort is lexical: `P1, P10, P2…`.
+Ten pips named `P1..P10` with `LayoutOrder` set still render with the tenth in slot two, which
+reads as a random gap in the filled run. Always pass `SortOrder = Enum.SortOrder.LayoutOrder`
+when children carry a LayoutOrder; if a list looks shuffled, that's the first thing to read.
