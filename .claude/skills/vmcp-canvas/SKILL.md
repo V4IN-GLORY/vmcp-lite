@@ -94,3 +94,31 @@ it still reaches the PNG through the pixel copy as long as the image is 512x512 
 
 `Line` is one pixel wide in the engine; a thickness is drawn as that many parallel lines, with
 the endpoints clamped inside the image because `DrawLine` refuses a point outside it.
+
+## Icons for a UI, start to finish
+
+1. Put the drawing in a ModuleScript under the ScreenGui (`Icons.draw[name] = function(c) ... end`),
+   so the art is source, not a one-off snippet. Draw white; tint with `ImageColor3` (a StyleRule
+   can do that per tag).
+2. Generator: `vmcp.Canvas.new` → draw → `vmcp.Render(canvas, "hud-" .. name, { upload = true })`
+   once per icon; keep the ids in a table in the generator and set `ImageLabel.Image =
+   "rbxassetid://id"`. Only upload an icon that has no id yet, or every rerun makes another asset.
+3. Leave the live `ImageContent` path as the fallback for icons that have no id.
+
+Why not EditableImage everywhere:
+- `ImageContent` from an EditableImage **is never saved** with the place, and the images
+  themselves die when the plugin that made them reloads — every label goes blank.
+- In play mode a client can't even draw one unless **Mesh & Image APIs** is enabled in Game
+  Settings → Security.
+- `AssetService:CreateAssetAsync` says "not available yet" on most Studio builds, which is why
+  the upload goes through the server.
+
+## Things that bite
+
+- `EditableImage:DrawRectangle` / `DrawCircle` / `DrawLine` require the `ImageCombineType`
+  argument now; `DrawLine` lost its thickness and refuses an endpoint outside the image. Canvas
+  handles all three.
+- A plugin reload does **not** happen just because the rbxmx changed — re-add the plugin in
+  Studio, then check with `vmcp.Tool("upload_image", {})` that the new tools are there.
+- `~/.vmcp/profiles/<name>.gprx` is a plain byte sink (`{ kind = "gprx", data = base64 }`), handy
+  for getting a big table out of Studio when a return value would be truncated.

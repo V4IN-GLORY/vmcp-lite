@@ -297,13 +297,15 @@ function drawImage(surface: Surface, node: UiNode, box: Box, s: number): void {
 	}
 
 	// An asset the server can't fetch: a tinted frame with a diagonal, so it reads as "image here".
+	// A tiled one is a texture overlay (scanlines, noise), so it gets the faint fill alone.
+	const overlay = image.tile !== undefined;
 	for (let y = area.y; y < area.y + area.h; y++) {
 		for (let x = area.x; x < area.x + area.w; x++) {
 			if (!inClip(clip, x, y)) continue;
 			const { d, lx, ly } = edgeDistance(box, x, y);
 			if (d > 0) continue;
-			const onEdge = d > -1.5;
-			const onDiagonal = Math.abs(lx / Math.max(box.hw, 1) - ly / Math.max(box.hh, 1)) < 0.08;
+			const onEdge = !overlay && d > -1.5;
+			const onDiagonal = !overlay && Math.abs(lx / Math.max(box.hw, 1) - ly / Math.max(box.hh, 1)) < 0.08;
 			surface.blend(x, y, tint[0], tint[1], tint[2], onEdge || onDiagonal ? alpha * 0.8 : alpha * 0.12);
 		}
 	}
