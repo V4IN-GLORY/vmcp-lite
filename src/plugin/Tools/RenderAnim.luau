@@ -232,7 +232,7 @@ local function pose(rig: Rig.Rig, at: number, tracks: Anim.Tracks, base: CFrame)
 		for _, child in node.children do
 			local motor = child.motor :: Motor6D
 			local keys = tracks[child.part.Name]
-			local transform = if keys then Anim.Sample(keys, at) else CFrame.identity
+			local transform = if keys then Anim.Sample(keys, at, motor) else CFrame.identity
 			world[child.part.Name] = world[node.part.Name] * motor.C0 * transform * motor.C1:Inverse()
 			walk(child)
 		end
@@ -286,6 +286,94 @@ local function easingNote(tracks: Anim.Tracks): string?
 		return "every transition is Linear. Body motion usually wants CubicV2/InOut (or /Out to snap then settle); Bounce and Elastic for impacts; Constant for a hard cut."
 	end
 	return nil
+end
+
+-- A joint's transform as the author thinks of it: offset and angles in character space
+-- (+X right, +Y up, +Z back), which is Anim's conjugation undone. { x, y, z, pitch, yaw, roll }.
+local function characterSpace(motor: Motor6D, transform: CFrame): { number }
+	local basis = motor.C0.Rotation
+	local local_ = basis * transform * basis:Inverse()
+	local pitch, yaw, roll = local_:ToEulerAnglesXYZ()
+	return { local_.X, local_.Y, local_.Z, math.deg(pitch), math.deg(yaw), math.deg(roll) }
+end
+
+local CHANNELS = { "x", "y", "z", "pitch", "yaw", "roll" }
+
+-- One line per joint with the range each channel covers over the frames drawn. This is what
+-- catches a walk whose torso slides back and forth because its "bob" went into the wrong axis,
+-- or a whole body tilted 5 degrees in every frame -- a filmstrip hides both. A channel that
+-- moves but never touches zero is called out, since that is almost always an unintended lean.
+local function motionText(motion: { [string]: { { number } } }): string
+	local lines = {}
+	for joint, frames in motion do
+		local items = {}
+		for channel = 1, 6 do
+			local low, high = math.huge, -math.huge
+			for _, values in frames do
+				low, high = math.min(low, values[channel]), math.max(high, values[channel])
+			end
+			local threshold = if channel <= 3 then 0.02 else 0.5
+			if math.max(math.abs(low), math.abs(high)) < threshold then
+				continue
+			end
+			local unit = if channel <= 3 then "" else "°"
+			local item = if high - low < threshold
+				then `{CHANNELS[channel]} {fmt(high)}{unit} constant`
+				else `{CHANNELS[channel]} {fmt(low)}..{fmt(high)}{unit}`
+			if low > threshold or high < -threshold then
+				item ..= " (never at rest)"
+			end
+			table.insert(items, item)
+		end
+		table.insert(lines, `{joint}: {if #items > 0 then table.concat(items, ", ") else "at rest"}`)
+	end
+	table.sort(lines)
+	return table.concat(lines, "\n")
+end
+
+-- Mirrors the renderer's camera basis: eye on the yaw/pitch sphere looking at the origin,
+-- screen-right = forward x up. Used to say which panels read right-to-left, since one world
+-- layout can't read left-to-right from every angle (left vs right, for one).
+local function screenRight(yawDegrees: number, pitchDegrees: number): Vector3
+	local yaw, pitch = math.rad(yawDegrees), math.rad(pitchDegrees)
+	local forward = -Vector3.new(math.cos(pitch) * math.sin(yaw), math.sin(pitch), math.cos(pitch) * math.cos(yaw))
+	local up = if math.abs(forward.Y) > 0.999 then Vector3.zAxis else Vector3.yAxis
+	return forward:Cross(up).Unit
+end
+
+local PRESETS: { [string]: { number } } = {
+	iso = { 45, 30 },
+	front = { 0, 0 },
+	back = { 180, 0 },
+	left = { 90, 0 },
+	right = { -90, 0 },
+	top = { 0, 89.9 },
+	bottom = { 0, -89.9 },
+	corner = { -135, 20 },
+}
+-- The build renderer's iso and top look down the frame diagonal and would stack the frames;
+-- these see it side-on and read left-to-right, so they stand in when a sheet asks for them.
+local ANIM_PRESETS: { [string]: { number } } = {
+	iso = { -45, 30 },
+	top = { -45, 85 },
+}
+
+local function resolveViews(views: { any }, step: Vector3): ({ any }, { string })
+	local resolved, mirrored = {}, {}
+	for _, view in views do
+		local name = if type(view) == "string" then string.lower(view) else nil
+		local angles = if name then ANIM_PRESETS[name] or PRESETS[name] else nil
+		if name and angles then
+			view = { name = view, yaw = angles[1], pitch = angles[2] }
+		end
+		if type(view) == "table" and type(view.yaw) == "number" and type(view.pitch) == "number" then
+			if screenRight(view.yaw, view.pitch):Dot(step) < 0 then
+				table.insert(mirrored, tostring(view.name or `{view.yaw}/{view.pitch}`))
+			end
+		end
+		table.insert(resolved, view)
+	end
+	return resolved, mirrored
 end
 
 local function timesOf(tracks: Anim.Tracks): { number }
@@ -414,13 +502,15 @@ function Tool.Run(arguments: {
 
 	-- The renderer's "front" camera sits on +Z and a character faces -Z, so the rig is turned to
 	-- look at it; that also puts its right side towards the "right" camera. Frames step along the
-	-- diagonal every preset sees side-on so they never stack, and wrap into rows going down.
+	-- diagonal that reads left-to-right in the front, right and (yaw -45) iso cameras, and wrap
+	-- into rows that drop in Y plus a slide away from the iso camera so the top view separates them.
 	local _, extents = model:GetBoundingBox()
 	local columns = math.ceil(math.sqrt(#times))
-	local step = Vector3.new(1, 0, -1).Unit * extents.X * 2
-	local drop = Vector3.new(0, -extents.Y * 1.3, 0)
+	local step = Vector3.new(1, 0, 1).Unit * extents.X * 2
+	local drop = Vector3.new(0, -extents.Y * 1.3, 0) + Vector3.new(-1, 0, 1).Unit * extents.Z * 1.5
 	local facing = CFrame.Angles(0, math.pi, 0)
 	local parts = {}
+	local motion: { [string]: { { number } } } = {}
 	for frame, at in times do
 		local column, row = (frame - 1) % columns, (frame - 1) // columns
 		local world = pose(rig, at, resolved, CFrame.new(step * column + drop * row) * facing)
@@ -435,6 +525,11 @@ function Tool.Run(arguments: {
 				table.insert(parts, Build.Describe(rider.part, #parts + 1, world[rider.carrier] * rider.offset))
 			end
 		end
+		for _, joint in built.joints do
+			local channels = motion[joint] or {}
+			motion[joint] = channels
+			table.insert(channels, characterSpace(rig.byName[joint].motor :: Motor6D, Anim.Sample(resolved[joint], at, rig.byName[joint].motor)))
+		end
 	end
 
 	local labels = {}
@@ -445,6 +540,12 @@ function Tool.Run(arguments: {
 		labels,
 		"  "
 	)}\n` .. `id = {id}  length = {fmt(built.length)}  joints = {table.concat(built.joints, ", ")}{saved}`
+	text ..= "\nmotion (character space: +x right, +y up, +z back; pitch + tips the top back / swings a hanging limb forward):\n"
+		.. motionText(motion)
+	local views, mirrored = resolveViews(arguments.views or { "front", "right", "iso", "top" }, step)
+	if #mirrored > 0 then
+		text ..= `\nnote: {table.concat(mirrored, ", ")} read right-to-left`
+	end
 	local note = easingNote(resolved)
 	if note then
 		text ..= `\nnote: {note}`
@@ -468,7 +569,7 @@ function Tool.Run(arguments: {
 			kind = "scene",
 			name = arguments.name,
 			size = arguments.size or 2048,
-			views = (Build.ResolveViews(arguments.views or { "front", "right", "iso", "top" })),
+			views = (Build.ResolveViews(views)),
 			badges = false,
 			parts = parts,
 		},

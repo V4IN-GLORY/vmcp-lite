@@ -748,21 +748,9 @@ local Env = {
 	Rig = require(script.Parent.Lib.Rig),
 	Style = require(script.Parent.Lib.Style),
 	Serialize = require(script.Parent.Exec.Serialize),
-	-- Eval and Require, against the running game's own script VM rather than the plugin's.
 	Game = require(script.Parent.Exec.GameVm),
 }
 
--- Calls another VMCP tool and gives back its text. `arguments.context` picks the DataModel, so a
--- client event can ask the server a question, or ask the edit session for a tree dump, without
--- the payload having to be split into three separate calls first.
---
--- Returns ok plus the text; a tool that reported an error comes back as false with its own words.
--- Writes a Canvas out as a PNG on the VMCP server, which is the only side with a filesystem.
--- Works from any context and from inside a timeline event, where returning a directive isn't an
--- option. `name` becomes the file name; leave it out and it gets a timestamped one.
--- `options.upload` publishes it as an Image asset too, and the reply carries the rbxassetid so
--- scripts can use the picture without EditableImage at runtime. `options.groupId` makes a group
--- the owner instead of the Studio user. The upload_image tool does the same for a finished PNG.
 function Env.Render(canvas: any, name: string?, options: { upload: boolean?, groupId: number? }?): (boolean, string)
 	local serverUpload = false
 	if options and options.upload then
@@ -1505,8 +1493,11 @@ local Anim = {}
 
 export type Key = {
 	time: number,
-	-- Degrees, XYZ. Shorthand for the common case; `cframe` wins if both are given.
+	-- Degrees, XYZ, in character space (see cframeOf). `cframe` wins if given.
 	angles: { number }?,
+	-- Studs, XYZ, in character space: +X right, +Y up, +Z back.
+	offset: { number }?,
+	-- Raw Motor6D Transform, in the joint's C0 space. What Decompile hands back.
 	cframe: (CFrame | { number })?,
 	-- "CubicV2/InOut", "Bounce/Out", "Elastic/In", "Constant", "Linear". Applies from this key toward the next.
 	easing: string?,
@@ -1522,7 +1513,13 @@ export type Compiled = {
 	keyframes: number,
 }
 
-local function cframeOf(key: Key): CFrame
+-- Motor6D.Transform is applied inside C0, and C0 carries a rotation on many rigs (every R6
+-- joint: the shoulders are turned 90 about Y, the root and neck -90 about X). Raw angles there
+-- mean "Z swings the arm forward" and "Y lifts the torso backwards", which nobody guesses right.
+-- So angles/offset are taken in character space (+X right, +Y up, +Z back, same on every rig)
+-- and conjugated by C0's rotation: C0 * T = C0.pos * R * C0.rot, i.e. R acts on the parent's axes
+-- at the joint pivot. `cframe` stays raw so a decompiled track round-trips untouched.
+local function cframeOf(key: Key, basis: CFrame): CFrame
 	local cframe = key.cframe
 	if typeof(cframe) == "CFrame" then
 		return cframe
@@ -1532,7 +1529,10 @@ local function cframeOf(key: Key): CFrame
 		return CFrame.new(table.unpack(cframe))
 	end
 	local angles = key.angles or { 0, 0, 0 }
-	return CFrame.Angles(math.rad(angles[1] or 0), math.rad(angles[2] or 0), math.rad(angles[3] or 0))
+	local offset = key.offset or { 0, 0, 0 }
+	local local_ = CFrame.new(offset[1] or 0, offset[2] or 0, offset[3] or 0)
+		* CFrame.Angles(math.rad(angles[1] or 0), math.rad(angles[2] or 0), math.rad(angles[3] or 0))
+	return basis:Inverse() * local_ * basis
 end
 
 -- nil for anything that isn't a real PoseEasingStyle, so "Quad" is an error, not a silent Linear.
@@ -1547,12 +1547,14 @@ end
 -- The value of one joint at an arbitrary time. Before the first key it holds the first value,
 -- after the last it holds the last, and between two it lerps -- so a joint keyed only at the ends
 -- still has a sensible pose in every keyframe the other joints introduced.
-function Anim.Sample(keys: { Key }, at: number): CFrame
+-- `motor` is the joint the track drives; its C0 rotation is the basis angles/offset are read in.
+function Anim.Sample(keys: { Key }, at: number, motor: Motor6D?): CFrame
 	if #keys == 0 then
 		return CFrame.identity
 	end
+	local basis = if motor then motor.C0.Rotation else CFrame.identity
 	if at <= keys[1].time then
-		return cframeOf(keys[1])
+		return cframeOf(keys[1], basis)
 	end
 
 	for index = 1, #keys - 1 do
@@ -1560,10 +1562,10 @@ function Anim.Sample(keys: { Key }, at: number): CFrame
 		if at >= from.time and at <= to.time then
 			local span = to.time - from.time
 			local alpha = if span > 0 then (at - from.time) / span else 1
-			return cframeOf(from):Lerp(cframeOf(to), alpha)
+			return cframeOf(from, basis):Lerp(cframeOf(to, basis), alpha)
 		end
 	end
-	return cframeOf(keys[#keys])
+	return cframeOf(keys[#keys], basis)
 end
 
 local function keyAt(keys: { Key }, at: number): Key?
@@ -1645,7 +1647,7 @@ function Anim.Sequence(model: Instance, tracks: Tracks, options: Options?): (Key
 
 		local pose = Rig.PoseTree(rig, function(joint: string): CFrame?
 			local keys = tracks[joint]
-			return if keys then Anim.Sample(keys, at) else nil
+			return if keys then Anim.Sample(keys, at, rig.byName[joint].motor) else nil
 		end)
 
 		-- Easing and weight are per-pose and only meaningful where the author actually put a key.
@@ -2793,6 +2795,7 @@ local MAX_SIZE = 1024
 local MAX_PIXEL_BYTES = 512 * 512 * 4
 
 local BLEND = Enum.ImageCombineType.AlphaBlend
+local SMOOTH = Enum.AntiAliasing.Enabled
 
 local Canvas = {}
 
@@ -2843,7 +2846,7 @@ function Methods.Rect(self: any, x: number, y: number, w: number, h: number, col
 end
 
 function Methods.Circle(self: any, x: number, y: number, radius: number, color: Color3, alpha: number?): any
-	self.image:DrawCircle(Vector2.new(x, y), radius, color, 1 - (alpha or 1), BLEND)
+	self.image:DrawCircle(Vector2.new(x, y), radius, color, 1 - (alpha or 1), BLEND, SMOOTH)
 	return record(self, { kind = "circle", x = x, y = y, r = radius, color = rgb(color), alpha = alpha or 1 })
 end
 
@@ -2862,7 +2865,8 @@ function Methods.Line(self: any, x1: number, y1: number, x2: number, y2: number,
 			Vector2.new(math.clamp(x2 + nx * offset, 0, maxX), math.clamp(y2 + ny * offset, 0, maxY)),
 			color,
 			0,
-			BLEND
+			BLEND,
+			SMOOTH
 		)
 	end
 	return record(self, { kind = "line", x1 = x1, y1 = y1, x2 = x2, y2 = y2, color = rgb(color), thickness = width })
@@ -6968,19 +6972,15 @@ function Session.IsRunning(): boolean
 	return not service().EditModeActive
 end
 
--- One player gets Play Solo: a single DataModel that is both server and client, and far quicker to
--- start than the real thing. Two or more needs a genuine multiplayer test.
 function Session.Start(players: number): string?
 	if Session.IsRunning() then
-		return "a playtest is already running -- stop that one first"
+		return "a playtest is already running"
 	end
 
 	state.ours = true
 	state.players = players
 	state.startedAt = os.clock()
 
-	-- Both calls yield until the test ends, and the plugin has to stay answerable the whole time a
-	-- session is open, so the waiting happens on its own thread.
 	task.spawn(function()
 		local studio = service()
 		local ok, failure
@@ -6990,7 +6990,7 @@ function Session.Start(players: number): string?
 			ok, failure = pcall(studio.ExecuteMultiplayerTestAsync, studio, players, {})
 		end
 		if not ok then
-			warn(`[VMCP] the playtest would not start: {failure}`)
+			warn(`the playtest is not starting because {failure}`)
 		end
 		state.ours = false
 	end)
@@ -7001,8 +7001,6 @@ function Session.Status(): { [string]: any }
 	local running = Session.IsRunning()
 	return {
 		running = running,
-		-- Studio's own Play button counts as a playtest; it just is not one we started, so we
-		-- should not stop it out from under anyone either.
 		ours = running and state.ours,
 		players = if running then state.players else nil,
 		seconds = if running then math.floor(os.clock() - state.startedAt) else nil,
@@ -9810,7 +9808,7 @@ local function pose(rig: Rig.Rig, at: number, tracks: Anim.Tracks, base: CFrame)
 		for _, child in node.children do
 			local motor = child.motor :: Motor6D
 			local keys = tracks[child.part.Name]
-			local transform = if keys then Anim.Sample(keys, at) else CFrame.identity
+			local transform = if keys then Anim.Sample(keys, at, motor) else CFrame.identity
 			world[child.part.Name] = world[node.part.Name] * motor.C0 * transform * motor.C1:Inverse()
 			walk(child)
 		end
@@ -9864,6 +9862,94 @@ local function easingNote(tracks: Anim.Tracks): string?
 		return "every transition is Linear. Body motion usually wants CubicV2/InOut (or /Out to snap then settle); Bounce and Elastic for impacts; Constant for a hard cut."
 	end
 	return nil
+end
+
+-- A joint's transform as the author thinks of it: offset and angles in character space
+-- (+X right, +Y up, +Z back), which is Anim's conjugation undone. { x, y, z, pitch, yaw, roll }.
+local function characterSpace(motor: Motor6D, transform: CFrame): { number }
+	local basis = motor.C0.Rotation
+	local local_ = basis * transform * basis:Inverse()
+	local pitch, yaw, roll = local_:ToEulerAnglesXYZ()
+	return { local_.X, local_.Y, local_.Z, math.deg(pitch), math.deg(yaw), math.deg(roll) }
+end
+
+local CHANNELS = { "x", "y", "z", "pitch", "yaw", "roll" }
+
+-- One line per joint with the range each channel covers over the frames drawn. This is what
+-- catches a walk whose torso slides back and forth because its "bob" went into the wrong axis,
+-- or a whole body tilted 5 degrees in every frame -- a filmstrip hides both. A channel that
+-- moves but never touches zero is called out, since that is almost always an unintended lean.
+local function motionText(motion: { [string]: { { number } } }): string
+	local lines = {}
+	for joint, frames in motion do
+		local items = {}
+		for channel = 1, 6 do
+			local low, high = math.huge, -math.huge
+			for _, values in frames do
+				low, high = math.min(low, values[channel]), math.max(high, values[channel])
+			end
+			local threshold = if channel <= 3 then 0.02 else 0.5
+			if math.max(math.abs(low), math.abs(high)) < threshold then
+				continue
+			end
+			local unit = if channel <= 3 then "" else "°"
+			local item = if high - low < threshold
+				then `{CHANNELS[channel]} {fmt(high)}{unit} constant`
+				else `{CHANNELS[channel]} {fmt(low)}..{fmt(high)}{unit}`
+			if low > threshold or high < -threshold then
+				item ..= " (never at rest)"
+			end
+			table.insert(items, item)
+		end
+		table.insert(lines, `{joint}: {if #items > 0 then table.concat(items, ", ") else "at rest"}`)
+	end
+	table.sort(lines)
+	return table.concat(lines, "\n")
+end
+
+-- Mirrors the renderer's camera basis: eye on the yaw/pitch sphere looking at the origin,
+-- screen-right = forward x up. Used to say which panels read right-to-left, since one world
+-- layout can't read left-to-right from every angle (left vs right, for one).
+local function screenRight(yawDegrees: number, pitchDegrees: number): Vector3
+	local yaw, pitch = math.rad(yawDegrees), math.rad(pitchDegrees)
+	local forward = -Vector3.new(math.cos(pitch) * math.sin(yaw), math.sin(pitch), math.cos(pitch) * math.cos(yaw))
+	local up = if math.abs(forward.Y) > 0.999 then Vector3.zAxis else Vector3.yAxis
+	return forward:Cross(up).Unit
+end
+
+local PRESETS: { [string]: { number } } = {
+	iso = { 45, 30 },
+	front = { 0, 0 },
+	back = { 180, 0 },
+	left = { 90, 0 },
+	right = { -90, 0 },
+	top = { 0, 89.9 },
+	bottom = { 0, -89.9 },
+	corner = { -135, 20 },
+}
+-- The build renderer's iso and top look down the frame diagonal and would stack the frames;
+-- these see it side-on and read left-to-right, so they stand in when a sheet asks for them.
+local ANIM_PRESETS: { [string]: { number } } = {
+	iso = { -45, 30 },
+	top = { -45, 85 },
+}
+
+local function resolveViews(views: { any }, step: Vector3): ({ any }, { string })
+	local resolved, mirrored = {}, {}
+	for _, view in views do
+		local name = if type(view) == "string" then string.lower(view) else nil
+		local angles = if name then ANIM_PRESETS[name] or PRESETS[name] else nil
+		if name and angles then
+			view = { name = view, yaw = angles[1], pitch = angles[2] }
+		end
+		if type(view) == "table" and type(view.yaw) == "number" and type(view.pitch) == "number" then
+			if screenRight(view.yaw, view.pitch):Dot(step) < 0 then
+				table.insert(mirrored, tostring(view.name or `{view.yaw}/{view.pitch}`))
+			end
+		end
+		table.insert(resolved, view)
+	end
+	return resolved, mirrored
 end
 
 local function timesOf(tracks: Anim.Tracks): { number }
@@ -9992,13 +10078,15 @@ function Tool.Run(arguments: {
 
 	-- The renderer's "front" camera sits on +Z and a character faces -Z, so the rig is turned to
 	-- look at it; that also puts its right side towards the "right" camera. Frames step along the
-	-- diagonal every preset sees side-on so they never stack, and wrap into rows going down.
+	-- diagonal that reads left-to-right in the front, right and (yaw -45) iso cameras, and wrap
+	-- into rows that drop in Y plus a slide away from the iso camera so the top view separates them.
 	local _, extents = model:GetBoundingBox()
 	local columns = math.ceil(math.sqrt(#times))
-	local step = Vector3.new(1, 0, -1).Unit * extents.X * 2
-	local drop = Vector3.new(0, -extents.Y * 1.3, 0)
+	local step = Vector3.new(1, 0, 1).Unit * extents.X * 2
+	local drop = Vector3.new(0, -extents.Y * 1.3, 0) + Vector3.new(-1, 0, 1).Unit * extents.Z * 1.5
 	local facing = CFrame.Angles(0, math.pi, 0)
 	local parts = {}
+	local motion: { [string]: { { number } } } = {}
 	for frame, at in times do
 		local column, row = (frame - 1) % columns, (frame - 1) // columns
 		local world = pose(rig, at, resolved, CFrame.new(step * column + drop * row) * facing)
@@ -10013,6 +10101,11 @@ function Tool.Run(arguments: {
 				table.insert(parts, Build.Describe(rider.part, #parts + 1, world[rider.carrier] * rider.offset))
 			end
 		end
+		for _, joint in built.joints do
+			local channels = motion[joint] or {}
+			motion[joint] = channels
+			table.insert(channels, characterSpace(rig.byName[joint].motor :: Motor6D, Anim.Sample(resolved[joint], at, rig.byName[joint].motor)))
+		end
 	end
 
 	local labels = {}
@@ -10023,6 +10116,12 @@ function Tool.Run(arguments: {
 		labels,
 		"  "
 	)}\n` .. `id = {id}  length = {fmt(built.length)}  joints = {table.concat(built.joints, ", ")}{saved}`
+	text ..= "\nmotion (character space: +x right, +y up, +z back; pitch + tips the top back / swings a hanging limb forward):\n"
+		.. motionText(motion)
+	local views, mirrored = resolveViews(arguments.views or { "front", "right", "iso", "top" }, step)
+	if #mirrored > 0 then
+		text ..= `\nnote: {table.concat(mirrored, ", ")} read right-to-left`
+	end
 	local note = easingNote(resolved)
 	if note then
 		text ..= `\nnote: {note}`
@@ -10046,7 +10145,7 @@ function Tool.Run(arguments: {
 			kind = "scene",
 			name = arguments.name,
 			size = arguments.size or 2048,
-			views = (Build.ResolveViews(arguments.views or { "front", "right", "iso", "top" })),
+			views = (Build.ResolveViews(views)),
 			badges = false,
 			parts = parts,
 		},

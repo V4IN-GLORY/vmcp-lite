@@ -19,8 +19,11 @@ local Anim = {}
 
 export type Key = {
 	time: number,
-	-- Degrees, XYZ. Shorthand for the common case; `cframe` wins if both are given.
+	-- Degrees, XYZ, in character space (see cframeOf). `cframe` wins if given.
 	angles: { number }?,
+	-- Studs, XYZ, in character space: +X right, +Y up, +Z back.
+	offset: { number }?,
+	-- Raw Motor6D Transform, in the joint's C0 space. What Decompile hands back.
 	cframe: (CFrame | { number })?,
 	-- "CubicV2/InOut", "Bounce/Out", "Elastic/In", "Constant", "Linear". Applies from this key toward the next.
 	easing: string?,
@@ -36,7 +39,13 @@ export type Compiled = {
 	keyframes: number,
 }
 
-local function cframeOf(key: Key): CFrame
+-- Motor6D.Transform is applied inside C0, and C0 carries a rotation on many rigs (every R6
+-- joint: the shoulders are turned 90 about Y, the root and neck -90 about X). Raw angles there
+-- mean "Z swings the arm forward" and "Y lifts the torso backwards", which nobody guesses right.
+-- So angles/offset are taken in character space (+X right, +Y up, +Z back, same on every rig)
+-- and conjugated by C0's rotation: C0 * T = C0.pos * R * C0.rot, i.e. R acts on the parent's axes
+-- at the joint pivot. `cframe` stays raw so a decompiled track round-trips untouched.
+local function cframeOf(key: Key, basis: CFrame): CFrame
 	local cframe = key.cframe
 	if typeof(cframe) == "CFrame" then
 		return cframe
@@ -46,7 +55,10 @@ local function cframeOf(key: Key): CFrame
 		return CFrame.new(table.unpack(cframe))
 	end
 	local angles = key.angles or { 0, 0, 0 }
-	return CFrame.Angles(math.rad(angles[1] or 0), math.rad(angles[2] or 0), math.rad(angles[3] or 0))
+	local offset = key.offset or { 0, 0, 0 }
+	local local_ = CFrame.new(offset[1] or 0, offset[2] or 0, offset[3] or 0)
+		* CFrame.Angles(math.rad(angles[1] or 0), math.rad(angles[2] or 0), math.rad(angles[3] or 0))
+	return basis:Inverse() * local_ * basis
 end
 
 -- nil for anything that isn't a real PoseEasingStyle, so "Quad" is an error, not a silent Linear.
@@ -61,12 +73,14 @@ end
 -- The value of one joint at an arbitrary time. Before the first key it holds the first value,
 -- after the last it holds the last, and between two it lerps -- so a joint keyed only at the ends
 -- still has a sensible pose in every keyframe the other joints introduced.
-function Anim.Sample(keys: { Key }, at: number): CFrame
+-- `motor` is the joint the track drives; its C0 rotation is the basis angles/offset are read in.
+function Anim.Sample(keys: { Key }, at: number, motor: Motor6D?): CFrame
 	if #keys == 0 then
 		return CFrame.identity
 	end
+	local basis = if motor then motor.C0.Rotation else CFrame.identity
 	if at <= keys[1].time then
-		return cframeOf(keys[1])
+		return cframeOf(keys[1], basis)
 	end
 
 	for index = 1, #keys - 1 do
@@ -74,10 +88,10 @@ function Anim.Sample(keys: { Key }, at: number): CFrame
 		if at >= from.time and at <= to.time then
 			local span = to.time - from.time
 			local alpha = if span > 0 then (at - from.time) / span else 1
-			return cframeOf(from):Lerp(cframeOf(to), alpha)
+			return cframeOf(from, basis):Lerp(cframeOf(to, basis), alpha)
 		end
 	end
-	return cframeOf(keys[#keys])
+	return cframeOf(keys[#keys], basis)
 end
 
 local function keyAt(keys: { Key }, at: number): Key?
@@ -159,7 +173,7 @@ function Anim.Sequence(model: Instance, tracks: Tracks, options: Options?): (Key
 
 		local pose = Rig.PoseTree(rig, function(joint: string): CFrame?
 			local keys = tracks[joint]
-			return if keys then Anim.Sample(keys, at) else nil
+			return if keys then Anim.Sample(keys, at, rig.byName[joint].motor) else nil
 		end)
 
 		-- Easing and weight are per-pose and only meaningful where the author actually put a key.
