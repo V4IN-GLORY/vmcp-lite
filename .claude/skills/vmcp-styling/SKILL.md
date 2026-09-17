@@ -72,6 +72,13 @@ wrong thing.
 default, so a `TextLabel { TextXAlignment = Left }` class rule takes it. Anything you need at
 its default *against* a class rule wants its own rule (`TextLabel.Center`), not a direct set.
 
+**And a rule *value* equal to the class default doesn't survive into a playtest.** The
+`TextLabel.Center { TextXAlignment = Center }` rule worked in the edit session and did nothing
+on the client: the saved rule arrived empty, so the `TextLabel { Left }` class rule won and the
+numbers slid off their hexes. `rule:SetProperty(...)` again from a LocalScript at startup makes
+it stick. Prefer rules that set non-default values; when you must set a default, re-set it at
+runtime.
+
 **A comma list in one selector parses but can match nothing.** `.A:Hover > .X, .A.Active > .X`
 gave no `SelectorError` and applied to neither. One selector per rule.
 
