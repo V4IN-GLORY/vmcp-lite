@@ -1,6 +1,6 @@
 ---
 name: vmcp-canvas
-description: Drawing images in Studio with VMCP's Canvas — an EditableImage wrapper that records every operation so the server can write the same picture out as a PNG. Use when asked to generate a texture, icon, chart or any image inside Roblox.
+description: Drawing images in Studio with VMCP's Canvas — an EditableImage wrapper that records every operation, writes the real pixels out as a PNG and uploads it as an Image asset (upload_image tool, Open Cloud key setup). Use when asked to generate a texture, icon, chart or any image inside Roblox, or to get an rbxassetid for one.
 ---
 
 # Canvas
@@ -112,6 +112,32 @@ Why not EditableImage everywhere:
   Settings → Security.
 - `AssetService:CreateAssetAsync` says "not available yet" on most Studio builds, which is why
   the upload goes through the server.
+
+## Struggles and lessons, in the order they happened
+
+- **Every Canvas call errored with "Argument 5 missing".** The engine added a required
+  `ImageCombineType` to `DrawRectangle`/`DrawCircle`/`DrawLine` and turned `DrawLine`'s sixth
+  argument into `AntiAliasing`; the old library passed thickness there. Lesson: when a wrapper
+  fails on its first call, read the wrapper's source before rewriting the caller — the
+  workaround (drawing on `canvas.image` and appending to `canvas.ops` by hand) was ten lines,
+  the fix in the library itself was the same ten lines and now everyone has it.
+- **"Studio hot-reloads a changed plugin file" — it doesn't, reliably.** Re-add the plugin
+  through Plugins → Manage, then check a new function exists (`typeof(vmcp.Style.Read)`).
+- **The plugin reload killed every EditableImage**, so every icon label showing one went blank
+  while all the properties still read fine. The fix was never "redraw them" — it was assets.
+- **`CreateAssetAsync` says "not available yet"** on this Studio build, so the upload lives on
+  the server. The user's Open Cloud key goes in `~/.vmcp/roblox-api-key` once (the
+  `upload_image` tool's `apiKey` argument writes it), the asset owner is the Studio user or a
+  group id per call.
+- **Big data out of Studio**: a `return` value is truncated by the serializer. The gprx sink
+  (`vmcp.Render({ kind = "gprx", data = base64 }, "name")`) writes any bytes to
+  `~/.vmcp/profiles/name.gprx`, which is how a 70 KB UI capture reached the local renderer while
+  the running server was still an old one.
+- **A running server doesn't have code you just wrote.** VMCP runs via `npx github:…`, so server
+  changes are live after a push *and* a Claude restart. Until then, test server code with
+  `node -e 'import("file:///…/dist/x.js")'` against the built `dist`, and plugin code by
+  reloading the plugin — the two halves can be verified separately.
+- **A key pasted into chat is a key to roll.** Store it, test it, then tell the user to rotate it.
 
 ## Things that bite
 
