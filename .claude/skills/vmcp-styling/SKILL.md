@@ -147,3 +147,23 @@ tint) and misaligned rows on the first run. Not for judging a font.
 
 The PNG comes back only from a server that knows the `ui` job; with an older server the tool
 reports "doesn't know how to finish a ui job" — restart Claude so `npx` pulls the current one.
+
+## Fonts
+
+Never use Arimo Legacy (`LegacyArimo`, or `Enum.Font.Legacy`/`LegacyArial`). Plain `Arimo` is fine.
+Skip the clichés too: `Zekton` (Enum SciFi), `PressStart2P` (Arcade), `Michroma`, `Orbitron`-style
+wide futurism, and the default `SourceSans`/`Gotham`/`BuilderSans` look for anything themed.
+
+Only bundled families load; anything else warns "failed to load" and silently falls back. The full
+set (`rbxasset://fonts/families/<Name>.json`, weights in brackets):
+AccanthisADFStd, AmaticSC, Arimo, Balthazar, Bangers, BuilderExtended [300-800], BuilderMono
+[300/400/700], BuilderSans, ComicNeueAngular, Creepster, DenkOne, Fondamento, FredokaOne,
+GrenzeGotisch, Guru, HighwayGothic, Inconsolata, IndieFlower, JosefinSans, Jura [300-700], Kalam,
+LuckiestGuy, Merriweather, Michroma, Montserrat, Nunito, Oswald, PatrickHand, PermanentMarker,
+PressStart2P, Roboto, RobotoCondensed, RobotoMono, RomanAntique, Sarpanch, SourceSansPro,
+SpecialElite, TitilliumWeb [200-900], Ubuntu, Zekton. Montserrat, BuilderMono and BuilderExtended
+have no `Enum.Font` entry — `Font.new(path, weight)` only.
+
+Pairings that read modern/tech without looking generated: Jura SemiBold + BuilderMono (CyberpunkHUD),
+TitilliumWeb + Inconsolata, BuilderExtended for wide display headers. Condensed → wide swaps
+(Oswald → Jura) grow text ~30%; run a `TextFits` sweep after, not a visual check.
