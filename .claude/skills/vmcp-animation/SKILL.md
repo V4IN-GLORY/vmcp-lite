@@ -52,7 +52,8 @@ render_anim {
   `views` for other angles, `size = 768` when a rough check is enough.
 - `animationId = "rbxassetid://..."` instead of tracks draws an existing animation and prints
   its tracks as editable angles, so "make the walk bouncier" is read, edit, re-render.
-- `save = "ServerStorage.Animations"` also leaves the KeyframeSequence in the place. Right-click
+- `save = "ServerStorage.Animations"` also leaves the KeyframeSequence in the place. The folder
+  has to exist already; the tool won't make one. `ServerStorage` itself works. Right-click
   it in Explorer > Save to Roblox and it becomes a real asset id for the game.
 
 ## What looks wrong in motion but fine on a sheet
@@ -74,6 +75,9 @@ things dominate. Before saving, ask of the motion readout:
 
 ## Working an animation up
 
+0. Unfamiliar rig? One-frame probe first: a single joint at `[30,0,0]`, `views = ["front",
+   "right"]`, `size = 256`. Ten seconds, and it settles which way is forward on this rig before
+   any real key is written. Guessing the axis from a full sheet cost a whole round once.
 1. Blockout: 2-4 keys on the joints that matter most (torso, the working arm). Render.
 2. Read the sheet against the description: is the pose extreme enough, is the timing right,
    does anything clip (arm through torso, weapon through leg -- the top view shows that).
@@ -84,6 +88,29 @@ things dominate. Before saving, ask of the motion readout:
 5. `save` it, play the `id` in Studio via run_luau (Previewing below) if a moving check is wanted.
 
 Keep keys few. Three to five per moving joint says most things; the engine interpolates the rest.
+
+The sheet judges poses and timing. The user judges motion, in the Animation Editor or in game,
+and will catch things the sheet can't (a nod, a drift, a lean). So: hand over the `save`d
+sequence by name, and when they report something wrong ask what they played -- an id from an
+earlier render and the saved sequence can differ.
+
+### A walk cycle, from the four-pose reference
+
+One second, loop, 0.5 per step. Times are the classic contact / down / pass / up beats:
+
+| t     | beat    | leading leg | trailing leg | arms (opposite to legs) |
+|-------|---------|-------------|--------------|-------------------------|
+| 0     | contact | +35         | -35          | ∓35                     |
+| 0.125 | down    | +28         | -25          | (interpolated)          |
+| 0.25  | pass    | 0           | +5           | 0                       |
+| 0.375 | up      | -22         | +25          | (interpolated)          |
+| 0.5   | contact | -35         | +35          | ±35                     |
+
+then the same again with the legs swapped to 1.0. Easing `CubicV2/Out` leaving a contact,
+`CubicV2/In` into the next one, `CubicV2/InOut` between. The left track is the right track with
+every angle negated; write one and mirror it. R6 has no knees, so the lifted passing leg in a
+drawn reference is just the trailing leg going 5 degrees past vertical. Leave the torso and head
+alone (see the checklist) -- the reference's bounce is for a drawn character, not a Humanoid.
 
 ## Easing
 
@@ -197,6 +224,10 @@ Edit the tracks, recompile, preview. The whole loop stays in Studio.
   Studio, then re-render and confirm the new output (the motion readout is a cheap tell) before
   re-saving anything the user will play. Saving with the old plugin after re-authoring for the
   new one is how "make the R6 walk" turned into a floss.
+- Don't infer a sign from a perspective render of a symmetric pose. Two legs at ±35 look the
+  same as two legs at ∓35 from most angles; the motion readout gives the number, and for the
+  world-space result `run_luau` can compose `Part0.CFrame * C0 * T * C1:Inverse()` and dot the
+  UpVector against the root's LookVector -- that is how the lean sign was actually settled.
 - The sheet steps frames along `(1,0,1)`, which reads left-to-right in front, right and the
   anim-specific iso/top presets. `left`, `back` and custom yaws can read right-to-left; the text
   says so when they do. Rows also slide along `(-1,0,1)` so the top view is a grid, so a row's
