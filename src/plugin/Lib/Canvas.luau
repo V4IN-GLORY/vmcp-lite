@@ -142,18 +142,24 @@ local function base64(bytes: buffer): string
 	return buffer.tostring(out)
 end
 
--- The image's real RGBA as base64, or nil when it's over the size the socket is happy carrying.
-function Methods.Pixels(self: any): string?
-	if self.width * self.height * 4 > MAX_PIXEL_BYTES then
+-- Any EditableImage's real RGBA as base64, or nil when it's over the size the socket is happy
+-- carrying or can't be read (Mesh & Image APIs off).
+function Canvas.Base64Pixels(image: EditableImage): string?
+	local size = image.Size
+	if size.X * size.Y * 4 > MAX_PIXEL_BYTES then
 		return nil
 	end
 	local ok, bytes = pcall(function()
-		return self.image:ReadPixelsBuffer(Vector2.zero, Vector2.new(self.width, self.height))
+		return image:ReadPixelsBuffer(Vector2.zero, size)
 	end)
 	if not ok then
 		return nil
 	end
 	return base64(bytes)
+end
+
+function Methods.Pixels(self: any): string?
+	return Canvas.Base64Pixels(self.image)
 end
 
 -- Publishes the image as an Image asset owned by whoever is logged into Studio and remembers the

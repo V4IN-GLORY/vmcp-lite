@@ -760,16 +760,18 @@ local Env = {
 -- Writes a Canvas out as a PNG on the VMCP server, which is the only side with a filesystem.
 -- Works from any context and from inside a timeline event, where returning a directive isn't an
 -- option. `name` becomes the file name; leave it out and it gets a timestamped one.
--- `options.upload` publishes it as an Image asset first (Canvas:Upload), and the reply carries
--- the rbxassetid so scripts can use the picture without EditableImage at runtime.
-function Env.Render(canvas: any, name: string?, options: { upload: boolean? }?): (boolean, string)
+-- `options.upload` publishes it as an Image asset too, and the reply carries the rbxassetid so
+-- scripts can use the picture without EditableImage at runtime. `options.groupId` makes a group
+-- the owner instead of the Studio user. The upload_image tool does the same for a finished PNG.
+function Env.Render(canvas: any, name: string?, options: { upload: boolean?, groupId: number? }?): (boolean, string)
 	local serverUpload = false
 	if options and options.upload then
 		if type(canvas) ~= "table" or not canvas.Upload then
 			return false, "upload needs a Canvas, not a recording"
 		end
-		-- Studio's own upload when it's enabled; otherwise the server does it over Open Cloud.
-		serverUpload = canvas:Upload(name or "vmcp-canvas") == nil
+		-- Studio's own upload when it's enabled and the user owns it; otherwise the server does
+		-- it over Open Cloud.
+		serverUpload = options.groupId ~= nil or canvas:Upload(name or "vmcp-canvas") == nil
 	end
 	local recording = if type(canvas) == "table" and canvas.Recording then canvas:Recording() else canvas
 	if type(recording) ~= "table" then
@@ -778,6 +780,7 @@ function Env.Render(canvas: any, name: string?, options: { upload: boolean? }?):
 	recording.name = name
 	if serverUpload then
 		recording.upload = true
+		recording.groupId = options and options.groupId
 		local ok, userId = pcall(function()
 			return game:GetService("StudioService"):GetUserId()
 		end)
@@ -2879,18 +2882,24 @@ local function base64(bytes: buffer): string
 	return buffer.tostring(out)
 end
 
--- The image's real RGBA as base64, or nil when it's over the size the socket is happy carrying.
-function Methods.Pixels(self: any): string?
-	if self.width * self.height * 4 > MAX_PIXEL_BYTES then
+-- Any EditableImage's real RGBA as base64, or nil when it's over the size the socket is happy
+-- carrying or can't be read (Mesh & Image APIs off).
+function Canvas.Base64Pixels(image: EditableImage): string?
+	local size = image.Size
+	if size.X * size.Y * 4 > MAX_PIXEL_BYTES then
 		return nil
 	end
 	local ok, bytes = pcall(function()
-		return self.image:ReadPixelsBuffer(Vector2.zero, Vector2.new(self.width, self.height))
+		return image:ReadPixelsBuffer(Vector2.zero, size)
 	end)
 	if not ok then
 		return nil
 	end
 	return base64(bytes)
+end
+
+function Methods.Pixels(self: any): string?
+	return Canvas.Base64Pixels(self.image)
 end
 
 -- Publishes the image as an Image asset owned by whoever is logged into Studio and remembers the
@@ -10891,6 +10900,156 @@ function Tool.Run(arguments: { scripts: { { script: string, source: string } }?,
 		table.insert(lines, "(a playtest was already running and was restarted)")
 	end
 	return text(table.concat(lines, "\n"))
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="57">
+        <Properties>
+          <string name="Name">UploadImage</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Publishes a picture as a Roblox Image asset, so a script can use rbxassetid://id at runtime
+-- instead of an EditableImage that only exists in this session. The upload itself happens on
+-- the VMCP server over Open Cloud, because Studio's own CreateAssetAsync isn't enabled
+-- everywhere yet; the plugin's job is to say what to upload and who should own it.
+
+local Path = require(script.Parent.Parent.Path)
+local Canvas = require(script.Parent.Parent.Lib.Canvas)
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+	postProcess: { [string]: any }?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "upload_image",
+	description = "Uploads an image as a Roblox Image asset and returns its rbxassetid, so the "
+		.. "picture can be used at runtime without EditableImage. Give it either `file`, the "
+		.. "name of a PNG vmcp.Render already wrote under ~/.vmcp/images, or `root`, a dotted "
+		.. "path to an ImageLabel/ImageButton showing an EditableImage (or the EditableImage "
+		.. "itself). `owner` is the Studio user by default; pass a group id to upload there. "
+		.. "First-time setup: pass `apiKey` once (an Open Cloud key with the assets read/write "
+		.. "scope for that user or group) and it's remembered in ~/.vmcp/roblox-api-key. "
+		.. "Moderation runs after upload, so the id is usable at once and the picture appears a "
+		.. "little later.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			file = {
+				type = "string",
+				description = "Name of a PNG under ~/.vmcp/images, without the extension -- what you gave vmcp.Render.",
+			},
+			root = {
+				type = "string",
+				description = "Dotted path to an ImageLabel, ImageButton or EditableImage in the place.",
+			},
+			name = {
+				type = "string",
+				description = "Asset display name. Defaults to the file or instance name.",
+			},
+			description = { type = "string", description = "Asset description." },
+			owner = {
+				type = "string",
+				description = '"user" (default: whoever is logged into Studio) or a group id like "12345678".',
+			},
+			apiKey = {
+				type = "string",
+				description = "Open Cloud API key to remember for every later upload. Only needed once.",
+			},
+		},
+	},
+	tags = { title = "Upload Image", external = true },
+	timeoutMs = 90000,
+}
+
+local function studioUserId(): number?
+	local ok, id = pcall(function()
+		return game:GetService("StudioService"):GetUserId()
+	end)
+	return if ok then id else nil
+end
+
+local function fail(text: string): Result
+	return { content = { { type = "text", text = text } }, isError = true }
+end
+
+function Tool.Run(arguments: {
+	file: string?,
+	root: string?,
+	name: string?,
+	description: string?,
+	owner: string?,
+	apiKey: string?,
+}): Result
+	local directive: { [string]: any } = {
+		kind = "upload",
+		apiKey = arguments.apiKey,
+		description = arguments.description,
+	}
+
+	local owner = arguments.owner
+	if owner == nil or owner == "" or owner == "user" then
+		local userId = studioUserId()
+		if not userId then
+			return fail("couldn't read the Studio user; pass owner as a group id instead")
+		end
+		directive.userId = userId
+	else
+		local groupId = tonumber(owner)
+		if not groupId then
+			return fail(`owner must be "user" or a group id, not "{owner}"`)
+		end
+		directive.groupId = groupId
+	end
+
+	if type(arguments.file) == "string" and arguments.file ~= "" then
+		directive.file = arguments.file
+		directive.name = arguments.name or arguments.file
+	elseif type(arguments.root) == "string" and arguments.root ~= "" then
+		local found, problem = Path.Resolve(arguments.root)
+		if not found then
+			return fail(problem :: string)
+		end
+		local image: EditableImage? = nil
+		if found:IsA("EditableImage") then
+			image = found
+		elseif found:IsA("ImageLabel") or found:IsA("ImageButton") then
+			local content = (found :: any):GetStyled("ImageContent") :: Content
+			local object = if content.SourceType == Enum.ContentSourceType.Object then content.Object else nil
+			if object and object:IsA("EditableImage") then
+				image = object
+			end
+		end
+		if not image then
+			return fail(`{found:GetFullName()} isn't an EditableImage or an image label showing one`)
+		end
+		local pixels = Canvas.Base64Pixels(image)
+		if not pixels then
+			return fail(`{found:GetFullName()} is too big to send ({image.Size.X}x{image.Size.Y}); render it with vmcp.Render first and upload the file`)
+		end
+		directive.width = image.Size.X
+		directive.height = image.Size.Y
+		directive.pixels = pixels
+		directive.name = arguments.name or found.Name
+	elseif arguments.apiKey then
+		-- Just storing the key is a fine call on its own.
+		directive.name = nil
+	else
+		return fail("give `file` (a PNG vmcp.Render wrote) or `root` (an image in the place)")
+	end
+
+	local what = if directive.file then `~/.vmcp/images/{directive.file}.png` elseif directive.pixels then arguments.root else "nothing"
+	local who = if directive.groupId then `group {directive.groupId}` else `user {directive.userId}`
+	return {
+		content = { { type = "text", text = `uploading {what} as "{directive.name or "-"}" owned by {who}` } },
+		postProcess = directive,
+	}
 end
 
 return Tool

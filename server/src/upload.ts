@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { config, log } from "./config.js";
 
@@ -19,12 +19,22 @@ export interface UploadRequest {
 	name: string;
 	description?: string;
 	userId?: number;
+	/** Owns the asset instead of the user when set; ROBLOX_GROUP_ID is the standing default. */
+	groupId?: number;
 }
+
+const KEY_PATH = join(config.stateDir, "roblox-api-key");
 
 function apiKey(): string | undefined {
 	if (process.env.ROBLOX_API_KEY) return process.env.ROBLOX_API_KEY.trim();
-	const path = join(config.stateDir, "roblox-api-key");
-	return existsSync(path) ? readFileSync(path, "utf8").trim() : undefined;
+	return existsSync(KEY_PATH) ? readFileSync(KEY_PATH, "utf8").trim() : undefined;
+}
+
+/** Remembers a key for every later upload. */
+export function storeApiKey(key: string): string {
+	mkdirSync(config.stateDir, { recursive: true });
+	writeFileSync(KEY_PATH, key.trim(), { mode: 0o600 });
+	return KEY_PATH;
 }
 
 interface Operation {
@@ -37,11 +47,11 @@ interface Operation {
 /** Returns the new asset id, or throws with the reason. */
 export async function uploadImage(png: Buffer, request: UploadRequest): Promise<number> {
 	const key = apiKey();
-	if (!key) throw new Error("no Open Cloud key: set ROBLOX_API_KEY or write it to ~/.vmcp/roblox-api-key");
+	if (!key) throw new Error("no Open Cloud key: call upload_image with apiKey once, or set ROBLOX_API_KEY");
 
-	const groupId = process.env.ROBLOX_GROUP_ID;
-	const creator = groupId ? { groupId } : request.userId ? { userId: String(request.userId) } : undefined;
-	if (!creator) throw new Error("no creator: the plugin sent no userId and ROBLOX_GROUP_ID is unset");
+	const groupId = request.groupId ?? (process.env.ROBLOX_GROUP_ID ? Number(process.env.ROBLOX_GROUP_ID) : undefined);
+	const creator = groupId ? { groupId: String(groupId) } : request.userId ? { userId: String(request.userId) } : undefined;
+	if (!creator) throw new Error("no owner: the plugin sent no userId and no group id");
 
 	const form = new FormData();
 	form.append(

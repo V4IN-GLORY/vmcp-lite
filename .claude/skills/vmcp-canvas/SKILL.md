@@ -56,20 +56,27 @@ Names are letters, digits, underscore and hyphen only — anything else gets a t
 ## Uploading it as an asset
 
 An `EditableImage` only exists in the session that drew it, so a script that needs the picture at
-runtime wants an asset id. `upload = true` publishes it as an Image asset and puts the id in the
-reply:
+runtime wants an asset id. Two ways to get one:
 
 ```lua
+-- while drawing: render and upload in one go
 local ok, text = vmcp.Render(canvas, "hud-icon", { upload = true })
 -- "[wrote the image to ...hud-icon.png] (uploaded as rbxassetid://123456789)"
-local id = canvas.assetId   -- set when Studio did the upload itself
+
+-- a group should own it
+vmcp.Render(canvas, "hud-icon", { upload = true, groupId = 12345678 })
 ```
 
-Studio's own `AssetService:CreateAssetAsync` is tried first. Where it isn't enabled yet the server
-uploads through Open Cloud instead, which needs an API key with the assets scope in
-`ROBLOX_API_KEY` or `~/.vmcp/roblox-api-key`; the asset belongs to the Studio user, or to
-`ROBLOX_GROUP_ID` when that's set. Moderation runs after upload — the id is real at once, the
-picture shows a little later.
+Or the `upload_image` tool afterwards, for a PNG Render already wrote (`file = "hud-icon"`) or
+an image in the place (`root` = an ImageLabel showing an EditableImage). `owner` is the Studio
+user unless you pass a group id.
+
+**One-time setup**: the upload runs on the VMCP server over Open Cloud, so it needs an API key
+with the assets read/write scope for the owner (Creator Hub → Open Cloud → API keys). Call
+`upload_image` once with `apiKey` and it's kept in `~/.vmcp/roblox-api-key`; `ROBLOX_API_KEY`
+in the environment works too. Studio's own `AssetService:CreateAssetAsync` is tried first where
+Roblox has enabled it. Moderation runs after upload — the id is real at once, the picture shows
+a little later.
 
 ## Limits that come from the engine
 

@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { config, log } from "./config.js";
 import type { ToolResult, ToolResultContent } from "./protocol.js";
@@ -6,7 +6,7 @@ import { encodePng, rasterize, type Recording } from "./image.js";
 import { materialsOf, renderScene, type Scene } from "./scene.js";
 import { loadMaterials } from "./materials.js";
 import { renderUi, type UiScene } from "./ui.js";
-import { uploadImage } from "./upload.js";
+import { storeApiKey, uploadImage } from "./upload.js";
 
 /**
  * The one place the relay acts on a result instead of passing it along.
@@ -60,8 +60,43 @@ interface Outcome {
 }
 
 /** Writes the image and returns a line to append to the tool's own output, plus the bytes. */
+/** Publishes a PNG as a Roblox Image asset: one Render wrote earlier, or pixels sent along. */
+async function uploadDirective(directive: Directive): Promise<Outcome> {
+	let stored = "";
+	if (typeof directive.apiKey === "string" && directive.apiKey.trim() !== "") {
+		stored = `[remembered the API key in ${storeApiKey(directive.apiKey)}] `;
+	}
+	if (typeof directive.name !== "string") {
+		return { text: stored || "[nothing to upload]" };
+	}
+
+	let png: Buffer;
+	if (typeof directive.file === "string") {
+		const path = outputPath({ name: directive.file }, "images", "canvas", "png");
+		if (!existsSync(path)) return { text: `${stored}[no image at ${path} -- render it first]` };
+		png = readFileSync(path);
+	} else if (typeof directive.pixels === "string") {
+		png = encodePng(rasterize(directive as unknown as Recording));
+	} else {
+		return { text: `${stored}[upload needs a file name or pixels]` };
+	}
+
+	try {
+		const id = await uploadImage(png, {
+			name: directive.name,
+			description: typeof directive.description === "string" ? directive.description : undefined,
+			userId: typeof directive.userId === "number" ? directive.userId : undefined,
+			groupId: typeof directive.groupId === "number" ? directive.groupId : undefined,
+		});
+		return { text: `${stored}[uploaded as rbxassetid://${id}]`, png };
+	} catch (err) {
+		return { text: `${stored}[upload failed: ${(err as Error).message}]` };
+	}
+}
+
 async function finish(directive: Directive): Promise<Outcome> {
 	if (directive.kind === "gprx") return writeCapture(directive);
+	if (directive.kind === "upload") return uploadDirective(directive);
 	if (directive.kind !== "png" && directive.kind !== "scene" && directive.kind !== "ui") {
 		return { text: `[vmcp doesn't know how to finish a "${String(directive.kind)}" job]` };
 	}
@@ -86,7 +121,8 @@ async function finish(directive: Directive): Promise<Outcome> {
 			const name = typeof directive.name === "string" ? directive.name : "vmcp-canvas";
 			const userId = typeof directive.userId === "number" ? directive.userId : undefined;
 			try {
-				const id = await uploadImage(png, { name, userId });
+				const groupId = typeof directive.groupId === "number" ? directive.groupId : undefined;
+				const id = await uploadImage(png, { name, userId, groupId });
 				asset = ` (uploaded as rbxassetid://${id})`;
 			} catch (err) {
 				asset = ` (upload failed: ${(err as Error).message})`;
