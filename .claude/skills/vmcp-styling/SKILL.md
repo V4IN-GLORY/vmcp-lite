@@ -39,8 +39,13 @@ Returns nil when the selector parsed.
 returning what the instance holds while the rule renders fine, and a rule that seems to do
 nothing was usually working all along. `instance:GetStyled("BackgroundColor3")` is the read that
 sees rules; `vmcp.Style.Read(instance, { "BackgroundColor3", "TextSize" })` does several at
-once. Only computed properties like `AbsoluteSize` reflect styling on their own. A value set
-directly on the instance still wins over a rule.
+once. Only computed properties like `AbsoluteSize` reflect styling on their own.
+
+**A value set directly on the instance wins over a rule — unless it equals the class default.**
+`label.TextXAlignment = Center` is the default, so the engine treats it as unset and a
+`TextLabel { TextXAlignment = Left }` rule takes it. Anything you need at its default against a
+class rule wants its own rule, and `TextLabel.Center` (class + tag) outranks the bare class one;
+`StyleRule.Priority` is the tiebreaker after that.
 
 To look at the result rather than probe it, the `screenshot_ui` tool draws a ScreenGui as a PNG
 from styled values — see below.
