@@ -68,6 +68,9 @@ things dominate. Before saving, ask of the motion readout:
 - Do the small joints stay still? In a cycle, head and hands either hold one value or do
   nothing. A 3..6 degree nod on a walk is nervous wobble, not life; leave the head out.
 - Do both halves of a cycle mirror? Left/right ranges should match to the degree.
+- On a Humanoid rig, leave the root part's `y` at 0 in a locomotion cycle. The root joint moves
+  the torso, not HumanoidRootPart, so a bob doesn't change collision -- it just pushes the feet
+  through the floor on the down and floats them on the up. Sell weight with the limbs instead.
 
 ## Working an animation up
 
