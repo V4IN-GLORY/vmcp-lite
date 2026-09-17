@@ -21,7 +21,7 @@ export type Key = {
 	time: number,
 	-- Degrees, XYZ. Shorthand for the common case; `cframe` wins if both are given.
 	angles: { number }?,
-	cframe: CFrame?,
+	cframe: (CFrame | { number })?,
 	-- "Cubic/Out", "Quad/InOut", "Linear". Applies from this key toward the next.
 	easing: string?,
 	weight: number?,
@@ -37,8 +37,13 @@ export type Compiled = {
 }
 
 local function cframeOf(key: Key): CFrame
-	if key.cframe then
-		return key.cframe
+	local cframe = key.cframe
+	if typeof(cframe) == "CFrame" then
+		return cframe
+	end
+	-- Over JSON a CFrame arrives as its 12 components.
+	if type(cframe) == "table" and #cframe == 12 then
+		return CFrame.new(table.unpack(cframe))
 	end
 	local angles = key.angles or { 0, 0, 0 }
 	return CFrame.Angles(math.rad(angles[1] or 0), math.rad(angles[2] or 0), math.rad(angles[3] or 0))
@@ -54,7 +59,7 @@ end
 -- The value of one joint at an arbitrary time. Before the first key it holds the first value,
 -- after the last it holds the last, and between two it lerps -- so a joint keyed only at the ends
 -- still has a sensible pose in every keyframe the other joints introduced.
-local function sample(keys: { Key }, at: number): CFrame
+function Anim.Sample(keys: { Key }, at: number): CFrame
 	if #keys == 0 then
 		return CFrame.identity
 	end
@@ -149,7 +154,7 @@ function Anim.Compile(
 
 		local pose = Rig.PoseTree(rig, function(joint: string): CFrame?
 			local keys = tracks[joint]
-			return if keys then sample(keys, at) else nil
+			return if keys then Anim.Sample(keys, at) else nil
 		end)
 
 		-- Easing and weight are per-pose and only meaningful where the author actually put a key.

@@ -380,8 +380,9 @@ end
 
 export type Geometry = { { [string]: any } }
 
-local function describe(part: BasePart, index: number): { [string]: any }
-	local components = { part.CFrame:GetComponents() }
+-- `cframe` overrides where the part is drawn, for posing a rig without moving it.
+function Build.Describe(part: BasePart, index: number, cframe: CFrame?): { [string]: any }
+	local components = { (cframe or part.CFrame):GetComponents() }
 	for at, value in components do
 		components[at] = round(value)
 	end
@@ -415,7 +416,7 @@ function Build.Geometry(root: Instance, maxParts: number?): (Geometry, { BasePar
 			return
 		end
 		table.insert(found, part)
-		table.insert(parts, describe(part, #found))
+		table.insert(parts, Build.Describe(part, #found))
 	end
 
 	if root:IsA("BasePart") then

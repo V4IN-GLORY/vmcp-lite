@@ -1,9 +1,41 @@
 ---
 name: vmcp-animation
-description: Building Roblox animations as code with VMCP's Rig and Anim library — per-joint tracks compiled to KeyframeSequences, previewed with no upload, and read back from existing animations. Use when asked to make, edit or inspect an animation.
+description: Building Roblox animations with VMCP — the render_anim tool takes per-joint tracks, draws the rig posed at each keyframe as a filmstrip and returns a playable id with no upload, plus the Rig and Anim library underneath it and reading existing animations back as tracks. Use when asked to make, edit or inspect an animation.
 ---
 
 # Animation as code
+
+## The loop: `render_anim`
+
+One tool call writes the animation, draws it and hands back a playable id. Send tracks, get a
+filmstrip: the rig posed at every keyframe, left to right, front and right views. Look, fix the
+numbers, send again. No Luau snippet, no playtest, nothing uploaded.
+
+```
+render_anim {
+  tracks = {
+    RightUpperArm = [ { time = 0, angles = [0,0,0] }, { time = 0.25, angles = [0,0,-110], easing = "Cubic/Out" }, { time = 0.6, angles = [0,0,15] } ],
+    RightLowerArm = [ { time = 0.25, angles = [-20,0,0] }, { time = 0.6, angles = [0,0,0] } ]
+  }
+}
+-> Workspace.VMCPRig: 3 frame(s) left to right: t=0  t=0.25  t=0.6
+   id = rbxasset://...  length = 0.6  joints = RightUpperArm, RightLowerArm
+   [picture]
+```
+
+- No `rig` given: it spawns `Workspace.VMCPRig`, an R15 dummy in classic colours (yellow head
+  and arms, blue torso, green legs) and reuses it. Pass `rig = "Workspace.Enemy"` for anything else.
+- `times = [0, 0.1, 0.2, ...]` to sample between keys and check the in-betweens; `views` for
+  other angles; `size` down to 384 when a quick check is enough.
+- `animationId = "rbxassetid://..."` instead of tracks draws an existing animation and prints
+  its tracks as editable angles, so "make the walk bouncier" is read, edit, re-render.
+- Keep the key count small. Three to five keys per moving joint says most things; the engine
+  interpolates the rest. More frames cost more picture and rarely more information.
+
+Play the id back with `run_luau` when it looks right (see Previewing). Everything below is the
+library the tool is built on, for when you need it from a snippet.
+
+## Library
 
 Reached from a `run_luau` snippet through `vmcp.Rig` and `vmcp.Anim`. Nothing is uploaded: the
 compiler registers a temporary id you can play immediately.
@@ -61,6 +93,8 @@ A misspelled joint name is an error naming the joint and listing the rig, not an
 quietly does nothing.
 
 ## Previewing
+
+`render_anim` already gives you the `id`; this plays it on the rig.
 
 ```lua
 local animation = Instance.new("Animation")
