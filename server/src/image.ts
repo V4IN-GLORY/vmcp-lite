@@ -64,14 +64,21 @@ function num(op: DrawOp, key: string): number {
 	return typeof op[key] === "number" ? (op[key] as number) : 0;
 }
 
+/** How much of the pixel at `column,row` lies within `radius` of the point, 0..1, one pixel of feather. */
+function coverage(distance: number, radius: number): number {
+	return Math.min(Math.max(radius + 0.5 - distance, 0), 1);
+}
+
 function fillRect(surface: Surface, x: number, y: number, w: number, h: number, op: DrawOp): void {
 	const [r, g, b] = colorOf(op);
 	const alpha = alphaOf(op);
-	const left = Math.round(x);
-	const top = Math.round(y);
-	for (let row = top; row < top + Math.round(h); row++) {
-		for (let column = left; column < left + Math.round(w); column++) {
-			surface.blend(column, row, r, g, b, alpha);
+	const right = x + w;
+	const bottom = y + h;
+	for (let row = Math.floor(y); row < Math.ceil(bottom); row++) {
+		const rowCover = Math.min(row + 1, bottom) - Math.max(row, y);
+		for (let column = Math.floor(x); column < Math.ceil(right); column++) {
+			const columnCover = Math.min(column + 1, right) - Math.max(column, x);
+			surface.blend(column, row, r, g, b, alpha * rowCover * columnCover);
 		}
 	}
 }
@@ -79,29 +86,35 @@ function fillRect(surface: Surface, x: number, y: number, w: number, h: number, 
 function fillDisc(surface: Surface, cx: number, cy: number, radius: number, op: DrawOp): void {
 	const [r, g, b] = colorOf(op);
 	const alpha = alphaOf(op);
-	const limit = radius * radius;
-	for (let row = Math.floor(cy - radius); row <= Math.ceil(cy + radius); row++) {
-		for (let column = Math.floor(cx - radius); column <= Math.ceil(cx + radius); column++) {
-			const dx = column - cx;
-			const dy = row - cy;
-			if (dx * dx + dy * dy <= limit) surface.blend(column, row, r, g, b, alpha);
+	for (let row = Math.floor(cy - radius - 1); row <= Math.ceil(cy + radius + 1); row++) {
+		for (let column = Math.floor(cx - radius - 1); column <= Math.ceil(cx + radius + 1); column++) {
+			const cover = coverage(Math.hypot(column + 0.5 - cx, row + 0.5 - cy), radius);
+			if (cover > 0) surface.blend(column, row, r, g, b, alpha * cover);
 		}
 	}
 }
 
-/** Stamps a disc along the line. Crude, but it matches what a thick line looks like in Studio. */
+/** A capsule: every pixel within thickness/2 of the segment, feathered at the edge. */
 function strokeLine(surface: Surface, op: DrawOp): void {
+	const [r, g, b] = colorOf(op);
+	const alpha = alphaOf(op);
 	const x1 = num(op, "x1");
 	const y1 = num(op, "y1");
 	const x2 = num(op, "x2");
 	const y2 = num(op, "y2");
-	const thickness = Math.max(num(op, "thickness") || 1, 1);
-	const span = Math.hypot(x2 - x1, y2 - y1);
-	const steps = Math.max(Math.ceil(span * 2), 1);
+	const radius = Math.max(num(op, "thickness") || 1, 1) / 2;
+	const dx = x2 - x1;
+	const dy = y2 - y1;
+	const lengthSquared = dx * dx + dy * dy || 1;
 
-	for (let step = 0; step <= steps; step++) {
-		const t = step / steps;
-		fillDisc(surface, x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, thickness / 2, op);
+	for (let row = Math.floor(Math.min(y1, y2) - radius - 1); row <= Math.ceil(Math.max(y1, y2) + radius + 1); row++) {
+		for (let column = Math.floor(Math.min(x1, x2) - radius - 1); column <= Math.ceil(Math.max(x1, x2) + radius + 1); column++) {
+			const px = column + 0.5;
+			const py = row + 0.5;
+			const t = Math.min(Math.max(((px - x1) * dx + (py - y1) * dy) / lengthSquared, 0), 1);
+			const cover = coverage(Math.hypot(px - (x1 + dx * t), py - (y1 + dy * t)), radius);
+			if (cover > 0) surface.blend(column, row, r, g, b, alpha * cover);
+		}
 	}
 }
 

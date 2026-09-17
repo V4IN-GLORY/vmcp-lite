@@ -22,6 +22,7 @@ local MAX_SIZE = 1024
 local MAX_PIXEL_BYTES = 512 * 512 * 4
 
 local BLEND = Enum.ImageCombineType.AlphaBlend
+local SMOOTH = Enum.AntiAliasing.Enabled
 
 local Canvas = {}
 
@@ -72,7 +73,7 @@ function Methods.Rect(self: any, x: number, y: number, w: number, h: number, col
 end
 
 function Methods.Circle(self: any, x: number, y: number, radius: number, color: Color3, alpha: number?): any
-	self.image:DrawCircle(Vector2.new(x, y), radius, color, 1 - (alpha or 1), BLEND)
+	self.image:DrawCircle(Vector2.new(x, y), radius, color, 1 - (alpha or 1), BLEND, SMOOTH)
 	return record(self, { kind = "circle", x = x, y = y, r = radius, color = rgb(color), alpha = alpha or 1 })
 end
 
@@ -91,7 +92,8 @@ function Methods.Line(self: any, x1: number, y1: number, x2: number, y2: number,
 			Vector2.new(math.clamp(x2 + nx * offset, 0, maxX), math.clamp(y2 + ny * offset, 0, maxY)),
 			color,
 			0,
-			BLEND
+			BLEND,
+			SMOOTH
 		)
 	end
 	return record(self, { kind = "line", x1 = x1, y1 = y1, x2 = x2, y2 = y2, color = rgb(color), thickness = width })

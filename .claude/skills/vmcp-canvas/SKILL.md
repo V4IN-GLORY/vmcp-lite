@@ -82,6 +82,14 @@ a little later.
 
 - **1024x1024 maximum**, and an `EditableImage` **cannot be resized**. A bigger one means a new
   image plus `DrawImageTransformed`.
+- **Anything that ends up as an asset should be drawn at 1024x1024** and shown in a smaller
+  label. Roblox scales GUI by device pixel ratio, so a 64px icon drawn at 64px is a 2-3x upscale
+  on most screens and looks pixelled; downscaling is smooth. `Circle` and `Line` are
+  anti-aliased on both the Studio side and the PNG side, `Rect` edges are pixel-exact, so a
+  1024 draw is clean at any display size.
+- At 1024 the pixel copy is skipped (over the socket budget) and the server **replays the
+  recording** into the PNG, so anything drawn straight on `canvas.image` won't reach the asset
+  at that size — use the four recorded operations.
 - **Only one EditableImage refreshes per frame** on the display side, so a wall of live previews
   updates one at a time.
 - Studio and plugins get unlimited editable-image memory; only clients are budgeted.
@@ -98,8 +106,9 @@ the endpoints clamped inside the image because `DrawLine` refuses a point outsid
 ## Icons for a UI, start to finish
 
 1. Put the drawing in a ModuleScript under the ScreenGui (`Icons.draw[name] = function(c) ... end`),
-   so the art is source, not a one-off snippet. Draw white; tint with `ImageColor3` (a StyleRule
-   can do that per tag).
+   so the art is source, not a one-off snippet. Draw white on a 1024x1024 canvas, in canvas
+   units (write the shapes against `c.width`, not fixed pixels); tint with `ImageColor3` (a
+   StyleRule can do that per tag).
 2. Generator: `vmcp.Canvas.new` → draw → `vmcp.Render(canvas, "hud-" .. name, { upload = true })`
    once per icon; keep the ids in a table in the generator and set `ImageLabel.Image =
    "rbxassetid://id"`. Only upload an icon that has no id yet, or every rerun makes another asset.
