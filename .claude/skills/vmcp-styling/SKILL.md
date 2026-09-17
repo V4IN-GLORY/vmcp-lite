@@ -167,3 +167,24 @@ have no `Enum.Font` entry — `Font.new(path, weight)` only.
 Pairings that read modern/tech without looking generated: Jura SemiBold + BuilderMono (CyberpunkHUD),
 TitilliumWeb + Inconsolata, BuilderExtended for wide display headers. Condensed → wide swaps
 (Oswald → Jura) grow text ~30%; run a `TextFits` sweep after, not a visual check.
+
+## Alignment
+
+Screenshots can't judge alignment — the bitmap font has its own cap height. Check it with numbers:
+one snippet that prints `AbsolutePosition.Y + AbsoluteSize.Y / 2` for every text label, icon and
+bar in a row/bar, and make the centers equal. Things that have gone wrong on the CyberpunkHUD:
+
+- **Siblings in one bar laid out from different top offsets.** Level/StreetCred at y=12, Nav at
+  y=14 in a 40-tall frame, Resources at y=16 in a 36-tall frame — three different centers in one
+  bar. Pick the bar's centerline once and derive every child's Y from it.
+- **Different TextSizes with `TextYAlignment = Center` don't share a baseline.** A 16px name
+  and a 12px "LEVEL 6" centered on the same Y put the small one visibly higher. Nudge the smaller
+  label down ~2px (or align both Bottom) so baselines match.
+- **A text stack next to a big icon.** Name at 12 / caption at 36 / pips at 90 in a 120-tall card
+  has its group center at 55 while the hex sits at 60. Center the group (first top = last bottom
+  margin), not each piece.
+- **An underline/XP bar under a caption should sit on the same line as the nav tab underline**
+  when both are in the same bar.
+
+Anything that looked right in Oswald needs this re-check after a font swap: wider glyphs move
+`TextBounds`, not positions, so the frames still "line up" while the ink doesn't.
