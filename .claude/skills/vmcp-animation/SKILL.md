@@ -69,6 +69,11 @@ things dominate. Before saving, ask of the motion readout:
 - Do the small joints stay still? In a cycle, head and hands either hold one value or do
   nothing. A 3..6 degree nod on a walk is nervous wobble, not life; leave the head out.
 - Do both halves of a cycle mirror? Left/right ranges should match to the degree.
+- Never move the character with the animation. No `z` (or `x`) travel on the root-driven part
+  for a charge, dash, lunge or knockback -- the animation poses the body in place and the game
+  moves the character with velocity/forces. Baked travel fights the real movement (stutter,
+  double-speed, feet sliding) and desyncs from the server's position. A held charge pose that
+  goes nowhere is correct; the world moves past it.
 - On a Humanoid rig, leave the root part's `y` at 0 in a locomotion cycle. The root joint moves
   the torso, not HumanoidRootPart, so a bob doesn't change collision -- it just pushes the feet
   through the floor on the down and floats them on the up. Sell weight with the limbs instead.
