@@ -137,6 +137,16 @@ Why not EditableImage everywhere:
   changes are live after a push *and* a Claude restart. Until then, test server code with
   `node -e 'import("file:///…/dist/x.js")'` against the built `dist`, and plugin code by
   reloading the plugin — the two halves can be verified separately.
+- **The icon was fine; the number next to it wasn't.** "The attribute numbers are off from the
+  hex" turned out to be a styling problem (a rule value equal to the class default never reached
+  the client — see the styling skill), not a drawing one. When an icon "looks off", inspect the
+  label sitting next to it before redrawing anything: `inspect_style` on the text label, in
+  `context = "client"`, is one call.
+- **A new plugin tool is a file.** Drop a ModuleScript with `Definition` + `Run` in
+  `src/plugin/Tools`, `rojo build plugin.project.json -o %LOCALAPPDATA%/Roblox/Plugins/VMCP.rbxmx`,
+  re-add the plugin, and the server lists it on the next connect; nothing in TypeScript changes.
+  Run `luau-lsp analyze --defs=globalTypes.d.luau --sourcemap=sourcemap.json <file>` first —
+  the plugin loads a tool with a type error just fine and you find out at call time.
 - **A key pasted into chat is a key to roll.** Store it, test it, then tell the user to rotate it.
 
 ## Things that bite

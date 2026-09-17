@@ -1,6 +1,6 @@
 ---
 name: vmcp-styling
-description: Roblox UI stylesheets with VMCP — StyleSheet, StyleRule, selectors, tokens and themes, the Style helper that catches the failures the engine hides, GetStyled, and the screenshot_ui tool for looking at the result. Use when building or debugging UI styling.
+description: Roblox UI stylesheets with VMCP — StyleSheet, StyleRule, selectors, tokens and themes, the Style helper that catches the failures the engine hides, GetStyled, the inspect_style tool that explains why a rule did nothing, and screenshot_ui for looking at the result. Use when building or debugging UI styling.
 ---
 
 # Stylesheets
@@ -94,7 +94,14 @@ rules. This is the mechanism behind "I fixed it and it broke again".
 
 ## Debugging a rule that does nothing
 
-In this order, each is one snippet:
+`inspect_style` (root = dotted path, properties = names, context plugin/client) does the whole
+checklist below in one call: tags and class, then per property the direct value, the styled
+value, the class default, a verdict on which one is winning, and every rule in the linked
+sheets (following StyleDerive) that sets it, with priority, stored value and SelectorError.
+Rules storing a class-default value are flagged. Run it with `context = "client"` when the edit
+view and the playtest disagree — that's the case it was written for.
+
+By hand, in this order, each is one snippet:
 
 1. `rule.SelectorError` — did it parse.
 2. `target:GetTags()` / `target.Name` — does the selector actually name it (tag vs name).
@@ -104,6 +111,18 @@ In this order, each is one snippet:
    `Rotation = 5`, read `GetStyled("Rotation")`. Applies → the selector matches and it's a
    precedence fight (specificity, Priority, direct value). Doesn't → the selector.
 5. `screenshot_ui` to see the whole thing rather than one property.
+
+## Play mode is not the edit view
+
+A fixed-pixel design stage under a `UIScale` lands on a fractional origin when it's anchor-centred
+(x = 265.94 on a 2299-wide viewport at scale 1.104), and every label and 1px bar then snaps to a
+different half-pixel than its neighbour. Set the scale in 1/20 steps and position the stage with
+`UDim2.fromOffset(floor(...))` instead of `AnchorPoint = 0.5`. Children still end on fractions
+(17 × 1.1 = 18.7) — that's inherent to a non-integer `UIScale`, so text is always a touch softer
+in play than at 1:1; only the origin is yours to fix.
+
+`GetStyled` can read a frame behind a change you just made to a rule. `task.wait()` before the
+read when you're probing.
 
 ## Editing a live sheet vs regenerating
 
