@@ -22,7 +22,7 @@ export type Key = {
 	-- Degrees, XYZ. Shorthand for the common case; `cframe` wins if both are given.
 	angles: { number }?,
 	cframe: (CFrame | { number })?,
-	-- "Cubic/Out", "Quad/InOut", "Linear". Applies from this key toward the next.
+	-- "CubicV2/InOut", "Bounce/Out", "Elastic/In", "Constant", "Linear". Applies from this key toward the next.
 	easing: string?,
 	weight: number?,
 }
@@ -49,11 +49,13 @@ local function cframeOf(key: Key): CFrame
 	return CFrame.Angles(math.rad(angles[1] or 0), math.rad(angles[2] or 0), math.rad(angles[3] or 0))
 end
 
-local function easingOf(key: Key): (Enum.PoseEasingStyle, Enum.PoseEasingDirection)
+-- nil for anything that isn't a real PoseEasingStyle, so "Quad" is an error, not a silent Linear.
+local function easingOf(key: Key): (Enum.PoseEasingStyle?, Enum.PoseEasingDirection?)
 	local style, direction = string.match(key.easing or "Linear", "^(%a+)/?(%a*)$")
-	local resolved = (Enum.PoseEasingStyle :: any)[style or "Linear"] or Enum.PoseEasingStyle.Linear
-	local towards = (Enum.PoseEasingDirection :: any)[direction ~= "" and direction or "Out"]
-	return resolved, towards or Enum.PoseEasingDirection.Out
+	local resolved = (Enum.PoseEasingStyle :: any)[style or "Linear"]
+	-- In is the engine's default direction, and in Pose terms means slow start, fast finish.
+	local towards = (Enum.PoseEasingDirection :: any)[direction ~= "" and direction or "In"]
+	return resolved, towards
 end
 
 -- The value of one joint at an arbitrary time. Before the first key it holds the first value,
@@ -109,6 +111,11 @@ local function validate(rig: Rig.Rig, tracks: Tracks): ({ number }, { string }, 
 			if type(key.time) ~= "number" or key.time < 0 then
 				return {}, {}, `a key on "{joint}" has no usable time`
 			end
+			if key.easing and not easingOf(key) then
+				return {},
+					{},
+					`"{key.easing}" isn't an easing; use Linear, Constant, CubicV2, Cubic, Elastic or Bounce, optionally /In /Out /InOut`
+			end
 			if not table.find(times, key.time) then
 				table.insert(times, key.time)
 			end
@@ -122,26 +129,24 @@ local function validate(rig: Rig.Rig, tracks: Tracks): ({ number }, { string }, 
 	return times, touched, nil
 end
 
--- Returns a temporary hash id usable straight away as Animation.AnimationId. Studio only, and
--- nothing is uploaded -- which is what makes previewing an animation a one-call loop.
-function Anim.Compile(
-	model: Instance,
-	tracks: Tracks,
-	options: { priority: string?, loop: boolean? }?
-): (Compiled?, string?)
+export type Options = { priority: string?, loop: boolean? }
+
+-- The KeyframeSequence itself, parented nowhere. Put it in the place to publish it from Studio
+-- (right-click > Save to Roblox); Compile registers it for preview instead.
+function Anim.Sequence(model: Instance, tracks: Tracks, options: Options?): (KeyframeSequence?, Compiled?, string?)
 	local rig, problem = Rig.Build(model)
 	if not rig then
-		return nil, problem
+		return nil, nil, problem
 	end
 
 	local times, joints, bad = validate(rig, tracks)
 	if bad then
-		return nil, bad
+		return nil, nil, bad
 	end
 
 	local sequence = Instance.new("KeyframeSequence")
 	sequence.Name = model.Name
-	local settings = options or ({} :: { priority: string?, loop: boolean? })
+	local settings = options or ({} :: Options)
 	sequence.Loop = settings.loop ~= false
 	local priority = (Enum.AnimationPriority :: any)[settings.priority or "Action"]
 	if priority then
@@ -162,7 +167,10 @@ function Anim.Compile(
 			local keys = tracks[descendant.Name]
 			local key = if keys then keyAt(keys, at) else nil
 			if key and descendant:IsA("Pose") then
-				descendant.EasingStyle, descendant.EasingDirection = easingOf(key)
+				local style, direction = easingOf(key)
+				if style and direction then
+					descendant.EasingStyle, descendant.EasingDirection = style, direction
+				end
 				if key.weight then
 					descendant.Weight = key.weight
 				end
@@ -175,16 +183,33 @@ function Anim.Compile(
 
 	-- KeyframeSequence.Length reads 0 until the sequence is loaded, so the length is the last
 	-- keyframe time and nothing else.
-	local length = times[#times]
+	return sequence, { id = "", length = times[#times], joints = joints, keyframes = #times }, nil
+end
+
+-- Returns a temporary hash id usable straight away as Animation.AnimationId. Studio only, and
+-- nothing is uploaded -- which is what makes previewing an animation a one-call loop.
+function Anim.Register(sequence: KeyframeSequence): (string?, string?)
 	local ok, id = pcall(function()
 		return KeyframeSequenceProvider:RegisterKeyframeSequence(sequence)
 	end)
-	sequence:Destroy()
 	if not ok then
 		return nil, `couldn't register the sequence: {id}`
 	end
+	return id, nil
+end
 
-	return { id = id, length = length, joints = joints, keyframes = #times }, nil
+function Anim.Compile(model: Instance, tracks: Tracks, options: Options?): (Compiled?, string?)
+	local sequence, built, problem = Anim.Sequence(model, tracks, options)
+	if not sequence or not built then
+		return nil, problem
+	end
+	local id, bad = Anim.Register(sequence)
+	sequence:Destroy()
+	if not id then
+		return nil, bad
+	end
+	built.id = id
+	return built, nil
 end
 
 -- The other direction, so an uploaded animation can be pulled down with

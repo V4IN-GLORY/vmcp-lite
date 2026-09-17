@@ -1508,7 +1508,7 @@ export type Key = {
 	-- Degrees, XYZ. Shorthand for the common case; `cframe` wins if both are given.
 	angles: { number }?,
 	cframe: (CFrame | { number })?,
-	-- "Cubic/Out", "Quad/InOut", "Linear". Applies from this key toward the next.
+	-- "CubicV2/InOut", "Bounce/Out", "Elastic/In", "Constant", "Linear". Applies from this key toward the next.
 	easing: string?,
 	weight: number?,
 }
@@ -1535,11 +1535,13 @@ local function cframeOf(key: Key): CFrame
 	return CFrame.Angles(math.rad(angles[1] or 0), math.rad(angles[2] or 0), math.rad(angles[3] or 0))
 end
 
-local function easingOf(key: Key): (Enum.PoseEasingStyle, Enum.PoseEasingDirection)
+-- nil for anything that isn't a real PoseEasingStyle, so "Quad" is an error, not a silent Linear.
+local function easingOf(key: Key): (Enum.PoseEasingStyle?, Enum.PoseEasingDirection?)
 	local style, direction = string.match(key.easing or "Linear", "^(%a+)/?(%a*)$")
-	local resolved = (Enum.PoseEasingStyle :: any)[style or "Linear"] or Enum.PoseEasingStyle.Linear
-	local towards = (Enum.PoseEasingDirection :: any)[direction ~= "" and direction or "Out"]
-	return resolved, towards or Enum.PoseEasingDirection.Out
+	local resolved = (Enum.PoseEasingStyle :: any)[style or "Linear"]
+	-- In is the engine's default direction, and in Pose terms means slow start, fast finish.
+	local towards = (Enum.PoseEasingDirection :: any)[direction ~= "" and direction or "In"]
+	return resolved, towards
 end
 
 -- The value of one joint at an arbitrary time. Before the first key it holds the first value,
@@ -1595,6 +1597,11 @@ local function validate(rig: Rig.Rig, tracks: Tracks): ({ number }, { string }, 
 			if type(key.time) ~= "number" or key.time < 0 then
 				return {}, {}, `a key on "{joint}" has no usable time`
 			end
+			if key.easing and not easingOf(key) then
+				return {},
+					{},
+					`"{key.easing}" isn't an easing; use Linear, Constant, CubicV2, Cubic, Elastic or Bounce, optionally /In /Out /InOut`
+			end
 			if not table.find(times, key.time) then
 				table.insert(times, key.time)
 			end
@@ -1608,26 +1615,24 @@ local function validate(rig: Rig.Rig, tracks: Tracks): ({ number }, { string }, 
 	return times, touched, nil
 end
 
--- Returns a temporary hash id usable straight away as Animation.AnimationId. Studio only, and
--- nothing is uploaded -- which is what makes previewing an animation a one-call loop.
-function Anim.Compile(
-	model: Instance,
-	tracks: Tracks,
-	options: { priority: string?, loop: boolean? }?
-): (Compiled?, string?)
+export type Options = { priority: string?, loop: boolean? }
+
+-- The KeyframeSequence itself, parented nowhere. Put it in the place to publish it from Studio
+-- (right-click > Save to Roblox); Compile registers it for preview instead.
+function Anim.Sequence(model: Instance, tracks: Tracks, options: Options?): (KeyframeSequence?, Compiled?, string?)
 	local rig, problem = Rig.Build(model)
 	if not rig then
-		return nil, problem
+		return nil, nil, problem
 	end
 
 	local times, joints, bad = validate(rig, tracks)
 	if bad then
-		return nil, bad
+		return nil, nil, bad
 	end
 
 	local sequence = Instance.new("KeyframeSequence")
 	sequence.Name = model.Name
-	local settings = options or ({} :: { priority: string?, loop: boolean? })
+	local settings = options or ({} :: Options)
 	sequence.Loop = settings.loop ~= false
 	local priority = (Enum.AnimationPriority :: any)[settings.priority or "Action"]
 	if priority then
@@ -1648,7 +1653,10 @@ function Anim.Compile(
 			local keys = tracks[descendant.Name]
 			local key = if keys then keyAt(keys, at) else nil
 			if key and descendant:IsA("Pose") then
-				descendant.EasingStyle, descendant.EasingDirection = easingOf(key)
+				local style, direction = easingOf(key)
+				if style and direction then
+					descendant.EasingStyle, descendant.EasingDirection = style, direction
+				end
 				if key.weight then
 					descendant.Weight = key.weight
 				end
@@ -1661,16 +1669,33 @@ function Anim.Compile(
 
 	-- KeyframeSequence.Length reads 0 until the sequence is loaded, so the length is the last
 	-- keyframe time and nothing else.
-	local length = times[#times]
+	return sequence, { id = "", length = times[#times], joints = joints, keyframes = #times }, nil
+end
+
+-- Returns a temporary hash id usable straight away as Animation.AnimationId. Studio only, and
+-- nothing is uploaded -- which is what makes previewing an animation a one-call loop.
+function Anim.Register(sequence: KeyframeSequence): (string?, string?)
 	local ok, id = pcall(function()
 		return KeyframeSequenceProvider:RegisterKeyframeSequence(sequence)
 	end)
-	sequence:Destroy()
 	if not ok then
 		return nil, `couldn't register the sequence: {id}`
 	end
+	return id, nil
+end
 
-	return { id = id, length = length, joints = joints, keyframes = #times }, nil
+function Anim.Compile(model: Instance, tracks: Tracks, options: Options?): (Compiled?, string?)
+	local sequence, built, problem = Anim.Sequence(model, tracks, options)
+	if not sequence or not built then
+		return nil, problem
+	end
+	local id, bad = Anim.Register(sequence)
+	sequence:Destroy()
+	if not id then
+		return nil, bad
+	end
+	built.id = id
+	return built, nil
 end
 
 -- The other direction, so an uploaded animation can be pulled down with
@@ -9561,8 +9586,8 @@ local Build = require(script.Parent.Parent.Lib.Build)
 local Rig = require(script.Parent.Parent.Lib.Rig)
 local Path = require(script.Parent.Parent.Path)
 
-local MAX_FRAMES = 12
-local DUMMY_NAME = "VMCPRig"
+local MAX_FRAMES = 16
+local DUMMY_PREFIX = "VMCPRig"
 
 type Result = {
 	content: { { type: "text", text: string } },
@@ -9574,19 +9599,23 @@ local Tool = {}
 
 Tool.Definition = {
 	name = "render_anim",
-	description = "Draws an animation as a filmstrip: the rig posed at each keyframe, left to right, "
-		.. "one panel per view, rendered by the VMCP server with no playtest. Takes the same per-joint "
-		.. "tracks vmcp.Anim.Compile takes, compiles them too, and returns a temporary animation id "
-		.. "you can play straight away. Nothing in the place moves; the poses are computed from the "
-		.. "rig's Motor6Ds. With no rig given it spawns a classic-coloured R15 dummy at "
-		.. `Workspace.{DUMMY_NAME} and reuses it after that.`,
+	description = "Draws an animation as a contact sheet: the rig posed at each keyframe, laid out in "
+		.. "reading order, one panel per view (four views in a 2x2 grid by default, so one 4k image "
+		.. "shows the whole thing). Takes the same per-joint tracks vmcp.Anim.Compile takes, compiles "
+		.. "them, and returns a temporary animation id you can play straight away. Nothing in the place "
+		.. "moves; poses are computed from the rig's Motor6Ds, and anything welded to the rig (a held "
+		.. "tool, accessories) comes along. With no rig given it spawns a classic-coloured R15 or R6 "
+		.. `dummy at Workspace.{DUMMY_PREFIX}R15 / R6 and reuses it. Works on any Motor6D rig.`,
 	inputSchema = {
 		type = "object",
 		properties = {
 			tracks = {
 				type = "object",
-				description = 'Joint name -> keys. A key is { time, angles = [x, y, z] degrees, easing = "Cubic/Out" } '
-					.. "or { time, cframe = [12 CFrame components] }. Easing sits on the key it leaves from.",
+				description = "Joint name -> keys. A key is { time, angles = [x, y, z] degrees, easing } or "
+					.. '{ time, cframe = [12 CFrame components], easing }. easing is "Style/Direction": '
+					.. "CubicV2, Bounce, Elastic, Constant, Linear with In, Out, InOut; it sits on the key it "
+					.. "leaves from. Rig joint names: R15 UpperTorso, Head, RightUpperArm, RightLowerArm, "
+					.. 'RightHand, RightUpperLeg...; R6 Torso, Head, "Right Arm", "Left Leg"...',
 			},
 			animationId = {
 				type = "string",
@@ -9594,7 +9623,17 @@ Tool.Definition = {
 			},
 			rig = {
 				type = "string",
-				description = `Dotted path to a rigged model. Defaults to Workspace.{DUMMY_NAME}, created if missing.`,
+				description = "Dotted path to a rigged model. Defaults to the dummy for rigType.",
+			},
+			rigType = {
+				type = "string",
+				enum = { "R15", "R6" },
+				description = "Which dummy to spawn when rig isn't given. Defaults to R15.",
+			},
+			holding = {
+				type = "string",
+				description = "Dotted path to a Tool or a Model with a Handle, drawn in the rig's right hand "
+					.. "the way the engine grips it (RightGripAttachment and Tool.Grip). Nothing is welded.",
 			},
 			times = {
 				type = "array",
@@ -9605,59 +9644,62 @@ Tool.Definition = {
 			views = {
 				type = "array",
 				items = { type = { "string", "object" } },
-				description = "Angles, one panel each: front, right, left, back, top, iso, or { yaw, pitch, name }. Defaults to front and right.",
+				description = "Angles, one panel each: front, right, left, back, top, iso, or { yaw, pitch, name }. Defaults to front, right, iso, top.",
 				maxItems = 4,
 			},
 			size = {
 				type = "integer",
-				description = "Pixels per panel. Defaults to 768.",
+				description = "Pixels per panel. Defaults to 2048.",
 				minimum = 128,
-				maximum = 1024,
+				maximum = 2048,
 			},
 			loop = { type = "boolean", description = "Sequence loops. Defaults to true." },
 			priority = { type = "string", description = "Animation priority name. Defaults to Action." },
-			name = { type = "string", description = "File name. Defaults to a timestamp." },
+			save = {
+				type = "string",
+				description = "Dotted path to a folder. Puts the KeyframeSequence there (named after `name`), "
+					.. "replacing one with the same name, so it can be published with right-click > Save to Roblox.",
+			},
+			name = { type = "string", description = "Sequence and file name. Defaults to a timestamp." },
 		},
 	},
-	tags = { title = "Render Animation", readOnly = true },
+	tags = { title = "Render Animation" },
 	timeoutMs = 60000,
 }
 
 -- Classic noob colours, because a grey dummy is one blob in a blockout render and this makes
--- head, torso, arms and legs tell apart at a glance.
+-- head, torso, arms and legs tell apart at a glance. Keyed by what the name contains so R6's
+-- "Right Arm" and R15's RightUpperArm land the same way.
 local YELLOW, BLUE, GREEN = Color3.fromRGB(245, 205, 48), Color3.fromRGB(13, 105, 172), Color3.fromRGB(75, 151, 75)
-local CLASSIC: { [string]: Color3 } = {
-	Head = YELLOW,
-	UpperTorso = BLUE,
-	LowerTorso = BLUE,
-	LeftUpperArm = YELLOW,
-	LeftLowerArm = YELLOW,
-	LeftHand = YELLOW,
-	RightUpperArm = YELLOW,
-	RightLowerArm = YELLOW,
-	RightHand = YELLOW,
-	LeftUpperLeg = GREEN,
-	LeftLowerLeg = GREEN,
-	LeftFoot = GREEN,
-	RightUpperLeg = GREEN,
-	RightLowerLeg = GREEN,
-	RightFoot = GREEN,
-}
+local function classic(name: string): Color3?
+	if string.find(name, "Torso") then
+		return BLUE
+	end
+	if string.find(name, "Leg") or string.find(name, "Foot") then
+		return GREEN
+	end
+	if name == "Head" or string.find(name, "Arm") or string.find(name, "Hand") then
+		return YELLOW
+	end
+	return nil
+end
 
-local function dummy(): (Model?, string?)
-	local existing = workspace:FindFirstChild(DUMMY_NAME)
+local function dummy(rigType: string): (Model?, string?)
+	local name = DUMMY_PREFIX .. rigType
+	local existing = workspace:FindFirstChild(name)
 	if existing and existing:IsA("Model") then
 		return existing, nil
 	end
+	local kind = if rigType == "R6" then Enum.HumanoidRigType.R6 else Enum.HumanoidRigType.R15
 	local ok, model = pcall(function()
-		return Players:CreateHumanoidModelFromDescription(Instance.new("HumanoidDescription"), Enum.HumanoidRigType.R15)
+		return Players:CreateHumanoidModelFromDescription(Instance.new("HumanoidDescription"), kind)
 	end)
 	if not ok then
 		return nil, `couldn't create a dummy ({model}); pass rig = a path to a rigged model instead`
 	end
-	model.Name = DUMMY_NAME
+	model.Name = name
 	for _, child in model:GetChildren() do
-		local color = CLASSIC[child.Name]
+		local color = classic(child.Name)
 		if color and child:IsA("BasePart") then
 			child.Color = color
 		end
@@ -9665,6 +9707,99 @@ local function dummy(): (Model?, string?)
 	model:PivotTo(CFrame.new(0, 3, 0))
 	model.Parent = workspace
 	return model, nil
+end
+
+local function jointEnds(joint: Instance): (BasePart?, BasePart?)
+	if joint:IsA("JointInstance") then
+		return joint.Part0, joint.Part1
+	end
+	if joint:IsA("WeldConstraint") then
+		return joint.Part0, joint.Part1
+	end
+	return nil, nil
+end
+
+-- Parts welded onto the rig (accessories, a tool handle, a backpack) and which rig part carries
+-- them, followed through chains of welds. Their offset from that part is read off the model as it
+-- sits now, so any joint type works and the pose it's in doesn't matter.
+type Rider = { part: BasePart, carrier: string, offset: CFrame }
+
+local function riders(rig: Rig.Rig, root: Instance): { Rider }
+	local carrierOf: { [BasePart]: string } = {}
+	local skeleton: { [Instance]: true } = {}
+	for name, node in rig.byName do
+		carrierOf[node.part] = name
+		if node.motor then
+			skeleton[node.motor] = true
+		end
+	end
+
+	local joints = {}
+	for _, descendant in root:GetDescendants() do
+		if not skeleton[descendant] and (descendant:IsA("JointInstance") or descendant:IsA("WeldConstraint")) then
+			table.insert(joints, descendant)
+		end
+	end
+
+	local found: { Rider } = {}
+	local grew = true
+	while grew do
+		grew = false
+		for _, joint in joints do
+			local a, b = jointEnds(joint)
+			if not a or not b then
+				continue
+			end
+			for _, pair in { { a, b }, { b, a } } do
+				local carrier, rider = pair[1], pair[2]
+				local carrierName = carrierOf[carrier]
+				if carrierName and not carrierOf[rider] then
+					carrierOf[rider] = carrierName
+					table.insert(found, {
+						part = rider,
+						carrier = carrierName,
+						offset = carrier.CFrame:Inverse() * rider.CFrame,
+					})
+					grew = true
+				end
+			end
+		end
+	end
+	return found
+end
+
+-- A tool in the right hand, placed the way Humanoid equips it: the handle sits on the grip
+-- attachment, offset by Tool.Grip. Other parts of the tool ride on the handle.
+local function held(rig: Rig.Rig, thing: Instance): ({ Rider }?, string?)
+	local handle = thing:FindFirstChild("Handle")
+	if not handle or not handle:IsA("BasePart") then
+		return nil, `{thing:GetFullName()} has no Handle part`
+	end
+	local gripName, attachment
+	for name, node in rig.byName do
+		local found = node.part:FindFirstChild("RightGripAttachment")
+		if found and found:IsA("Attachment") then
+			gripName, attachment = name, found
+			break
+		end
+	end
+	if not gripName or not attachment then
+		return nil, "the rig has no RightGripAttachment to hold anything with"
+	end
+	local grip = if thing:IsA("Tool") then thing.Grip else CFrame.identity
+	local handleOffset = attachment.CFrame * grip:Inverse()
+
+	local found: { Rider } = { { part = handle, carrier = gripName, offset = handleOffset } }
+	for _, descendant in thing:GetDescendants() do
+		if descendant:IsA("BasePart") and descendant ~= handle then
+			table.insert(found, {
+				part = descendant,
+				carrier = gripName,
+				offset = handleOffset * handle.CFrame:Inverse() * descendant.CFrame,
+			})
+		end
+	end
+	return found, nil
 end
 
 -- World CFrame of every rig part with the joint transforms applied, the root placed at `base`.
@@ -9705,23 +9840,59 @@ end
 local function keyText(key: Anim.Key): string
 	local cframe = key.cframe :: CFrame
 	local rx, ry, rz = cframe:ToEulerAnglesXYZ()
-	local value = `angles = \{ {fmt(math.deg(rx))}, {fmt(math.deg(ry))}, {fmt(math.deg(rz))} }`
+	local value = `angles = [{fmt(math.deg(rx))}, {fmt(math.deg(ry))}, {fmt(math.deg(rz))}]`
 	if cframe.Position ~= Vector3.zero then
 		value ..= ` (+ position {fmt(cframe.X)}, {fmt(cframe.Y)}, {fmt(cframe.Z)})`
 	end
-	local easing = if key.easing and key.easing ~= "Linear/Out" then `, easing = "{key.easing}"` else ""
+	local easing = if key.easing then `, easing = "{key.easing}"` else ""
 	return `\{ time = {fmt(key.time)}, {value}{easing} }`
+end
+
+-- Every transition Linear reads as robotic; say so once rather than let it ship unnoticed.
+local function easingNote(tracks: Anim.Tracks): string?
+	local transitions, eased = 0, 0
+	for _, keys in tracks do
+		for index = 1, #keys - 1 do
+			transitions += 1
+			local easing = keys[index].easing
+			if easing and not string.find(easing, "^Linear") then
+				eased += 1
+			end
+		end
+	end
+	if transitions >= 2 and eased == 0 then
+		return "every transition is Linear. Body motion usually wants CubicV2/InOut (or /Out to snap then settle); Bounce and Elastic for impacts; Constant for a hard cut."
+	end
+	return nil
+end
+
+local function timesOf(tracks: Anim.Tracks): { number }
+	local seen: { [number]: true } = {}
+	local times = {}
+	for _, keys in tracks do
+		for _, key in keys do
+			if not seen[key.time] then
+				seen[key.time] = true
+				table.insert(times, key.time)
+			end
+		end
+	end
+	table.sort(times)
+	return times
 end
 
 function Tool.Run(arguments: {
 	tracks: Anim.Tracks?,
 	animationId: string?,
 	rig: string?,
+	rigType: string?,
+	holding: string?,
 	times: { number }?,
 	views: { any }?,
 	size: number?,
 	loop: boolean?,
 	priority: string?,
+	save: string?,
 	name: string?,
 }): Result
 	local function fail(text: string): Result
@@ -9732,7 +9903,7 @@ function Tool.Run(arguments: {
 	if arguments.rig then
 		model, problem = Path.Resolve(arguments.rig)
 	else
-		model, problem = dummy()
+		model, problem = dummy(arguments.rigType or "R15")
 	end
 	if not model then
 		return fail(problem :: string)
@@ -9763,24 +9934,57 @@ function Tool.Run(arguments: {
 	end
 	local resolved = tracks :: Anim.Tracks
 
-	local built
-	built, problem = Anim.Compile(model, resolved, { loop = arguments.loop, priority = arguments.priority })
-	if not built then
+	local sequence, built
+	sequence, built, problem = Anim.Sequence(model, resolved, { loop = arguments.loop, priority = arguments.priority })
+	if not sequence or not built then
 		return fail(problem :: string)
+	end
+	local id
+	id, problem = Anim.Register(sequence)
+	if not id then
+		sequence:Destroy()
+		return fail(problem :: string)
+	end
+	local saved = ""
+	if arguments.save then
+		local folder
+		folder, problem = Path.Resolve(arguments.save)
+		if not folder then
+			sequence:Destroy()
+			return fail(problem :: string)
+		end
+		sequence.Name = arguments.name or model.Name
+		local old = folder:FindFirstChild(sequence.Name)
+		if old and old:IsA("KeyframeSequence") then
+			old:Destroy()
+		end
+		sequence.Parent = folder
+		saved =
+			`\nsaved as {sequence:GetFullName()} -- right-click it in Explorer > Save to Roblox to get a real asset id`
+	else
+		sequence:Destroy()
+	end
+
+	local extras = riders(rig, model)
+	if arguments.holding then
+		local thing
+		thing, problem = Path.Resolve(arguments.holding)
+		if not thing then
+			return fail(problem :: string)
+		end
+		local grip
+		grip, problem = held(rig, thing)
+		if not grip then
+			return fail(problem :: string)
+		end
+		for _, rider in grip do
+			table.insert(extras, rider)
+		end
 	end
 
 	local times: { number } = arguments.times or {}
 	if #times == 0 then
-		local seen: { [number]: true } = {}
-		for _, keys in resolved do
-			for _, key in keys do
-				if not seen[key.time] then
-					seen[key.time] = true
-					table.insert(times, key.time)
-				end
-			end
-		end
-		table.sort(times)
+		times = timesOf(resolved)
 	end
 	if #times > MAX_FRAMES then
 		return fail(`{#times} frames is too many to read; pass times to pick up to {MAX_FRAMES}`)
@@ -9788,17 +9992,25 @@ function Tool.Run(arguments: {
 
 	-- The renderer's "front" camera sits on +Z and a character faces -Z, so the rig is turned to
 	-- look at it; that also puts its right side towards the "right" camera. Frames step along the
-	-- diagonal every preset sees side-on, so they never stack behind each other.
+	-- diagonal every preset sees side-on so they never stack, and wrap into rows going down.
 	local _, extents = model:GetBoundingBox()
+	local columns = math.ceil(math.sqrt(#times))
 	local step = Vector3.new(1, 0, -1).Unit * extents.X * 2
+	local drop = Vector3.new(0, -extents.Y * 1.3, 0)
 	local facing = CFrame.Angles(0, math.pi, 0)
 	local parts = {}
 	for frame, at in times do
-		local world = pose(rig, at, resolved, CFrame.new(step * (frame - 1)) * facing)
+		local column, row = (frame - 1) % columns, (frame - 1) // columns
+		local world = pose(rig, at, resolved, CFrame.new(step * column + drop * row) * facing)
 		for _, name in rig.order do
 			local part = rig.byName[name].part
 			if part.Transparency < 1 then
 				table.insert(parts, Build.Describe(part, #parts + 1, world[name]))
+			end
+		end
+		for _, rider in extras do
+			if rider.part.Transparency < 1 then
+				table.insert(parts, Build.Describe(rider.part, #parts + 1, world[rider.carrier] * rider.offset))
 			end
 		end
 	end
@@ -9807,8 +10019,14 @@ function Tool.Run(arguments: {
 	for _, at in times do
 		table.insert(labels, `t={fmt(at)}`)
 	end
-	local text = `{model:GetFullName()}: {#times} frame(s) left to right: {table.concat(labels, "  ")}\n`
-		.. `id = {built.id}  length = {fmt(built.length)}  joints = {table.concat(built.joints, ", ")}`
+	local text = `{model:GetFullName()}: {#times} frame(s) in reading order, {columns} per row: {table.concat(
+		labels,
+		"  "
+	)}\n` .. `id = {id}  length = {fmt(built.length)}  joints = {table.concat(built.joints, ", ")}{saved}`
+	local note = easingNote(resolved)
+	if note then
+		text ..= `\nnote: {note}`
+	end
 	if decompiled then
 		local lines = {}
 		for joint, keys in resolved do
@@ -9816,7 +10034,7 @@ function Tool.Run(arguments: {
 			for _, key in keys do
 				table.insert(items, keyText(key))
 			end
-			table.insert(lines, `{joint} = \{ {table.concat(items, ", ")} }`)
+			table.insert(lines, `{joint} = [{table.concat(items, ", ")}]`)
 		end
 		table.sort(lines)
 		text ..= "\ntracks:\n" .. table.concat(lines, "\n")
@@ -9827,8 +10045,8 @@ function Tool.Run(arguments: {
 		postProcess = {
 			kind = "scene",
 			name = arguments.name,
-			size = arguments.size or 768,
-			views = (Build.ResolveViews(arguments.views or { "front", "right" })),
+			size = arguments.size or 2048,
+			views = (Build.ResolveViews(arguments.views or { "front", "right", "iso", "top" })),
 			badges = false,
 			parts = parts,
 		},

@@ -48,8 +48,8 @@ export interface Scene {
 
 type V3 = [number, number, number];
 
-const MAX_PANEL = 1024;
-const MAX_TOTAL = 3072;
+const MAX_PANEL = 2048;
+const MAX_TOTAL = 4096;
 const MARGIN = 0.08;
 
 const PRESETS: Record<string, [number, number]> = {

@@ -7,33 +7,66 @@ description: Building Roblox animations with VMCP — the render_anim tool takes
 
 ## The loop: `render_anim`
 
-One tool call writes the animation, draws it and hands back a playable id. Send tracks, get a
-filmstrip: the rig posed at every keyframe, left to right, front and right views. Look, fix the
-numbers, send again. No Luau snippet, no playtest, nothing uploaded.
+One call writes the animation, draws it and hands back a playable id. Send tracks, get one image:
+the rig posed at every keyframe in reading order, four views (front, right, iso, top) tiled 2x2
+into a 4k sheet. One picture per iteration is the whole token budget -- look, fix numbers, resend.
 
 ```
 render_anim {
   tracks = {
-    RightUpperArm = [ { time = 0, angles = [0,0,0] }, { time = 0.25, angles = [0,0,-110], easing = "Cubic/Out" }, { time = 0.6, angles = [0,0,15] } ],
-    RightLowerArm = [ { time = 0.25, angles = [-20,0,0] }, { time = 0.6, angles = [0,0,0] } ]
+    RightUpperArm = [ { time = 0, angles = [0,0,0], easing = "CubicV2/Out" },
+                      { time = 0.25, angles = [0,0,-110], easing = "CubicV2/InOut" },
+                      { time = 0.6, angles = [0,0,15] } ],
+    RightLowerArm = [ { time = 0.25, angles = [-20,0,0], easing = "CubicV2/InOut" }, { time = 0.6, angles = [0,0,0] } ]
   }
 }
--> Workspace.VMCPRig: 3 frame(s) left to right: t=0  t=0.25  t=0.6
+-> Workspace.VMCPRigR15: 3 frame(s) in reading order, 2 per row: t=0  t=0.25  t=0.6
    id = rbxasset://...  length = 0.6  joints = RightUpperArm, RightLowerArm
    [picture]
 ```
 
-- No `rig` given: it spawns `Workspace.VMCPRig`, an R15 dummy in classic colours (yellow head
-  and arms, blue torso, green legs) and reuses it. Pass `rig = "Workspace.Enemy"` for anything else.
-- `times = [0, 0.1, 0.2, ...]` to sample between keys and check the in-betweens; `views` for
-  other angles; `size` down to 384 when a quick check is enough.
+- No `rig`: it spawns `Workspace.VMCPRigR15` (or `VMCPRigR6` with `rigType = "R6"`) in classic
+  colours -- yellow head/arms, blue torso, green legs -- and reuses it. `rig = "Workspace.Enemy"`
+  for anything else; any Motor6D rig works, joint names come from the rig's own parts.
+- Joint names are part names. R15: `UpperTorso LowerTorso Head RightUpperArm RightLowerArm
+  RightHand RightUpperLeg RightLowerLeg RightFoot` and Left. R6: `Torso Head "Right Arm" "Left
+  Arm" "Right Leg" "Left Leg"`. R6 arms only bend at the shoulder, so a punch is one joint.
+- `holding = "ReplicatedStorage.Katana"` draws a Tool (or a Model with a Handle) in the right hand
+  exactly as the engine grips it. Parts already welded to the rig (accessories, a sheath) come
+  along on their own.
+- `times = [0, 0.1, 0.2, ...]` samples between keys to check the in-betweens (up to 16).
+  `views` for other angles, `size = 768` when a rough check is enough.
 - `animationId = "rbxassetid://..."` instead of tracks draws an existing animation and prints
   its tracks as editable angles, so "make the walk bouncier" is read, edit, re-render.
-- Keep the key count small. Three to five keys per moving joint says most things; the engine
-  interpolates the rest. More frames cost more picture and rarely more information.
+- `save = "ServerStorage.Animations"` also leaves the KeyframeSequence in the place. Right-click
+  it in Explorer > Save to Roblox and it becomes a real asset id for the game.
 
-Play the id back with `run_luau` when it looks right (see Previewing). Everything below is the
-library the tool is built on, for when you need it from a snippet.
+## Working an animation up
+
+1. Blockout: 2-4 keys on the joints that matter most (torso, the working arm). Render.
+2. Read the sheet against the description: is the pose extreme enough, is the timing right,
+   does anything clip (arm through torso, weapon through leg -- the top view shows that).
+3. Add the supporting joints: opposite arm counter-swings, torso twists into the swing, head
+   leads. Render.
+4. Easing pass, then `times` sampled between keys to check the in-betweens move the way the
+   description says.
+5. `save` it, play the `id` in Studio via run_luau (Previewing below) if a moving check is wanted.
+
+Keep keys few. Three to five per moving joint says most things; the engine interpolates the rest.
+
+## Easing
+
+`easing` goes on the key it *leaves from* and is `"Style/Direction"`. Real styles only
+(`PoseEasingStyle`): `Linear`, `Constant`, `CubicV2`, `Elastic`, `Bounce` (`Cubic` is the old
+one; use `CubicV2`). Directions: `In` (slow start, fast finish -- engine default), `Out` (fast
+start, settles), `InOut`. Anything else is an error, not a silent Linear.
+
+- Body motion between poses: `CubicV2/InOut`. Nearly always the right default.
+- Wind-up into a strike: `CubicV2/In` into the hit, then `CubicV2/Out` or `Bounce/Out` out of it.
+- Impacts, landings, recoil: `Bounce/Out` or `Elastic/Out`.
+- Hard cuts, blinks, weapon swaps: `Constant`.
+- `Linear` only for mechanical things (a turret, a conveyor). The tool flags a track set where
+  every transition is Linear because it reads as robotic on a character.
 
 ## Library
 
@@ -66,8 +99,8 @@ into the engine's format, which is "at t=0.3, here is the entire body".
 local tracks = {
     RightUpperArm = {
         { time = 0,    angles = { 0, 0, 0 } },
-        { time = 0.25, angles = { 0, 0, -110 }, easing = "Cubic/Out" },
-        { time = 0.6,  angles = { 0, 0, 15 },   easing = "Quad/InOut" },
+        { time = 0.25, angles = { 0, 0, -110 }, easing = "CubicV2/Out" },
+        { time = 0.6,  angles = { 0, 0, 15 },   easing = "CubicV2/InOut" },
     },
     RightLowerArm = {
         { time = 0.25, angles = { -20, 0, 0 } },
@@ -80,11 +113,13 @@ if not built then return problem end
 return built   -- { id = "rbxasset://...", length = 0.6, joints = {...}, keyframes = 3 }
 ```
 
+`vmcp.Anim.Sequence(model, tracks, options)` returns the `KeyframeSequence` instance itself
+(unparented) when you want to put it in the place rather than register it.
+
 `angles` is degrees, XYZ. Pass `cframe = CFrame.new(...)` instead for anything angles can't say.
 
 **Easing is written on the key it leaves from**, because `Pose.EasingStyle` describes how to reach
-the *next* keyframe. The last key's easing is never used. Format is `"Style/Direction"`, e.g.
-`"Cubic/Out"`, `"Quad/InOut"`, `"Linear"`.
+the *next* keyframe. The last key's easing is never used. See Easing above.
 
 A joint with no key at a keyframe some other joint introduced is interpolated, not reset — a joint
 keyed only at the ends still poses correctly in between.
