@@ -183,7 +183,9 @@ function fillBox(surface: Surface, node: UiNode, box: Box, s: number): void {
 			if (grad) {
 				// UIGradient runs left to right at 0 degrees, along the element's own axes.
 				const t = Math.min(Math.max((lx * gCos + ly * gSin) / (2 * (Math.abs(gCos) * box.hw + Math.abs(gSin) * box.hh)) + 0.5, 0), 1);
-				color = sampleColor(grad.colors, t);
+				// The engine multiplies the gradient into BackgroundColor3; a dark base stays dark whatever the sequence says.
+				const g = sampleColor(grad.colors, t);
+				color = [(g[0] * base[0]) / 255, (g[1] * base[1]) / 255, (g[2] * base[2]) / 255];
 				a *= sampleAlpha(grad.alphas, t);
 			}
 			surface.blend(x, y, color[0], color[1], color[2], a);
@@ -311,7 +313,43 @@ function drawImage(surface: Surface, node: UiNode, box: Box, s: number): void {
 	}
 }
 
-export function renderUi(scene: UiScene): Surface {
+/** Uncovered viewport is drawn as a grey checker so a letterboxed or undersized GUI can't pass for a dark background. */
+function checkerUnderlay(surface: Surface): string {
+	const { width, height, pixels } = surface;
+	let uncovered = 0;
+	const colCovered = new Uint8Array(width);
+	const rowCovered = new Uint8Array(height);
+	for (let y = 0; y < height; y++) {
+		for (let x = 0; x < width; x++) {
+			const at = (y * width + x) * 4;
+			const a = (pixels[at + 3] ?? 0) / 255;
+			if (a >= 0.5) {
+				colCovered[x] = 1;
+				rowCovered[y] = 1;
+			} else {
+				uncovered++;
+			}
+			const shade = ((x >> 4) + (y >> 4)) & 1 ? 96 : 72;
+			pixels[at] = (pixels[at] ?? 0) * a + shade * (1 - a);
+			pixels[at + 1] = (pixels[at + 1] ?? 0) * a + shade * (1 - a);
+			pixels[at + 2] = (pixels[at + 2] ?? 0) * a + shade * (1 - a);
+			pixels[at + 3] = 255;
+		}
+	}
+	const share = uncovered / (width * height);
+	if (share < 0.02) return "";
+	const first = (flags: Uint8Array) => flags.indexOf(1);
+	const last = (flags: Uint8Array) => flags.lastIndexOf(1);
+	const strips: string[] = [];
+	if (first(colCovered) > 0) strips.push(`left ${first(colCovered)}px`);
+	if (last(colCovered) < width - 1) strips.push(`right ${width - 1 - last(colCovered)}px`);
+	if (first(rowCovered) > 0) strips.push(`top ${first(rowCovered)}px`);
+	if (last(rowCovered) < height - 1) strips.push(`bottom ${height - 1 - last(rowCovered)}px`);
+	const where = strips.length ? ` (empty strips: ${strips.join(", ")})` : "";
+	return `${Math.round(share * 100)}% of the viewport has nothing opaque drawn on it${where}; shown as grey checker`;
+}
+
+export function renderUiScene(scene: UiScene): { surface: Surface; note: string } {
 	const requested = Math.max(scene.width, scene.height, 1);
 	const s = Math.min(clamp01(scene.scale, 1), MAX_SIDE / requested);
 	const width = Math.max(1, Math.round(scene.width * s));
@@ -331,5 +369,6 @@ export function renderUi(scene: UiScene): Surface {
 			label(surface, node.label, Math.round(x), Math.round(box.cy - (GLYPH_HEIGHT * scale) / 2), scale, [120, 200, 220], 0.8, scaledClip(node.clip, s));
 		}
 	}
-	return surface;
+	const note = checkerUnderlay(surface);
+	return { surface, note };
 }

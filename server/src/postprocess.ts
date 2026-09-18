@@ -5,7 +5,7 @@ import type { ToolResult, ToolResultContent } from "./protocol.js";
 import { encodePng, rasterize, type Recording } from "./image.js";
 import { materialsOf, renderScene, type Scene } from "./scene.js";
 import { loadMaterials } from "./materials.js";
-import { renderUi, type UiScene } from "./ui.js";
+import { renderUiScene, type UiScene } from "./ui.js";
 import { storeApiKey, uploadImage } from "./upload.js";
 
 /**
@@ -103,11 +103,12 @@ async function finish(directive: Directive): Promise<Outcome> {
 
 	try {
 		let surface;
+		let note = "";
 		if (directive.kind === "scene") {
 			const scene = directive as unknown as Scene;
 			surface = renderScene(scene, await loadMaterials(materialsOf(scene)));
 		} else if (directive.kind === "ui") {
-			surface = renderUi(directive as unknown as UiScene);
+			({ surface, note } = renderUiScene(directive as unknown as UiScene));
 		} else {
 			surface = rasterize(directive as unknown as Recording);
 		}
@@ -128,7 +129,8 @@ async function finish(directive: Directive): Promise<Outcome> {
 				asset = ` (upload failed: ${(err as Error).message})`;
 			}
 		}
-		return { text: `[wrote the image to ${path}${asset}]`, png };
+		const coverage = note ? ` [${note}]` : "";
+		return { text: `[wrote the image to ${path}${asset}]${coverage}`, png };
 	} catch (err) {
 		return { text: `[couldn't write the image: ${(err as Error).message}]` };
 	}

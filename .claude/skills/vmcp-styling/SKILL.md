@@ -53,6 +53,10 @@ state rules an explicit Priority (hover 1, active 2) instead of trusting the spe
 
 ## The silent failures
 
+**A StyleLink on a tree that isn't in StarterGui yet never resolves.** Build the ScreenGui, parent
+it to StarterGui, then add the StyleLink (Parent first, then `StyleSheet`), and `task.wait(0.2)`
+before any `GetStyled` read — the first frame after linking still reads class defaults.
+
 **`StyleRule:SetProperties` ignores a property the class doesn't have.** No error, no warning.
 `vmcp.Style.Apply(rule, "TextLabel", props)` returns the names it refused; `vmcp.Style.Check`
 does the same without applying. Both work by creating a throwaway instance, so an abstract
@@ -144,6 +148,13 @@ ViewportFrame a box naming how many parts it holds. Good for "what overlaps what
 backdrop actually opaque", "is that icon centred in its row" — it caught a see-through
 backdrop (a `UIGradient.Transparency` sequence makes the *element* transparent, not just the
 tint) and misaligned rows on the first run. Not for judging a font.
+
+Any viewport the GUI doesn't cover is drawn as a grey checker and the tool's text says how much and
+which edge strips are empty — a fixed-size design stage under a `UIScale` letterboxes on every
+viewport that isn't its aspect ratio, so put a `Size = UDim2.fromScale(1, 1)` backdrop behind it.
+`UIGradient.Color` **multiplies into** `BackgroundColor3`: a gradient on a near-black frame renders
+near-black whatever the sequence says. Put the gradient on a white frame when the sequence is the
+colour you want. The renderer does the same multiply.
 
 The PNG comes back only from a server that knows the `ui` job; with an older server the tool
 reports "doesn't know how to finish a ui job" — restart Claude so `npx` pulls the current one.
