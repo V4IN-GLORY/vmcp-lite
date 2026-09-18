@@ -26,7 +26,9 @@ Tool.Definition = {
 		.. "First-time setup: pass `apiKey` once (an Open Cloud key with the assets read/write "
 		.. "scope for that user or group) and it's remembered in ~/.vmcp/roblox-api-key. "
 		.. "Moderation runs after upload, so the id is usable at once and the picture appears a "
-		.. "little later.",
+		.. "little later. Images must be 4096px on the long side (Roblox downsamples; small "
+		.. "uploads look blurry) unless allowSmall is set. Every id is remembered in "
+		.. "~/.vmcp/images/assets.json so screenshot_ui can draw the real picture.",
 	inputSchema = {
 		type = "object",
 		properties = {
@@ -50,6 +52,10 @@ Tool.Definition = {
 			apiKey = {
 				type = "string",
 				description = "Open Cloud API key to remember for every later upload. Only needed once.",
+			},
+			allowSmall = {
+				type = "boolean",
+				description = "Upload even when the long side is under 4096px. Assets are meant to be exported at 4K and downsampled by Roblox, so this is refused by default.",
 			},
 		},
 	},
@@ -75,11 +81,13 @@ function Tool.Run(arguments: {
 	description: string?,
 	owner: string?,
 	apiKey: string?,
+	allowSmall: boolean?,
 }): Result
 	local directive: { [string]: any } = {
 		kind = "upload",
 		apiKey = arguments.apiKey,
 		description = arguments.description,
+		allowSmall = arguments.allowSmall == true,
 	}
 
 	local owner = arguments.owner
@@ -120,7 +128,9 @@ function Tool.Run(arguments: {
 		end
 		local pixels = Canvas.Base64Pixels(image)
 		if not pixels then
-			return fail(`{found:GetFullName()} is too big to send ({image.Size.X}x{image.Size.Y}); render it with vmcp.Render first and upload the file`)
+			return fail(
+				`{found:GetFullName()} is too big to send ({image.Size.X}x{image.Size.Y}); render it with vmcp.Render first and upload the file`
+			)
 		end
 		directive.width = image.Size.X
 		directive.height = image.Size.Y
@@ -133,7 +143,10 @@ function Tool.Run(arguments: {
 		return fail("give `file` (a PNG vmcp.Render wrote) or `root` (an image in the place)")
 	end
 
-	local what = if directive.file then `~/.vmcp/images/{directive.file}.png` elseif directive.pixels then arguments.root else "nothing"
+	local what = if directive.file
+		then `~/.vmcp/images/{directive.file}.png`
+		elseif directive.pixels then arguments.root
+		else "nothing"
 	local who = if directive.groupId then `group {directive.groupId}` else `user {directive.userId}`
 	return {
 		content = { { type = "text", text = `uploading {what} as "{directive.name or "-"}" owned by {who}` } },

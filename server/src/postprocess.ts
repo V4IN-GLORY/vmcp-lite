@@ -2,11 +2,11 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { config, log } from "./config.js";
 import type { ToolResult, ToolResultContent } from "./protocol.js";
-import { encodePng, rasterize, type Recording } from "./image.js";
+import { encodePng, pngSize, rasterize, type Recording } from "./image.js";
 import { materialsOf, renderScene, type Scene } from "./scene.js";
 import { loadMaterials } from "./materials.js";
 import { renderUiScene, type UiScene } from "./ui.js";
-import { storeApiKey, uploadImage } from "./upload.js";
+import { rememberAsset, storeApiKey, uploadImage } from "./upload.js";
 
 /**
  * The one place the relay acts on a result instead of passing it along.
@@ -50,6 +50,19 @@ function writeCapture(directive: Directive): Outcome {
 	}
 }
 
+// Every asset is exported at 4K and Roblox does the downsampling, so a small upload is a mistake
+// (it would be upscaled on most screens) unless the caller says otherwise.
+const MIN_ASSET_SIDE = 4096;
+
+function tooSmall(png: Buffer): string | undefined {
+	const size = pngSize(png);
+	if (!size) return "not a PNG";
+	if (Math.max(size.width, size.height) < MIN_ASSET_SIDE) {
+		return `${size.width}x${size.height} is under ${MIN_ASSET_SIDE}px on its long side -- export at 4K and let Roblox downsample, or pass allowSmall = true`;
+	}
+	return undefined;
+}
+
 // Past this the image is more of the reply than the words are, and the file on disk is the better
 // way to look at it.
 const INLINE_LIMIT = 1_500_000;
@@ -71,15 +84,21 @@ async function uploadDirective(directive: Directive): Promise<Outcome> {
 	}
 
 	let png: Buffer;
+	let file: string;
 	if (typeof directive.file === "string") {
 		const path = outputPath({ name: directive.file }, "images", "canvas", "png");
 		if (!existsSync(path)) return { text: `${stored}[no image at ${path} -- render it first]` };
 		png = readFileSync(path);
+		file = path;
 	} else if (typeof directive.pixels === "string") {
 		png = encodePng(rasterize(directive as unknown as Recording));
+		file = outputPath(directive, "images", "canvas", "png");
+		writeFileSync(file, png);
 	} else {
 		return { text: `${stored}[upload needs a file name or pixels]` };
 	}
+	const small = directive.allowSmall === true ? undefined : tooSmall(png);
+	if (small) return { text: `${stored}[not uploaded: ${small}]` };
 
 	try {
 		const id = await uploadImage(png, {
@@ -88,6 +107,7 @@ async function uploadDirective(directive: Directive): Promise<Outcome> {
 			userId: typeof directive.userId === "number" ? directive.userId : undefined,
 			groupId: typeof directive.groupId === "number" ? directive.groupId : undefined,
 		});
+		rememberAsset(id, file);
 		return { text: `${stored}[uploaded as rbxassetid://${id}]`, png };
 	} catch (err) {
 		return { text: `${stored}[upload failed: ${(err as Error).message}]` };
@@ -124,6 +144,7 @@ async function finish(directive: Directive): Promise<Outcome> {
 			try {
 				const groupId = typeof directive.groupId === "number" ? directive.groupId : undefined;
 				const id = await uploadImage(png, { name, userId, groupId });
+				rememberAsset(id, path);
 				asset = ` (uploaded as rbxassetid://${id})`;
 			} catch (err) {
 				asset = ` (upload failed: ${(err as Error).message})`;

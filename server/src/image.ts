@@ -1,4 +1,4 @@
-import { deflateSync } from "node:zlib";
+import { deflateSync, inflateSync } from "node:zlib";
 
 /**
  * Replays a Canvas recording into a PNG.
@@ -208,4 +208,74 @@ export function encodePng(surface: Surface): Buffer {
 		chunk("IDAT", deflateSync(raw)),
 		chunk("IEND", Buffer.alloc(0)),
 	]);
+}
+
+/** Width and height from the IHDR, or undefined when the bytes aren't a PNG. */
+export function pngSize(png: Buffer): { width: number; height: number } | undefined {
+	if (png.length < 24 || !png.subarray(0, 8).equals(SIGNATURE)) return undefined;
+	return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
+}
+
+const PNG_COLOR_CHANNELS: Record<number, number> = { 0: 1, 2: 3, 4: 2, 6: 4 };
+
+/**
+ * Decodes an 8-bit non-interlaced PNG into a Surface. Covers what encodePng and OpenPencil
+ * write; palette, 16-bit and interlaced files return undefined rather than a wrong picture.
+ */
+export function decodePng(png: Buffer): Surface | undefined {
+	const size = pngSize(png);
+	if (!size) return undefined;
+	const depth = png[24];
+	const colorType = png[25] ?? -1;
+	const channels = PNG_COLOR_CHANNELS[colorType];
+	if (depth !== 8 || !channels || png[28] !== 0) return undefined;
+
+	const idat: Buffer[] = [];
+	for (let at = 8; at + 8 <= png.length; ) {
+		const length = png.readUInt32BE(at);
+		const type = png.toString("ascii", at + 4, at + 8);
+		if (type === "IDAT") idat.push(png.subarray(at + 8, at + 8 + length));
+		if (type === "IEND") break;
+		at += 12 + length;
+	}
+	const raw = inflateSync(Buffer.concat(idat));
+	const { width, height } = size;
+	const stride = width * channels;
+	const surface = new Surface(width, height);
+	const out = surface.pixels;
+	const previous = Buffer.alloc(stride);
+	const line = Buffer.alloc(stride);
+	for (let row = 0; row < height; row++) {
+		const at = row * (stride + 1);
+		const filter = raw[at];
+		raw.copy(line, 0, at + 1, at + 1 + stride);
+		for (let i = 0; i < stride; i++) {
+			const a = i >= channels ? (line[i - channels] ?? 0) : 0;
+			const b = previous[i] ?? 0;
+			const c = i >= channels ? (previous[i - channels] ?? 0) : 0;
+			let predictor = 0;
+			if (filter === 1) predictor = a;
+			else if (filter === 2) predictor = b;
+			else if (filter === 3) predictor = (a + b) >> 1;
+			else if (filter === 4) {
+				const p = a + b - c;
+				const pa = Math.abs(p - a);
+				const pb = Math.abs(p - b);
+				const pc = Math.abs(p - c);
+				predictor = pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+			}
+			line[i] = ((line[i] ?? 0) + predictor) & 0xff;
+		}
+		for (let x = 0; x < width; x++) {
+			const src = x * channels;
+			const dst = (row * width + x) * 4;
+			const grey = channels < 3;
+			out[dst] = line[src] ?? 0;
+			out[dst + 1] = grey ? (line[src] ?? 0) : (line[src + 1] ?? 0);
+			out[dst + 2] = grey ? (line[src] ?? 0) : (line[src + 2] ?? 0);
+			out[dst + 3] = channels === 4 ? (line[src + 3] ?? 0) : channels === 2 ? (line[src + 1] ?? 0) : 255;
+		}
+		line.copy(previous);
+	}
+	return surface;
 }

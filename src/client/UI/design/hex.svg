@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 160">
+  <!-- flat top/bottom hexagon plate: faint fill, 2px edge, notch tabs top and bottom. White; tinted by ImageColor3. -->
+  <path fill="#ffffff" fill-opacity="0.18" d="M0 80 L64 0 L192 0 L256 80 L192 160 L64 160 Z"/>
+  <path fill="none" stroke="#ffffff" stroke-width="3" d="M2 80 L65 2 L191 2 L254 80 L191 158 L65 158 Z"/>
+  <path fill="#ffffff" d="M106 0 L150 0 L150 4 L106 4 Z M106 156 L150 156 L150 160 L106 160 Z"/>
+</svg>

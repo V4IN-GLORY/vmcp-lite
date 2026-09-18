@@ -5,6 +5,11 @@ description: Roblox UI stylesheets with VMCP — StyleSheet, StyleRule, selector
 
 # Stylesheets
 
+The full grammar (selectors, queries, the stylable-property table per class, CSS → Roblox map,
+Style Editor folder layout) is in `references/roblox-styling.md`, distilled from the official
+pages. In this project the theme is `ReplicatedStorage.Design` (`Design.Build()` — see
+`vmcp-ui`); stories and controllers link that sheet, they never build their own.
+
 Reached from a `run_luau` snippet as `vmcp.Style`. Three functions: `Check`, `Apply`, `Selector`
 for writing rules, `Read` for seeing what they did. Everything else is plain engine API, but the
 engine fails quietly in more places than it should — the list below is every one that has cost
@@ -35,12 +40,13 @@ link.Parent = screenGui
 ```
 
 Selectors take a class name, `.Tag` (CollectionService tag), `#Name` (instance name), `:Hover`
-`:Press`, `@StyleQuery`, combined with `>` (direct child) and `>>` (descendant). Tokens are
+`:Press`, `@StyleQuery`, combined with `>` (direct child) and `>>` (descendant); nested
+StyleRules merge their selectors. Tokens are
 **StyleSheet attributes**, so swapping a set of attributes reskins everything — that is the whole
 theming mechanism; keep tokens in one sheet and rules in another joined by `StyleDerive`.
 `SetPropertyTransition(property, tweenInfo)` is the CSS-transition equivalent. The `::` combinator
-spawns a phantom `UICorner` / `UIStroke` / `UIGradient` from a rule instead of parenting one by
-hand.
+spawns a phantom `UICorner` / `UIStroke` / `UIGradient` / `UIPadding` / `UIShadow` from a rule
+instead of parenting one by hand.
 
 A state that isn't `:Hover`/`:Press` (selected tab, active panel) is a tag you add and remove
 with `CollectionService`, matched as `.Tab.Active`. Compound class+tag selectors work
@@ -83,8 +89,10 @@ numbers slid off their hexes. `rule:SetProperty(...)` again from a LocalScript a
 it stick. Prefer rules that set non-default values; when you must set a default, re-set it at
 runtime.
 
-**A comma list in one selector parses but can match nothing.** `.A:Hover > .X, .A.Active > .X`
-gave no `SelectorError` and applied to neither. One selector per rule.
+**A comma list in one selector can match nothing.** The docs say `"ImageLabel, TextLabel"` works;
+`.A:Hover > .X, .A.Active > .X` gave no `SelectorError` and applied to neither. Verify a list with
+`inspect_style` or use one selector per rule (nested rules merge selectors, which is the same
+thing with less typing).
 
 **`.Name` is a tag, `#Name` is the instance name.** A label *called* `Value` with tags
 `{ "ValueXL" }` does not match `.Value`; the rule silently matches nothing. First move when a
@@ -142,9 +150,12 @@ the source says and nothing else. Live probing is for finding out; the file is f
 client; scale) walks the tree in render order (Sibling and Global ZIndex), reads every visual
 property through `GetStyled`, and the server draws it as a PNG that comes back inline. Boxes,
 strokes, gradients, corners, rotation and clipping are exact; text is a 5x7 bitmap font so its
-width isn't the engine's (check overflow with `TextFits`, not by eye); EditableImage icons are
-real pixels, asset images a tinted placeholder (a tiled one draws as a faint overlay), a
-ViewportFrame a box naming how many parts it holds. Good for "what overlaps what", "is the
+width isn't the engine's (check overflow with `TextFits`, not by eye); EditableImage icons and
+any `rbxassetid` that `upload_image` published (`~/.vmcp/images/assets.json`) are real pixels,
+box-averaged down from the 4K source and tinted, `ScaleType.Fit` letterboxed; other asset images
+a tinted placeholder (a tiled one draws as a faint overlay), a ViewportFrame a box naming how
+many parts it holds. `mount_story` (see `vmcp-ui`) is the one-call way to get a component
+mounted and screenshotted. Good for "what overlaps what", "is the
 backdrop actually opaque", "is that icon centred in its row" — it caught a see-through
 backdrop (a `UIGradient.Transparency` sequence makes the *element* transparent, not just the
 tint) and misaligned rows on the first run. Not for judging a font.

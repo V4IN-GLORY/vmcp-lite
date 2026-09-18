@@ -5,8 +5,9 @@
 -- sees StyleRules), and hands the flat list to the VMCP server, which rasterizes it.
 --
 -- What comes back is a layout check, not a render: boxes, strokes, gradients, corner radii and
--- rotation are exact; text is a bitmap font; EditableImage pixels are real, asset images are a
--- placeholder, and a ViewportFrame is a box naming what's inside it.
+-- rotation are exact; text is a bitmap font; EditableImage pixels are real, asset images are real
+-- when this server uploaded them (~/.vmcp/images/assets.json) and a placeholder otherwise, and a
+-- ViewportFrame is a box naming what's inside it.
 
 local Path = require(script.Parent.Parent.Path)
 
@@ -31,8 +32,9 @@ Tool.Definition = {
 	description = "Draws a ScreenGui (or any GuiObject) as a PNG so you can look at the layout "
 		.. "instead of reading AbsolutePosition numbers. Reads styled values, so StyleSheet rules "
 		.. "show. Boxes, strokes, gradients, corners and rotation are exact; text is a bitmap "
-		.. "font (check overflow with TextFits, not by eye); EditableImage icons are real pixels, "
-		.. "asset images are a tinted placeholder, ViewportFrames are a box naming their contents. "
+		.. "font (check overflow with TextFits, not by eye); EditableImage icons and assets that "
+		.. "upload_image published are real pixels, other asset images a tinted placeholder, "
+		.. "ViewportFrames a box naming their contents. "
 		.. "context plugin draws StarterGui as Studio lays it out; context client draws the "
 		.. "player's live PlayerGui.",
 	inputSchema = {
@@ -40,7 +42,7 @@ Tool.Definition = {
 		properties = {
 			root = {
 				type = "string",
-				description = 'Dotted path to a ScreenGui, GuiObject, or a container of ScreenGuis. '
+				description = "Dotted path to a ScreenGui, GuiObject, or a container of ScreenGuis. "
 					.. "Defaults to StarterGui in the edit session and the local PlayerGui in a client.",
 			},
 			context = {
@@ -175,8 +177,16 @@ local function describe(state: Walk, gui: GuiObject, clip: Rect?)
 	}
 
 	for _, child in gui:GetChildren() do
-		if child:IsA("UIStroke") and styled(child, "Enabled") and styled(child, "ApplyStrokeMode") == Enum.ApplyStrokeMode.Border then
-			node.stroke = { color = rgb(styled(child, "Color")), a = 1 - styled(child, "Transparency"), t = styled(child, "Thickness") }
+		if
+			child:IsA("UIStroke")
+			and styled(child, "Enabled")
+			and styled(child, "ApplyStrokeMode") == Enum.ApplyStrokeMode.Border
+		then
+			node.stroke = {
+				color = rgb(styled(child, "Color")),
+				a = 1 - styled(child, "Transparency"),
+				t = styled(child, "Thickness"),
+			}
 		elseif child:IsA("UICorner") then
 			local radius: UDim = styled(child, "CornerRadius")
 			node.corner = radius.Offset + radius.Scale * math.min(size.X, size.Y)
@@ -198,7 +208,9 @@ local function describe(state: Walk, gui: GuiObject, clip: Rect?)
 		if gui:IsA("TextBox") and text == "" then
 			text = styled(gui, "PlaceholderText")
 		end
-		local textSize: number = if styled(gui, "TextScaled") then math.min(gui.TextBounds.Y, size.Y) else styled(gui, "TextSize")
+		local textSize: number = if styled(gui, "TextScaled")
+			then math.min(gui.TextBounds.Y, size.Y)
+			else styled(gui, "TextSize")
 		node.text = {
 			s = text,
 			size = textSize,
@@ -221,10 +233,23 @@ local function describe(state: Walk, gui: GuiObject, clip: Rect?)
 			if pixels then
 				image.px, image.pw, image.ph = pixels.px, pixels.pw, pixels.ph
 			end
-		elseif content.SourceType == Enum.ContentSourceType.None and (styled(gui, "Image") :: string) == "" then
-			image.a = 0
+		else
+			local uri: string = if content.SourceType == Enum.ContentSourceType.Uri
+				then content.Uri
+				else styled(gui, "Image")
+			local id = string.match(uri, "^rbxassetid://(%d+)$") or string.match(uri, "[?&]id=(%d+)")
+			if id then
+				-- The server draws real pixels when it uploaded this id itself (assets.json).
+				image.asset = tonumber(id)
+			elseif uri == "" then
+				image.a = 0
+			end
 		end
-		if styled(gui, "ScaleType") == Enum.ScaleType.Tile then
+		local scaleType = styled(gui, "ScaleType")
+		if scaleType == Enum.ScaleType.Fit then
+			image.fit = true
+		end
+		if scaleType == Enum.ScaleType.Tile then
 			local tile: UDim2 = styled(gui, "TileSize")
 			image.tile = { w = tile.X.Offset + tile.X.Scale * size.X, h = tile.Y.Offset + tile.Y.Scale * size.Y }
 		end
@@ -395,7 +420,10 @@ function Tool.Run(arguments: { root: string?, scale: number?, name: string? }): 
 		content = {
 			{
 				type = "text",
-				text = `{state.count} element(s) under {root:GetFullName()}, {size.X}x{size.Y} at {string.format("%.2f", scale)}x{note}`,
+				text = `{state.count} element(s) under {root:GetFullName()}, {size.X}x{size.Y} at {string.format(
+					"%.2f",
+					scale
+				)}x{note}`,
 			},
 		},
 		postProcess = {

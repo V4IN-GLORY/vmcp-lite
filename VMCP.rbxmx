@@ -8709,6 +8709,292 @@ return Tool
       </Item>
       <Item class="ModuleScript" referent="45">
         <Properties>
+          <string name="Name">MountStory</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Mounts a UI Labs story the way the UI Labs plugin would, into a ScreenGui under StarterGui,
+-- and hands back a screenshot_ui picture of it. The story file is the contract: the same module
+-- the human opens in UI Labs is what this draws, so there is one source of truth for a component.
+--
+-- Studio's require cache is per instance, and Rojo syncs an edit into the same instance, so a
+-- plain require would keep serving the first version. The story's folder is cloned beside the
+-- original for the mount (relative requires still resolve) and destroyed afterwards.
+
+local Path = require(script.Parent.Parent.Path)
+local ScreenshotUi = require(script.Parent.ScreenshotUi)
+
+local StarterGui = game:GetService("StarterGui")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local GUI_NAME = "VMCPStory"
+local STYLE_RESOLVE_WAIT = 0.2 -- a StyleLink reads class defaults for a frame after linking
+
+type Result = {
+	content: { { type: "text", text: string } },
+	isError: boolean?,
+	postProcess: { [string]: any }?,
+}
+
+local Tool = {}
+
+Tool.Definition = {
+	name = "mount_story",
+	description = "Mounts a UI Labs story (a *.story ModuleScript) into a ScreenGui under "
+		.. "StarterGui with the given control values and returns a screenshot_ui picture of it. "
+		.. "Handles Vide stories ({ vide, story, controls }), generic stories ({ render, "
+		.. "controls }) and function stories. The story's folder is cloned for the mount so a "
+		.. "just-synced edit is what runs. ReplicatedStorage.Design.StyleSheet is linked when it "
+		.. "exists. Unless keep is set, the mount is torn down after the screenshot; with keep "
+		.. "the ScreenGui stays as StarterGui.VMCPStory for inspect_style and run_luau probes.",
+	inputSchema = {
+		type = "object",
+		properties = {
+			story = {
+				type = "string",
+				description = "Dotted path to the story ModuleScript, e.g. StarterPlayer.StarterPlayerScripts.Client.UI.HexStat.HexStat.story",
+			},
+			controls = {
+				type = "object",
+				description = "Control values to override the story's defaults, keyed by control name.",
+			},
+			size = {
+				type = "array",
+				items = { type = "number" },
+				description = "Target frame size in pixels [w, h]. Defaults to [1280, 720].",
+			},
+			background = {
+				type = "string",
+				description = 'Target frame colour as "r,g,b" 0-255. Defaults to the story\'s `background` field, else a dark grey.',
+			},
+			keep = { type = "boolean", description = "Leave the mount in StarterGui.VMCPStory after the screenshot." },
+			scale = {
+				type = "number",
+				description = "Screenshot scale 0.1-1, passed to screenshot_ui.",
+				minimum = 0.1,
+				maximum = 1,
+			},
+		},
+		required = { "story" },
+	},
+	tags = { title = "Mount Story" },
+	timeoutMs = 60000,
+}
+
+local function fail(text: string): Result
+	return { content = { { type = "text", text = text } }, isError = true }
+end
+
+-- UI Labs control entries are either a raw default or { EntryType = "Control", ControlValue = default }.
+local function controlDefault(entry: any): any
+	if type(entry) == "table" and entry.EntryType == "Control" then
+		return entry.ControlValue
+	end
+	return entry
+end
+
+local function parseColor(text: string?): Color3?
+	if not text then
+		return nil
+	end
+	local r, g, b = string.match(text, "^%s*(%d+)%s*,%s*(%d+)%s*,%s*(%d+)%s*$")
+	if not r then
+		return nil
+	end
+	return Color3.fromRGB(tonumber(r) :: number, tonumber(g) :: number, tonumber(b) :: number)
+end
+
+local mounted: { gui: ScreenGui?, clone: Instance?, cleanup: (() -> ())? } = {}
+
+local function teardown()
+	if mounted.cleanup then
+		pcall(mounted.cleanup)
+	end
+	if mounted.gui then
+		mounted.gui:Destroy()
+	end
+	if mounted.clone then
+		mounted.clone:Destroy()
+	end
+	mounted.gui, mounted.clone, mounted.cleanup = nil, nil, nil
+	local stale = StarterGui:FindFirstChild(GUI_NAME)
+	if stale then
+		stale:Destroy()
+	end
+end
+
+-- Runs the story and returns its cleanup. `values` are the resolved control values.
+local function mountStory(story: any, target: Frame, values: { [string]: any }): (() -> ())?
+	if type(story) == "function" then
+		return story(target)
+	end
+	if type(story) ~= "table" then
+		error(`a story module returns a function or a table, not {typeof(story)}`)
+	end
+
+	if story.vide then
+		local Vide = story.vide
+		local sources = {}
+		for name, value in values do
+			sources[name] = Vide.source(value)
+		end
+		local props = { target = target, controls = sources }
+		local unroot = Vide.root(function()
+			local result = story.story(props)
+			if typeof(result) == "Instance" then
+				result.Parent = target
+			end
+		end)
+		return unroot
+	end
+
+	if story.fusion then
+		error("Fusion stories aren't supported here; use a Vide, generic or function story")
+	end
+
+	local render = story.render or story.story
+	if type(render) ~= "function" then
+		error("story table needs `story` (Vide) or `render` (generic)")
+	end
+	local props = {
+		target = target,
+		controls = values,
+		-- Controls never change during a mount, so a subscription has nothing to deliver.
+		subscribe = function(): () -> ()
+			return function() end
+		end,
+	}
+	local result = render(props)
+	if typeof(result) == "Instance" then
+		result.Parent = target
+		return function()
+			result:Destroy()
+		end
+	end
+	return result
+end
+
+function Tool.Run(arguments: {
+	story: string,
+	controls: { [string]: any }?,
+	size: { number }?,
+	background: string?,
+	keep: boolean?,
+	scale: number?,
+}): Result
+	teardown()
+
+	local found, problem = Path.Resolve(arguments.story)
+	if not found then
+		return fail(problem :: string)
+	end
+	if not found:IsA("ModuleScript") then
+		return fail(`{found:GetFullName()} is a {found.ClassName}, not a ModuleScript`)
+	end
+
+	-- Clone the folder the story lives in so this run sees the current source of everything in it.
+	local original = found.Parent :: Instance
+	local clone = original:Clone()
+	clone.Name = original.Name
+	clone.Parent = original.Parent
+	local storyModule = clone:FindFirstChild(found.Name) :: ModuleScript
+	mounted.clone = clone
+
+	local okRequire, story = pcall(require, storyModule)
+	if not okRequire then
+		teardown()
+		return fail(`story failed to load: {story}`)
+	end
+
+	local values: { [string]: any } = {}
+	if type(story) == "table" and type(story.controls) == "table" then
+		for name, entry in story.controls do
+			values[name] = controlDefault(entry)
+		end
+	end
+	local overrides: { [string]: any } = arguments.controls or {}
+	for name, value in overrides do
+		if typeof(values[name]) == "Color3" and type(value) == "string" then
+			values[name] = parseColor(value) or values[name]
+		else
+			values[name] = value
+		end
+	end
+
+	local size = arguments.size or { 1280, 720 }
+	local gui = Instance.new("ScreenGui")
+	gui.Name = GUI_NAME
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.Parent = StarterGui
+	mounted.gui = gui
+
+	local target = Instance.new("Frame")
+	target.Name = "Target"
+	target.Size = UDim2.fromOffset(size[1], size[2])
+	target.AnchorPoint = Vector2.new(0.5, 0.5)
+	target.Position = UDim2.fromScale(0.5, 0.5)
+	target.BorderSizePixel = 0
+	target.BackgroundColor3 = parseColor(arguments.background)
+		or (
+			if type(story) == "table" and typeof(story.background) == "Color3"
+				then story.background
+				else Color3.fromRGB(24, 24, 28)
+		)
+	target.Parent = gui
+
+	-- Design builds its sheets on first require (Rojo can't author StyleRules).
+	local design = ReplicatedStorage:FindFirstChild("Design")
+	if design and design:IsA("ModuleScript") then
+		pcall(require, design)
+	end
+	local sheet = if design then design:FindFirstChild("StyleSheet") else nil
+	if sheet and sheet:IsA("StyleSheet") then
+		local link = Instance.new("StyleLink")
+		link.Parent = gui
+		link.StyleSheet = sheet
+	end
+
+	local okMount, cleanupOrError = pcall(mountStory, story, target, values)
+	if not okMount then
+		teardown()
+		return fail(`story errored while mounting: {cleanupOrError}`)
+	end
+	mounted.cleanup = if type(cleanupOrError) == "function" then cleanupOrError else nil
+
+	task.wait(STYLE_RESOLVE_WAIT)
+
+	local shot = ScreenshotUi.Run({
+		root = `StarterGui.{GUI_NAME}`,
+		scale = arguments.scale,
+		name = `story-{string.gsub(found.Name, "[^%w_-]", "")}`,
+	})
+
+	local summary = { `mounted {found:GetFullName()} at {size[1]}x{size[2]}` }
+	local names = {}
+	for name, value in values do
+		table.insert(names, `{name}={tostring(value)}`)
+	end
+	table.sort(names)
+	if #names > 0 then
+		table.insert(summary, `controls: {table.concat(names, ", ")}`)
+	end
+	if arguments.keep then
+		table.insert(summary, `kept as StarterGui.{GUI_NAME} -- call mount_story again or run_luau to remove it`)
+	else
+		teardown()
+	end
+
+	local header: { type: "text", text: string } = { type = "text", text = table.concat(summary, "\n") }
+	table.insert(shot.content, 1, header)
+	return shot
+end
+
+return Tool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="46">
+        <Properties>
           <string name="Name">OptimizationLedger</string>
           <string name="Source"><![CDATA[--!strict
 
@@ -8824,7 +9110,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="46">
+      <Item class="ModuleScript" referent="47">
         <Properties>
           <string name="Name">Peer</string>
           <string name="Source"><![CDATA[--!strict
@@ -8881,7 +9167,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="47">
+      <Item class="ModuleScript" referent="48">
         <Properties>
           <string name="Name">Playtest</string>
           <string name="Source"><![CDATA[--!strict
@@ -8977,7 +9263,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="48">
+      <Item class="ModuleScript" referent="49">
         <Properties>
           <string name="Name">Print</string>
           <string name="Source"><![CDATA[--!strict
@@ -9076,7 +9362,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="49">
+      <Item class="ModuleScript" referent="50">
         <Properties>
           <string name="Name">ProfileScripts</string>
           <string name="Source"><![CDATA[--!strict
@@ -9571,7 +9857,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="50">
+      <Item class="ModuleScript" referent="51">
         <Properties>
           <string name="Name">RenderAnim</string>
           <string name="Source"><![CDATA[--!strict
@@ -10156,7 +10442,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="51">
+      <Item class="ModuleScript" referent="52">
         <Properties>
           <string name="Name">RenderBuild</string>
           <string name="Source"><![CDATA[--!strict
@@ -10299,7 +10585,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="52">
+      <Item class="ModuleScript" referent="53">
         <Properties>
           <string name="Name">ReviewRemotes</string>
           <string name="Source"><![CDATA[--!strict
@@ -10358,7 +10644,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="53">
+      <Item class="ModuleScript" referent="54">
         <Properties>
           <string name="Name">RunLuau</string>
           <string name="Source"><![CDATA[--!strict
@@ -10491,7 +10777,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="54">
+      <Item class="ModuleScript" referent="55">
         <Properties>
           <string name="Name">RunTimeline</string>
           <string name="Source"><![CDATA[--!strict
@@ -10823,7 +11109,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="55">
+      <Item class="ModuleScript" referent="56">
         <Properties>
           <string name="Name">ScreenshotUi</string>
           <string name="Source"><![CDATA[--!strict
@@ -10833,8 +11119,9 @@ return Tool
 -- sees StyleRules), and hands the flat list to the VMCP server, which rasterizes it.
 --
 -- What comes back is a layout check, not a render: boxes, strokes, gradients, corner radii and
--- rotation are exact; text is a bitmap font; EditableImage pixels are real, asset images are a
--- placeholder, and a ViewportFrame is a box naming what's inside it.
+-- rotation are exact; text is a bitmap font; EditableImage pixels are real, asset images are real
+-- when this server uploaded them (~/.vmcp/images/assets.json) and a placeholder otherwise, and a
+-- ViewportFrame is a box naming what's inside it.
 
 local Path = require(script.Parent.Parent.Path)
 
@@ -10859,8 +11146,9 @@ Tool.Definition = {
 	description = "Draws a ScreenGui (or any GuiObject) as a PNG so you can look at the layout "
 		.. "instead of reading AbsolutePosition numbers. Reads styled values, so StyleSheet rules "
 		.. "show. Boxes, strokes, gradients, corners and rotation are exact; text is a bitmap "
-		.. "font (check overflow with TextFits, not by eye); EditableImage icons are real pixels, "
-		.. "asset images are a tinted placeholder, ViewportFrames are a box naming their contents. "
+		.. "font (check overflow with TextFits, not by eye); EditableImage icons and assets that "
+		.. "upload_image published are real pixels, other asset images a tinted placeholder, "
+		.. "ViewportFrames a box naming their contents. "
 		.. "context plugin draws StarterGui as Studio lays it out; context client draws the "
 		.. "player's live PlayerGui.",
 	inputSchema = {
@@ -10868,7 +11156,7 @@ Tool.Definition = {
 		properties = {
 			root = {
 				type = "string",
-				description = 'Dotted path to a ScreenGui, GuiObject, or a container of ScreenGuis. '
+				description = "Dotted path to a ScreenGui, GuiObject, or a container of ScreenGuis. "
 					.. "Defaults to StarterGui in the edit session and the local PlayerGui in a client.",
 			},
 			context = {
@@ -11003,8 +11291,16 @@ local function describe(state: Walk, gui: GuiObject, clip: Rect?)
 	}
 
 	for _, child in gui:GetChildren() do
-		if child:IsA("UIStroke") and styled(child, "Enabled") and styled(child, "ApplyStrokeMode") == Enum.ApplyStrokeMode.Border then
-			node.stroke = { color = rgb(styled(child, "Color")), a = 1 - styled(child, "Transparency"), t = styled(child, "Thickness") }
+		if
+			child:IsA("UIStroke")
+			and styled(child, "Enabled")
+			and styled(child, "ApplyStrokeMode") == Enum.ApplyStrokeMode.Border
+		then
+			node.stroke = {
+				color = rgb(styled(child, "Color")),
+				a = 1 - styled(child, "Transparency"),
+				t = styled(child, "Thickness"),
+			}
 		elseif child:IsA("UICorner") then
 			local radius: UDim = styled(child, "CornerRadius")
 			node.corner = radius.Offset + radius.Scale * math.min(size.X, size.Y)
@@ -11026,7 +11322,9 @@ local function describe(state: Walk, gui: GuiObject, clip: Rect?)
 		if gui:IsA("TextBox") and text == "" then
 			text = styled(gui, "PlaceholderText")
 		end
-		local textSize: number = if styled(gui, "TextScaled") then math.min(gui.TextBounds.Y, size.Y) else styled(gui, "TextSize")
+		local textSize: number = if styled(gui, "TextScaled")
+			then math.min(gui.TextBounds.Y, size.Y)
+			else styled(gui, "TextSize")
 		node.text = {
 			s = text,
 			size = textSize,
@@ -11049,10 +11347,23 @@ local function describe(state: Walk, gui: GuiObject, clip: Rect?)
 			if pixels then
 				image.px, image.pw, image.ph = pixels.px, pixels.pw, pixels.ph
 			end
-		elseif content.SourceType == Enum.ContentSourceType.None and (styled(gui, "Image") :: string) == "" then
-			image.a = 0
+		else
+			local uri: string = if content.SourceType == Enum.ContentSourceType.Uri
+				then content.Uri
+				else styled(gui, "Image")
+			local id = string.match(uri, "^rbxassetid://(%d+)$") or string.match(uri, "[?&]id=(%d+)")
+			if id then
+				-- The server draws real pixels when it uploaded this id itself (assets.json).
+				image.asset = tonumber(id)
+			elseif uri == "" then
+				image.a = 0
+			end
 		end
-		if styled(gui, "ScaleType") == Enum.ScaleType.Tile then
+		local scaleType = styled(gui, "ScaleType")
+		if scaleType == Enum.ScaleType.Fit then
+			image.fit = true
+		end
+		if scaleType == Enum.ScaleType.Tile then
 			local tile: UDim2 = styled(gui, "TileSize")
 			image.tile = { w = tile.X.Offset + tile.X.Scale * size.X, h = tile.Y.Offset + tile.Y.Scale * size.Y }
 		end
@@ -11223,7 +11534,10 @@ function Tool.Run(arguments: { root: string?, scale: number?, name: string? }): 
 		content = {
 			{
 				type = "text",
-				text = `{state.count} element(s) under {root:GetFullName()}, {size.X}x{size.Y} at {string.format("%.2f", scale)}x{note}`,
+				text = `{state.count} element(s) under {root:GetFullName()}, {size.X}x{size.Y} at {string.format(
+					"%.2f",
+					scale
+				)}x{note}`,
 			},
 		},
 		postProcess = {
@@ -11241,7 +11555,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="56">
+      <Item class="ModuleScript" referent="57">
         <Properties>
           <string name="Name">SearchScripts</string>
           <string name="Source"><![CDATA[--!strict
@@ -11472,7 +11786,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="57">
+      <Item class="ModuleScript" referent="58">
         <Properties>
           <string name="Name">TimelinePart</string>
           <string name="Source"><![CDATA[--!strict
@@ -11576,7 +11890,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="58">
+      <Item class="ModuleScript" referent="59">
         <Properties>
           <string name="Name">TryScripts</string>
           <string name="Source"><![CDATA[--!strict
@@ -11688,7 +12002,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="59">
+      <Item class="ModuleScript" referent="60">
         <Properties>
           <string name="Name">UploadImage</string>
           <string name="Source"><![CDATA[--!strict
@@ -11719,7 +12033,9 @@ Tool.Definition = {
 		.. "First-time setup: pass `apiKey` once (an Open Cloud key with the assets read/write "
 		.. "scope for that user or group) and it's remembered in ~/.vmcp/roblox-api-key. "
 		.. "Moderation runs after upload, so the id is usable at once and the picture appears a "
-		.. "little later.",
+		.. "little later. Images must be 4096px on the long side (Roblox downsamples; small "
+		.. "uploads look blurry) unless allowSmall is set. Every id is remembered in "
+		.. "~/.vmcp/images/assets.json so screenshot_ui can draw the real picture.",
 	inputSchema = {
 		type = "object",
 		properties = {
@@ -11743,6 +12059,10 @@ Tool.Definition = {
 			apiKey = {
 				type = "string",
 				description = "Open Cloud API key to remember for every later upload. Only needed once.",
+			},
+			allowSmall = {
+				type = "boolean",
+				description = "Upload even when the long side is under 4096px. Assets are meant to be exported at 4K and downsampled by Roblox, so this is refused by default.",
 			},
 		},
 	},
@@ -11768,11 +12088,13 @@ function Tool.Run(arguments: {
 	description: string?,
 	owner: string?,
 	apiKey: string?,
+	allowSmall: boolean?,
 }): Result
 	local directive: { [string]: any } = {
 		kind = "upload",
 		apiKey = arguments.apiKey,
 		description = arguments.description,
+		allowSmall = arguments.allowSmall == true,
 	}
 
 	local owner = arguments.owner
@@ -11813,7 +12135,9 @@ function Tool.Run(arguments: {
 		end
 		local pixels = Canvas.Base64Pixels(image)
 		if not pixels then
-			return fail(`{found:GetFullName()} is too big to send ({image.Size.X}x{image.Size.Y}); render it with vmcp.Render first and upload the file`)
+			return fail(
+				`{found:GetFullName()} is too big to send ({image.Size.X}x{image.Size.Y}); render it with vmcp.Render first and upload the file`
+			)
 		end
 		directive.width = image.Size.X
 		directive.height = image.Size.Y
@@ -11826,7 +12150,10 @@ function Tool.Run(arguments: {
 		return fail("give `file` (a PNG vmcp.Render wrote) or `root` (an image in the place)")
 	end
 
-	local what = if directive.file then `~/.vmcp/images/{directive.file}.png` elseif directive.pixels then arguments.root else "nothing"
+	local what = if directive.file
+		then `~/.vmcp/images/{directive.file}.png`
+		elseif directive.pixels then arguments.root
+		else "nothing"
 	local who = if directive.groupId then `group {directive.groupId}` else `user {directive.userId}`
 	return {
 		content = { { type = "text", text = `uploading {what} as "{directive.name or "-"}" owned by {who}` } },

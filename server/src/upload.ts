@@ -82,3 +82,21 @@ export async function uploadImage(png: Buffer, request: UploadRequest): Promise<
 	log(`uploaded ${request.name} as rbxassetid://${id}`);
 	return id;
 }
+
+const ASSETS_PATH = join(config.stateDir, "images", "assets.json");
+
+/** Which PNG under ~/.vmcp/images became which asset id, so screenshot_ui can draw the real picture. */
+export function readAssets(): Record<string, string> {
+	try {
+		return JSON.parse(readFileSync(ASSETS_PATH, "utf8")) as Record<string, string>;
+	} catch {
+		return {};
+	}
+}
+
+export function rememberAsset(id: number, file: string): void {
+	const assets = readAssets();
+	assets[String(id)] = file;
+	mkdirSync(join(config.stateDir, "images"), { recursive: true });
+	writeFileSync(ASSETS_PATH, JSON.stringify(assets, null, "\t"));
+}

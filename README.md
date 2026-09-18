@@ -120,3 +120,23 @@ Standard Rojo project, built with [Rojo](https://rojo.space/) 7.7.0-rc.1:
 rojo build -o "VMCP.rbxlx"
 rojo serve
 ```
+
+## UI: icons, stories, the theme
+
+The place carries a worked example of the UI pipeline (`src/client/UI/`, `src/design/`):
+
+- **Icons and plates** are vectors — Iconify names or SVG files listed in
+  `src/client/UI/design/icons.json` — rasterized headless by OpenPencil
+  (`npm i -g @open-pencil/cli`, then `node server/scripts/icons.mjs <spec.json>`) at 4096px, so
+  Roblox does the downsampling. `upload_image` refuses anything smaller unless told otherwise, and
+  records every id in `~/.vmcp/images/assets.json` so `screenshot_ui` can draw the real picture.
+  `.mcp.json` also wires OpenPencil's MCP server, which drives the desktop app when it's open.
+- **Components** are folders with `init.luau` (plain Instances, Vide only for state and motion)
+  and a `*.story.luau` in [UI Labs](https://ui-labs.luau.page/) format. The `mount_story` tool
+  mounts a story into StarterGui and screenshots it; the UI Labs plugin (asset 14293316215)
+  shows the same stories to a human with hot reload and controls. `wally install` fetches Vide
+  and the UI Labs utils into `Packages/`.
+- **The theme** is `ReplicatedStorage.Design`, a module that builds the Style Editor's sheet
+  layout (rules, tokens, themes) on first require, since Rojo can't author StyleRule properties.
+
+The skills under `.claude/skills/` (`vmcp-icons`, `vmcp-ui`, `vmcp-styling`) are the working notes.

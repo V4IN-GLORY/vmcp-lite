@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "open-pencil": {
+      "command": "npx",
+      "args": ["-y", "@open-pencil/mcp"],
+      "env": { "OPENPENCIL_MCP_ROOT": "C:/Users/Rhiley/.vmcp/design" }
+    }
+  }
+}

@@ -1,4 +1,6 @@
-import { Surface } from "./image.js";
+import { existsSync, readFileSync } from "node:fs";
+import { decodePng, Surface } from "./image.js";
+import { readAssets } from "./upload.js";
 import { GLYPH_HEIGHT, label, textWidth } from "./font.js";
 
 /**
@@ -44,7 +46,18 @@ export interface UiNode {
 	stroke?: { color: number[]; a: number; t: number };
 	grad?: { rot: number; colors: number[][]; alphas: number[][] };
 	text?: { s: string; size: number; color: number[]; a: number; ax: number; ay: number; wrap: boolean };
-	image?: { color: number[]; a: number; px?: string; pw?: number; ph?: number; tile?: { w: number; h: number } };
+	image?: {
+		color: number[];
+		a: number;
+		px?: string;
+		pw?: number;
+		ph?: number;
+		tile?: { w: number; h: number };
+		/** rbxassetid; drawn for real when assets.json says this server uploaded it. */
+		asset?: number;
+		/** ScaleType.Fit: letterbox inside the box instead of stretching. */
+		fit?: boolean;
+	};
 	label?: string;
 }
 
@@ -258,6 +271,28 @@ function drawText(surface: Surface, node: UiNode, s: number): void {
 	}
 }
 
+const assetCache = new Map<number, { bytes: Uint8ClampedArray; pw: number; ph: number } | null>();
+
+/** Pixels shipped by the plugin (an EditableImage), or read from the PNG this server uploaded as that asset. */
+function sourcePixels(image: NonNullable<UiNode["image"]>): { bytes: Uint8ClampedArray | Buffer; pw: number; ph: number } | undefined {
+	if (image.px && image.pw && image.ph) {
+		const bytes = Buffer.from(image.px, "base64");
+		return bytes.length === image.pw * image.ph * 4 ? { bytes, pw: image.pw, ph: image.ph } : undefined;
+	}
+	if (image.asset === undefined) return undefined;
+	let cached = assetCache.get(image.asset);
+	if (cached === undefined) {
+		cached = null;
+		const file = readAssets()[String(image.asset)];
+		if (file && existsSync(file)) {
+			const decoded = decodePng(readFileSync(file));
+			if (decoded) cached = { bytes: decoded.pixels, pw: decoded.width, ph: decoded.height };
+		}
+		assetCache.set(image.asset, cached);
+	}
+	return cached ?? undefined;
+}
+
 function drawImage(surface: Surface, node: UiNode, box: Box, s: number): void {
 	const image = node.image;
 	if (!image) return;
@@ -267,32 +302,55 @@ function drawImage(surface: Surface, node: UiNode, box: Box, s: number): void {
 	const clip = scaledClip(node.clip, s);
 	const area = bounds(box, 0);
 
-	if (image.px && image.pw && image.ph) {
-		const bytes = Buffer.from(image.px, "base64");
-		if (bytes.length !== image.pw * image.ph * 4) return;
-		const tileW = image.tile ? image.tile.w * s : box.hw * 2;
-		const tileH = image.tile ? image.tile.h * s : box.hh * 2;
+	const source = sourcePixels(image);
+	if (source) {
+		const { bytes, pw, ph } = source;
+		// Fit letterboxes the whole picture inside the box; Stretch (and everything else) fills it.
+		let fitW = box.hw * 2;
+		let fitH = box.hh * 2;
+		if (image.fit && !image.tile) {
+			const k = Math.min(fitW / pw, fitH / ph);
+			fitW = pw * k;
+			fitH = ph * k;
+		}
+		const offX = box.hw - fitW / 2;
+		const offY = box.hh - fitH / 2;
+		const tileW = image.tile ? image.tile.w * s : fitW;
+		const tileH = image.tile ? image.tile.h * s : fitH;
+		// A 4K asset in a 32px box: average a block of source pixels per output pixel so it
+		// reads the way the engine's mipmaps make it look, not as one sampled pixel.
+		const stepX = Math.max(1, Math.floor(pw / Math.max(tileW, 1)));
+		const stepY = Math.max(1, Math.floor(ph / Math.max(tileH, 1)));
 		for (let y = area.y; y < area.y + area.h; y++) {
 			for (let x = area.x; x < area.x + area.w; x++) {
 				if (!inClip(clip, x, y)) continue;
 				const { d, lx, ly } = edgeDistance(box, x, y);
 				if (d > 0) continue;
 				// Local coords run -half..half; map into the (possibly tiled) source image.
-				const u = (((lx + box.hw) % tileW) + tileW) % tileW;
-				const v = (((ly + box.hh) % tileH) + tileH) % tileH;
-				const sx = Math.min(image.pw - 1, Math.floor((u / tileW) * image.pw));
-				const sy = Math.min(image.ph - 1, Math.floor((v / tileH) * image.ph));
-				const at = (sy * image.pw + sx) * 4;
-				const pa = (bytes[at + 3] ?? 0) / 255;
-				if (pa <= 0) continue;
-				surface.blend(
-					x,
-					y,
-					((bytes[at] ?? 0) * tint[0]) / 255,
-					((bytes[at + 1] ?? 0) * tint[1]) / 255,
-					((bytes[at + 2] ?? 0) * tint[2]) / 255,
-					pa * alpha,
-				);
+				const u = lx + box.hw - offX;
+				const v = ly + box.hh - offY;
+				if (!image.tile && (u < 0 || v < 0 || u >= fitW || v >= fitH)) continue;
+				const tu = ((u % tileW) + tileW) % tileW;
+				const tv = ((v % tileH) + tileH) % tileH;
+				const sx = Math.min(pw - stepX, Math.floor((tu / tileW) * pw));
+				const sy = Math.min(ph - stepY, Math.floor((tv / tileH) * ph));
+				let r = 0;
+				let g = 0;
+				let b = 0;
+				let a = 0;
+				for (let yy = 0; yy < stepY; yy++) {
+					for (let xx = 0; xx < stepX; xx++) {
+						const at = ((sy + yy) * pw + sx + xx) * 4;
+						const pa = bytes[at + 3] ?? 0;
+						r += (bytes[at] ?? 0) * pa;
+						g += (bytes[at + 1] ?? 0) * pa;
+						b += (bytes[at + 2] ?? 0) * pa;
+						a += pa;
+					}
+				}
+				if (a <= 0) continue;
+				const pa = a / (stepX * stepY * 255);
+				surface.blend(x, y, ((r / a) * tint[0]) / 255, ((g / a) * tint[1]) / 255, ((b / a) * tint[2]) / 255, pa * alpha);
 			}
 		}
 		return;
