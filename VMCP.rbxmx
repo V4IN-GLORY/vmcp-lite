@@ -8751,7 +8751,7 @@ Tool.Definition = {
 		properties = {
 			story = {
 				type = "string",
-				description = "Dotted path to the story ModuleScript, e.g. StarterPlayer.StarterPlayerScripts.Client.UI.HexStat.HexStat.story",
+				description = "Dotted path to the component module or folder, e.g. StarterPlayer.StarterPlayerScripts.Client.UI.HexStat; its *.story child is mounted. A dotted path can't name the story itself (its name has a dot).",
 			},
 			controls = {
 				type = "object",
@@ -8883,12 +8883,19 @@ function Tool.Run(arguments: {
 }): Result
 	teardown()
 
-	local found, problem = Path.Resolve(arguments.story)
-	if not found then
+	local container, problem = Path.Resolve(arguments.story)
+	if not container then
 		return fail(problem :: string)
 	end
-	if not found:IsA("ModuleScript") then
-		return fail(`{found:GetFullName()} is a {found.ClassName}, not a ModuleScript`)
+	local found: ModuleScript? = nil
+	for _, child in container:GetChildren() do
+		if child:IsA("ModuleScript") and string.match(child.Name, "%.story$") then
+			found = child
+			break
+		end
+	end
+	if not found then
+		return fail(`{container:GetFullName()} has no *.story ModuleScript child`)
 	end
 
 	-- Clone the folder the story lives in so this run sees the current source of everything in it.

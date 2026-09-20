@@ -125,12 +125,14 @@ rojo serve
 
 The place carries a worked example of the UI pipeline (`src/client/UI/`, `src/design/`):
 
-- **Icons and plates** are vectors — Iconify names or SVG files listed in
-  `src/client/UI/design/icons.json` — rasterized headless by OpenPencil
-  (`npm i -g @open-pencil/cli`, then `node server/scripts/icons.mjs <spec.json>`) at 4096px, so
-  Roblox does the downsampling. `upload_image` refuses anything smaller unless told otherwise, and
-  records every id in `~/.vmcp/images/assets.json` so `screenshot_ui` can draw the real picture.
-  `.mcp.json` also wires OpenPencil's MCP server, which drives the desktop app when it's open.
+- **Icons and plates** are vectors — Iconify names, SVG, or JSX — rasterized at 4096px by
+  OpenPencil's core running headless in Node, so Roblox does the downsampling. Two ways in:
+  `openpencil-headless/` is an MCP server (wired in `.mcp.json`) that serves OpenPencil's own
+  tools (`render`, `search_icons`, `import_svg`, …) over one in-memory `.fig` — upstream's MCP
+  only relays to the desktop app — and `node server/scripts/icons.mjs <spec.json>` builds a whole
+  set from `src/client/UI/design/icons.json`. `upload_image` refuses anything under 4096px unless
+  told otherwise and records every id in `~/.vmcp/images/assets.json` so `screenshot_ui` can draw
+  the real picture.
 - **Components** are folders with `init.luau` (plain Instances, Vide only for state and motion)
   and a `*.story.luau` in [UI Labs](https://ui-labs.luau.page/) format. The `mount_story` tool
   mounts a story into StarterGui and screenshots it; the UI Labs plugin (asset 14293316215)

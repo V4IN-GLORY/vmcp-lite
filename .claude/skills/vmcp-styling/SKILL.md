@@ -89,6 +89,16 @@ numbers slid off their hexes. `rule:SetProperty(...)` again from a LocalScript a
 it stick. Prefer rules that set non-default values; when you must set a default, re-set it at
 runtime.
 
+**Whole rules copied from the edit session into a playtest are lossy too**, not just
+default-valued ones: a sheet built in edit mode and adopted by the client lost `SliceCenter` /
+`ScaleType` on the plate rules (panels drew as fit-scaled images). The client always builds its
+own sheet (`Design.Build()` checks `RunService:IsRunning()`); never rely on the StarterGui copy.
+
+**Team Create reverts StyleSheet deletes and renames.** Destroying or renaming a StyleSheet in
+edit mode reverts it and every StyleSheet created within ~1s of it, silently, from C++ ("The
+Parent property of X is locked" warnings while it restores). Only ever *add* sheets in edit
+mode; build beside the old, repoint links (`vmcp-ui`, "How UI Labs actually runs a story").
+
 **A comma list in one selector can match nothing.** The docs say `"ImageLabel, TextLabel"` works;
 `.A:Hover > .X, .A.Active > .X` gave no `SelectorError` and applied to neither. Verify a list with
 `inspect_style` or use one selector per rule (nested rules merge selectors, which is the same

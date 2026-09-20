@@ -1,30 +1,31 @@
 // Turns a JSON list of icons into 4096px PNGs under ~/.vmcp/images, ready for upload_image.
-// Each icon is a vector from Iconify (name "mdi:heart") or a local SVG file, drawn white on
-// transparent inside a square frame so ImageColor3 tints it and ScaleType.Fit never clips.
+// Each icon is a local SVG file (original art, see make-icons.py), drawn white on transparent
+// inside a frame so ImageColor3 tints it and ScaleType.Fit never clips.
 //
 //   node scripts/icons.mjs spec.json
 //
-// spec.json: { "set": "hud", "icons": { "heart": "mdi:heart", "skull": "game-icons:skull", "logo": "./logo.svg" } }
-// Iconify icons get a square frame; a local SVG keeps its viewBox aspect (a 256x160 plate exports
-// 4096x2560). Writes ~/.vmcp/design/<set>.fig (open it in OpenPencil to edit) and
-// ~/.vmcp/images/<set>-<icon>.png.
+// spec.json: { "set": "hud", "icons": { "heart": "./heart.svg", "logo": "./logo.svg" } }
+// A file keeps its viewBox aspect (a 256x160 plate exports 4096x2560), with a 3% clear edge. Writes ~/.vmcp/design/<set>.fig (open it in OpenPencil to
+// edit) and ~/.vmcp/images/<set>-<icon>.png.
+//
+// Runs OpenPencil's core in-process, the same way openpencil-headless/index.mjs does.
 
-import { execFileSync, execSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import svgpath from "svgpath";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const DESIGN = 1024; // frame size in the document; export scale 4 makes the 4096 asset
-const INSET = 0.08; // fraction of the frame left clear on each side
+// The headless package owns the OpenPencil dependency (and its Windows canvaskit patch).
+const HEADLESS = resolve(dirname(fileURLToPath(import.meta.url)), "../../openpencil-headless");
+const require = createRequire(join(HEADLESS, "package.json"));
+const { BUILTIN_IO_FORMATS, FigmaAPI, IORegistry, computeAllLayouts, createSVGNodes, headlessRenderNodes } = await import(pathToFileURL(require.resolve("@open-pencil/core")).href);
+const { prepareGraphFonts } = await import(pathToFileURL(require.resolve("@open-pencil/core/text")).href);
+
+const DESIGN = 1024; // frame's long side in the document; export scale 4 makes the 4096 asset
+const INSET = 0.08; // fraction of a square frame left clear on each side
+const PLATE_INSET = 0.03; // a plate's edge strokes would otherwise grow the export past the frame
 const EXPORT_SCALE = 4;
-// Node won't spawn a .cmd shim without a shell, so run the CLI's own entry point instead.
-const OPENPENCIL = join(execSync("npm root -g").toString().trim(), "@open-pencil/cli/bin/openpencil.js");
-if (!existsSync(OPENPENCIL)) {
-	console.error("openpencil is not installed: npm i -g @open-pencil/cli");
-	process.exit(1);
-}
-const openpencil = (args, options = {}) => execFileSync(process.execPath, [OPENPENCIL, ...args], options);
 
 const specPath = process.argv[2];
 if (!specPath) {
@@ -39,136 +40,98 @@ const imagesDir = join(home, "images");
 mkdirSync(designDir, { recursive: true });
 mkdirSync(imagesDir, { recursive: true });
 
-async function svgFor(source) {
-	if (source.endsWith(".svg")) return readFileSync(resolve(dirname(specPath), source), "utf8");
-	const [prefix, name] = source.split(":");
-	const res = await fetch(`https://api.iconify.design/${prefix}/${name}.svg`);
-	if (!res.ok) throw new Error(`iconify has no ${source} (${res.status})`);
-	return await res.text();
+// Every icon is a local SVG, drawn for the project (src/client/UI/design/make-icons.py); no stock sets.
+function svgFor(source) {
+	if (!source.endsWith(".svg")) throw new Error(`${source}: only ./file.svg entries are allowed, draw the icon`);
+	return readFileSync(resolve(dirname(specPath), source), "utf8");
 }
 
-// OpenPencil's headless eval accepts M L C Q Z only, each with its own letter: relative →
-// absolute, arcs → curves, H/V → L, and no implicit repeats (svgpath's toString writes those).
-function absolutePath(d) {
-	let x = 0;
-	let y = 0;
-	const out = [];
-	svgpath(d)
-		.abs()
-		.unarc()
-		.unshort()
-		.iterate((segment) => {
-			const [command] = segment;
-			if (command === "H") {
-				x = segment[1];
-				out.push(`L${x} ${y}`);
-			} else if (command === "V") {
-				y = segment[1];
-				out.push(`L${x} ${y}`);
-			} else {
-				if (command !== "Z") {
-					x = segment[segment.length - 2];
-					y = segment[segment.length - 1];
-				}
-				out.push(command + segment.slice(1).map((n) => Number(n.toFixed(3))).join(" "));
-			}
-		});
-	return out.join("");
-}
-
-// One vector per <path>. Filled paths get a white fill; stroke-only sets (lucide, tabler)
-// keep their stroke width, scaled with the icon.
-function pathsOf(svg) {
-	const viewBox = (svg.match(/viewBox="([^"]+)"/)?.[1] ?? "0 0 24 24").split(/\s+/).map(Number);
-	const strokeSvg = /<svg\b[^>]*\bstroke-width="([^"]+)"/.exec(svg)?.[1];
-	const paths = [];
-	for (const tag of svg.matchAll(/<path\b[^>]*>/g)) {
-		const d = tag[0].match(/\bd="([^"]+)"/)?.[1];
-		if (!d) continue;
-		const stroke = tag[0].match(/\bstroke-width="([^"]+)"/)?.[1] ?? strokeSvg;
-		const filled = !/\bfill="none"/.test(tag[0]) && !(strokeSvg && !/\bfill=/.test(tag[0]));
-		const opacity = Number(tag[0].match(/\b(?:fill-opacity|stroke-opacity|opacity)="([^"]+)"/)?.[1] ?? 1);
-		paths.push({ d: absolutePath(d), stroke: filled ? 0 : Number(stroke ?? 2), opacity, evenOdd: /fill-rule="evenodd"/.test(tag[0]) });
-	}
-	if (paths.length === 0) throw new Error("no <path> elements; convert shapes to paths first");
-	return { viewBox, paths };
-}
-
-function evalScript(icons) {
-	return `
+const io = new IORegistry(BUILTIN_IO_FORMATS);
+const blank = readFileSync(join(HEADLESS, "blank.fig"));
+const { graph } = await io.readDocument({ name: `${set}.fig`, data: new Uint8Array(blank) });
+const figma = new FigmaAPI(graph);
 const page = figma.currentPage;
-page.children.forEach(c => c.remove());
-const icons = ${JSON.stringify(icons)};
-icons.forEach((icon, i) => {
+
+const frames = [];
+let x = 0;
+for (const [name, source] of Object.entries(spec.icons)) {
+	// Iconify sets width/height to 1em, which the importer reads as a 1x1 frame; the viewBox is the size.
+	const svg = svgFor(source).replace(/\s(width|height)="[^"]*"/g, "");
+	const square = !source.endsWith(".svg");
+	const [, , vw, vh] = (svg.match(/viewBox="([^"]+)"/)?.[1] ?? "0 0 24 24").split(/\s+/).map(Number);
+	const long = Math.max(vw, vh);
+	const w = square ? DESIGN : Math.round((DESIGN * vw) / long);
+	const h = square ? DESIGN : Math.round((DESIGN * vh) / long);
+
 	const frame = figma.createFrame();
-	frame.name = icon.name;
-	frame.resize(icon.w, icon.h);
+	frame.name = name;
+	frame.resize(w, h);
 	frame.fills = [];
-	// A transparent frame exports cropped to its content; an invisible plate keeps the full square.
+	frame.x = x;
+	frame.y = 0;
+	page.appendChild(frame);
+	// A transparent frame exports cropped to its content; an invisible plate keeps the full canvas.
 	const plate = figma.createRectangle();
-	plate.resize(icon.w, icon.h);
+	plate.resize(w, h);
 	plate.fills = [{ type: "SOLID", color: { r: 0, g: 0, b: 0 }, opacity: 0 }];
 	frame.appendChild(plate);
 	plate.x = 0;
 	plate.y = 0;
-	frame.x = i * ${DESIGN + 64};
-	frame.y = 0;
-	page.appendChild(frame);
-	const [vx, vy, vw, vh] = icon.viewBox;
-	const inset = icon.square ? ${INSET} : 0;
-	const scale = (${DESIGN} * (1 - 2 * inset)) / Math.max(vw, vh);
-	const ox = (icon.w - vw * scale) / 2 - vx * scale;
-	const oy = (icon.h - vh * scale) / 2 - vy * scale;
-	for (const path of icon.paths) {
-		const v = figma.createVector();
-		v.vectorPaths = [{ windingRule: path.evenOdd ? "EVENODD" : "NONZERO", data: path.d }];
-		// Read the path's own origin before appendChild, which keeps page coordinates.
-		const bx = v.x;
-		const by = v.y;
-		frame.appendChild(v);
-		v.rescale(scale);
-		v.x = ox + bx * scale;
-		v.y = oy + by * scale;
-		if (path.stroke > 0) {
-			v.fills = [];
-			v.strokes = [{ type: "SOLID", color: { r: 1, g: 1, b: 1 }, opacity: path.opacity }];
-			v.strokeWeight = path.stroke * scale; // after rescale, which multiplies an existing weight
-			v.strokeCap = "ROUND";
-			v.strokeJoin = "ROUND";
-		} else {
-			v.fills = [{ type: "SOLID", color: { r: 1, g: 1, b: 1 }, opacity: path.opacity }];
-			v.strokes = [];
+
+	const art = createSVGNodes(graph, frame.id, svg, { name: "art", defaultColor: "#ffffff" });
+	const node = figma.getNodeById(art.id);
+	// The importer drops fill-opacity / stroke-opacity; one vector per <path>, in order.
+	const opacities = [...svg.matchAll(/<path\b[^>]*>/g)].map((tag) => Number(tag[0].match(/\b(?:fill-opacity|stroke-opacity|opacity)="([^"]+)"/)?.[1] ?? 1));
+	node.children.forEach((child, index) => {
+		const opacity = opacities[index] ?? 1;
+		if (opacity < 1) {
+			child.fills = child.fills.map((fill) => ({ ...fill, opacity }));
+			child.strokes = child.strokes.map((stroke) => ({ ...stroke, opacity }));
+		}
+	});
+	const inset = square ? INSET : PLATE_INSET;
+	const scale = (DESIGN * (1 - 2 * inset)) / long;
+	node.rescale(scale);
+	node.x = (w - node.width) / 2;
+	node.y = (h - node.height) / 2;
+
+	frames.push({ name, id: frame.id });
+	x += w + 64;
+}
+computeAllLayouts(graph);
+
+const fig = join(designDir, `${set}.fig`);
+writeFileSync(fig, (await io.writeDocument("fig", graph)).data);
+
+for (const { name, id } of frames) {
+	await prepareGraphFonts(graph, [id]);
+	const png = await headlessRenderNodes(graph, page.id, [id], { scale: EXPORT_SCALE, format: "PNG" });
+	const out = join(imagesDir, `${set}-${name}.png`);
+	writeFileSync(out, png);
+	console.log(`${set}-${name}  ${out}`);
+}
+console.log(`design: ${fig}`);
+
+// Contact sheet on a dark ground so the white art is visible in a viewer.
+const { decodePng, encodePng, Surface } = await import(pathToFileURL(resolve(dirname(fileURLToPath(import.meta.url)), "../dist/image.js")).href);
+const CELL = 128;
+const sheet = new Surface(frames.length * CELL, CELL);
+sheet.pixels.fill(28);
+for (let i = 3; i < sheet.pixels.length; i += 4) sheet.pixels[i] = 255;
+frames.forEach(({ name }, index) => {
+	const icon = decodePng(readFileSync(join(imagesDir, `${set}-${name}.png`)));
+	const k = Math.max(icon.width, icon.height) / CELL;
+	for (let y = 0; y < CELL; y++) {
+		for (let x = 0; x < CELL; x++) {
+			const sx = Math.floor(x * k);
+			const sy = Math.floor(y * k);
+			if (sx >= icon.width || sy >= icon.height) continue;
+			const at = (sy * icon.width + sx) * 4;
+			const alpha = (icon.pixels[at + 3] ?? 0) / 255;
+			if (alpha > 0) sheet.blend(index * CELL + x, y, icon.pixels[at], icon.pixels[at + 1], icon.pixels[at + 2], alpha);
 		}
 	}
 });
-`;
-}
-
-const icons = [];
-for (const [name, source] of Object.entries(spec.icons)) {
-	const { viewBox, paths } = pathsOf(await svgFor(source));
-	const square = !source.endsWith(".svg");
-	const [, , vw, vh] = viewBox;
-	const long = Math.max(vw, vh);
-	icons.push({ name, viewBox, paths, square, w: square ? DESIGN : Math.round((DESIGN * vw) / long), h: square ? DESIGN : Math.round((DESIGN * vh) / long) });
-}
-
-const fig = join(designDir, `${set}.fig`);
-const blank = join(designDir, ".blank.fig");
-if (!existsSync(blank)) {
-	const html = join(designDir, ".blank.html");
-	writeFileSync(html, "<div></div>");
-	openpencil(["import", html, "-o", blank, "-q"], { stdio: "inherit" });
-}
-openpencil(["eval", blank, "-o", fig, "--stdin", "-q"], { input: evalScript(icons) });
-
-// Ids are renumbered when the file is written, so look each frame up by name afterwards.
-const frames = JSON.parse(openpencil(["find", fig, "--type", "FRAME", "--json"]).toString());
-for (const name of Object.keys(spec.icons)) {
-	const frame = frames.find((f) => f.name === name);
-	if (!frame) throw new Error(`frame ${name} missing after write`);
-	const png = join(imagesDir, `${set}-${name}.png`);
-	openpencil(["export", fig, "--node", frame.id, "-s", String(EXPORT_SCALE), "-o", png, "-q"]);
-	console.log(`${set}-${name}  ${png}`);
-}
-console.log(`design: ${fig}`);
+const sheetPath = join(imagesDir, `${set}-sheet.png`);
+writeFileSync(sheetPath, encodePng(sheet));
+console.log(`sheet: ${sheetPath}`);

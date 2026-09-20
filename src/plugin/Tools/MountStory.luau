@@ -5,14 +5,16 @@
 -- the human opens in UI Labs is what this draws, so there is one source of truth for a component.
 --
 -- Studio's require cache is per instance, and Rojo syncs an edit into the same instance, so a
--- plain require would keep serving the first version. The story's folder is cloned beside the
--- original for the mount (relative requires still resolve) and destroyed afterwards.
+-- plain require would keep serving the first version. Modules are loaded from source instead,
+-- the way UI Labs' hot reloader does it: every require reached from the story runs fresh, with
+-- `script` set and string paths ("./root", "../Make") resolved, so the mount matches the plugin.
 
 local Path = require(script.Parent.Parent.Path)
 local ScreenshotUi = require(script.Parent.ScreenshotUi)
 
 local StarterGui = game:GetService("StarterGui")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ScriptEditorService = game:GetService("ScriptEditorService")
 
 local GUI_NAME = "VMCPStory"
 local STYLE_RESOLVE_WAIT = 0.2 -- a StyleLink reads class defaults for a frame after linking
@@ -30,16 +32,16 @@ Tool.Definition = {
 	description = "Mounts a UI Labs story (a *.story ModuleScript) into a ScreenGui under "
 		.. "StarterGui with the given control values and returns a screenshot_ui picture of it. "
 		.. "Handles Vide stories ({ vide, story, controls }), generic stories ({ render, "
-		.. "controls }) and function stories. The story's folder is cloned for the mount so a "
-		.. "just-synced edit is what runs. ReplicatedStorage.Design.StyleSheet is linked when it "
-		.. "exists. Unless keep is set, the mount is torn down after the screenshot; with keep "
+		.. "controls }) and function stories. Every module the story requires is loaded from source "
+		.. "(like UI Labs' hot reloader), so a just-synced edit is what runs. ReplicatedStorage.Design "
+		.. "is linked when it exists. Unless keep is set, the mount is torn down after the screenshot; with keep "
 		.. "the ScreenGui stays as StarterGui.VMCPStory for inspect_style and run_luau probes.",
 	inputSchema = {
 		type = "object",
 		properties = {
 			story = {
 				type = "string",
-				description = "Dotted path to the story ModuleScript, e.g. StarterPlayer.StarterPlayerScripts.Client.UI.HexStat.HexStat.story",
+				description = "Dotted path to the component module or folder, e.g. StarterPlayer.StarterPlayerScripts.Client.UI.HexStat; its *.story child is mounted. A dotted path can't name the story itself (its name has a dot).",
 			},
 			controls = {
 				type = "object",
@@ -72,6 +74,58 @@ local function fail(text: string): Result
 	return { content = { { type = "text", text = text } }, isError = true }
 end
 
+-- "./x", "../x", "@self/x", "@game/x" relative to `module`, the way Luau string requires read.
+local function resolvePath(module: ModuleScript, path: string): ModuleScript
+	local current: Instance = module.Parent :: Instance
+	for _, part in string.split(path, "/") do
+		if part == ".." then
+			current = current.Parent :: Instance
+		elseif part == "@self" then
+			current = module
+		elseif part == "@game" then
+			current = game
+		elseif part ~= "." then
+			current = current:FindFirstChild(part) or error(`{path}: no "{part}" under {current:GetFullName()}`, 0)
+		end
+	end
+	if not current:IsA("ModuleScript") then
+		current = current:FindFirstChild("init")
+			or current:FindFirstChild("Init")
+			or error(`{path}: {current:GetFullName()} has no init module`, 0)
+	end
+	return current :: ModuleScript
+end
+
+-- One mount's module loader: fresh results, cached for the mount so a module shared by two
+-- components (Vide, Make) is one table.
+local function newLoader(): (ModuleScript) -> any
+	local cache: { [ModuleScript]: any } = {}
+	local function load(module: ModuleScript): any
+		if cache[module] ~= nil then
+			return cache[module]
+		end
+		local chunk, problem = loadstring(ScriptEditorService:GetEditorSource(module), module:GetFullName())
+		if not chunk then
+			error(problem, 0)
+		end
+		local globals: { [string]: any } = {
+			script = module,
+			require = function(dependency: any)
+				local target = if type(dependency) == "string" then resolvePath(module, dependency) else dependency
+				if typeof(target) ~= "Instance" or not target:IsA("ModuleScript") then
+					error(`{module:GetFullName()}: require of {tostring(dependency)} is not a ModuleScript`, 0)
+				end
+				return load(target)
+			end,
+		}
+		setfenv(chunk, setmetatable(globals, { __index = getfenv() }) :: any)
+		local result = chunk()
+		cache[module] = result
+		return result
+	end
+	return load
+end
+
 -- UI Labs control entries are either a raw default or { EntryType = "Control", ControlValue = default }.
 local function controlDefault(entry: any): any
 	if type(entry) == "table" and entry.EntryType == "Control" then
@@ -91,7 +145,7 @@ local function parseColor(text: string?): Color3?
 	return Color3.fromRGB(tonumber(r) :: number, tonumber(g) :: number, tonumber(b) :: number)
 end
 
-local mounted: { gui: ScreenGui?, clone: Instance?, cleanup: (() -> ())? } = {}
+local mounted: { gui: ScreenGui?, cleanup: (() -> ())? } = {}
 
 local function teardown()
 	if mounted.cleanup then
@@ -100,10 +154,7 @@ local function teardown()
 	if mounted.gui then
 		mounted.gui:Destroy()
 	end
-	if mounted.clone then
-		mounted.clone:Destroy()
-	end
-	mounted.gui, mounted.clone, mounted.cleanup = nil, nil, nil
+	mounted.gui, mounted.cleanup = nil, nil
 	local stale = StarterGui:FindFirstChild(GUI_NAME)
 	if stale then
 		stale:Destroy()
@@ -171,23 +222,23 @@ function Tool.Run(arguments: {
 }): Result
 	teardown()
 
-	local found, problem = Path.Resolve(arguments.story)
-	if not found then
+	local container, problem = Path.Resolve(arguments.story)
+	if not container then
 		return fail(problem :: string)
 	end
-	if not found:IsA("ModuleScript") then
-		return fail(`{found:GetFullName()} is a {found.ClassName}, not a ModuleScript`)
+	local found: ModuleScript? = nil
+	for _, child in container:GetChildren() do
+		if child:IsA("ModuleScript") and string.match(child.Name, "%.story$") then
+			found = child
+			break
+		end
+	end
+	if not found then
+		return fail(`{container:GetFullName()} has no *.story ModuleScript child`)
 	end
 
-	-- Clone the folder the story lives in so this run sees the current source of everything in it.
-	local original = found.Parent :: Instance
-	local clone = original:Clone()
-	clone.Name = original.Name
-	clone.Parent = original.Parent
-	local storyModule = clone:FindFirstChild(found.Name) :: ModuleScript
-	mounted.clone = clone
-
-	local okRequire, story = pcall(require, storyModule)
+	local load = newLoader()
+	local okRequire, story = pcall(load, found)
 	if not okRequire then
 		teardown()
 		return fail(`story failed to load: {story}`)
@@ -230,16 +281,13 @@ function Tool.Run(arguments: {
 		)
 	target.Parent = gui
 
-	-- Design builds its sheets on first require (Rojo can't author StyleRules).
+	-- The same fresh Design the story got: its Link puts a StyleLink on the gui.
 	local design = ReplicatedStorage:FindFirstChild("Design")
 	if design and design:IsA("ModuleScript") then
-		pcall(require, design)
-	end
-	local sheet = if design then design:FindFirstChild("StyleSheet") else nil
-	if sheet and sheet:IsA("StyleSheet") then
-		local link = Instance.new("StyleLink")
-		link.Parent = gui
-		link.StyleSheet = sheet
+		local okDesign, Design = pcall(load, design)
+		if okDesign and type(Design) == "table" and type(Design.Link) == "function" then
+			Design.Link(gui)
+		end
 	end
 
 	local okMount, cleanupOrError = pcall(mountStory, story, target, values)

@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "open-pencil": {
-      "command": "npx",
-      "args": ["-y", "@open-pencil/mcp"],
+      "command": "node",
+      "args": ["openpencil-headless/index.mjs"],
       "env": { "OPENPENCIL_MCP_ROOT": "C:/Users/Rhiley/.vmcp/design" }
     }
   }

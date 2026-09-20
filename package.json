@@ -6,7 +6,7 @@
     "vmcp": "server/dist/index.js"
   },
   "scripts": {
-    "prepare": "tsc -p server && rojo build plugin.project.json -o VMCP.rbxmx"
+    "prepare": "tsc -p server && rojo build plugin.project.json -o VMCP.rbxmx && npm --prefix openpencil-headless install --no-audit --no-fund"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
