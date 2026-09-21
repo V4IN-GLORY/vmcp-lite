@@ -117,6 +117,24 @@ export class SessionRegistry extends EventEmitter {
 		return [...this.exposed.values()];
 	}
 
+	/** One line per live Studio session and one per remembered place, for vmcp_status. */
+	describe(): string[] {
+		const lines: string[] = [];
+		if (this.sessions.size === 0) lines.push("connected Studio sessions: none");
+		for (const session of this.sessions.values()) {
+			const peers = [session.peers.server ? "server" : "", ...session.peers.clients.map((_, i) => `client${i + 1}`)].filter(Boolean);
+			lines.push(
+				`connected: "${session.placeName}" placeId=${session.placeId} session=${session.sessionId.slice(0, 8)} ` +
+					`tools=${session.tools.length}` + (peers.length ? ` playtest=[${peers.join(", ")}]` : ""),
+			);
+		}
+		for (const [placeId, entry] of this.manifest.all()) {
+			if ([...this.sessions.values()].some((s) => s.placeId === placeId)) continue;
+			lines.push(`remembered (not connected): "${entry.placeName}" placeId=${placeId} last seen ${entry.updatedAt}`);
+		}
+		return lines;
+	}
+
 	resolve(exposedName: string): ExposedTool | undefined {
 		return this.exposed.get(exposedName);
 	}

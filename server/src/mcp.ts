@@ -9,7 +9,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { log } from "./config.js";
+import { config, log } from "./config.js";
 import { RETRY_KEY, type ToolDefinition, type ToolResult } from "./protocol.js";
 import { settle } from "./postprocess.js";
 import { RetryCache } from "./retry-cache.js";
@@ -35,11 +35,43 @@ export interface ToolService {
 	offChanged(listener: () => void): void;
 }
 
+/**
+ * Served by this process, not by a plugin, so it's there even when no place is connected. It's
+ * the first thing to call when tools are listed but every call says the place isn't connected.
+ */
+const STATUS_TOOL: Tool = {
+	name: "vmcp_status",
+	description:
+		"Reports what this VMCP server can see: the port it owns, every Studio session connected to it " +
+		"(place name and id), places it remembers from earlier, and where the auth token lives. Call it " +
+		"first when tools are listed but a call says the place isn't connected.",
+	inputSchema: { type: "object", properties: {} },
+	annotations: { title: "VMCP status", readOnlyHint: true },
+};
+
+function statusReport(registry: SessionRegistry): CallToolResult {
+	const lines = [
+		`vmcp pid ${process.pid} owns ws://${config.host}:${config.port} (this is the primary)`,
+		`token: ${config.tokenPath} -- the plugin's Token field must hold this file's contents`,
+		`tool cache: ${config.manifestPath}`,
+		...registry.describe(),
+		"",
+		"If your place isn't in the connected list: open the VMCP panel in Studio (Plugins tab), check the",
+		"status word -- 'refused' is a wrong token or old plugin, 'not connected' means Connect wasn't",
+		"pressed, 'connecting' with no progress means nothing is listening on that port. This server",
+		"prints the reason for every connection it refuses to its stderr.",
+	];
+	return { content: [{ type: "text", text: lines.join("\n") }] };
+}
+
 export function localService(registry: SessionRegistry): ToolService {
 	const retries = new RetryCache();
 	return {
-		list: () => registry.list().map(advertise),
-		call: (name, args, onProgress) => callLocal(registry, retries, name, args, onProgress),
+		list: () => [STATUS_TOOL, ...registry.list().map(advertise)],
+		call: (name, args, onProgress) =>
+			name === STATUS_TOOL.name
+				? Promise.resolve(statusReport(registry))
+				: callLocal(registry, retries, name, args, onProgress),
 		onChanged: (listener) => void registry.on("changed", listener),
 		offChanged: (listener) => void registry.off("changed", listener),
 	};

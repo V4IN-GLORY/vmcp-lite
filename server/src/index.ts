@@ -31,7 +31,18 @@ async function main(): Promise<void> {
 	const listeners = new Set<() => void>();
 	const facade: ToolService = {
 		list: () => backend.list(),
-		call: (name, args, onProgress) => backend.call(name, args, onProgress),
+		call: async (name, args, onProgress) => {
+			const result = await backend.call(name, args, onProgress);
+			// The primary wrote the report; say when it came through a proxy so two processes
+			// with different tokens or state dirs are visible from the client's side.
+			if (name === "vmcp_status" && backend !== local) {
+				result.content.push({
+					type: "text",
+					text: `this MCP process (pid ${process.pid}) is a proxy: port ${config.port} was taken, so it forwards to the primary above. Its own token file is ${config.tokenPath}.`,
+				});
+			}
+			return result;
+		},
 		onChanged: (listener) => void listeners.add(listener),
 		offChanged: (listener) => void listeners.delete(listener),
 	};

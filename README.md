@@ -50,6 +50,26 @@ The server writes its token and cached tool lists to `%USERPROFILE%\.vmcp\`.
 | `VMCP_LIST_OFFLINE` | off | Keep listing tools for places that aren't open |
 | `VMCP_HOME` | `~/.vmcp` | Where the token and tool cache live |
 
+## When Claude lists the tools but can't reach your place
+
+Call `vmcp_status` (it's served by the Node side, so it's always listed). It says which process
+owns the port, every Studio session connected to it with place name and id, and where the token
+file is. Then:
+
+- **No connected sessions** — look at the VMCP panel in Studio. `refused` is a wrong token or an
+  old plugin build; `connecting` that never resolves means nothing is listening on that port;
+  `not connected` means Connect wasn't pressed. The server prints the reason for every connection
+  it refuses to stderr (`claude mcp` shows it with `--debug`).
+- **Connected, but it's a different place / window** — two Studio windows each connect as their
+  own session; tools get a place prefix once the server knows two places. Close the one you're
+  not using or call the prefixed name.
+- **`this MCP process is a proxy`** — another VMCP owns the port (a second Claude session, or an
+  old process). That's normal; the primary's sessions are what you're seeing. If the primary is
+  stale, end it and the proxy takes over.
+- **A socket error in Studio's Output like `Failed ws recv ... forcibly closed`** — the server
+  process died or was replaced mid-session. The plugin reconnects on its own with backoff (up to
+  30s); if it gives up with `superseded`, press Connect again.
+
 ## Building the plugin
 
 `src/plugin/` holds the panel UI and nothing else — no toolbar, no dock widget, no socket.
