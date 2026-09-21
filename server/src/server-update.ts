@@ -15,6 +15,16 @@ export interface ServerUpdate {
 	commits: number;
 }
 
+/** The commit this process was started from, so a later checkout change can be reported as "restart needed". */
+export const runningCommit: Promise<string | undefined> = existsSync(join(ROOT, ".git"))
+	? git("rev-parse", "HEAD").catch(() => undefined)
+	: Promise.resolve(undefined);
+
+export async function headCommit(): Promise<string | undefined> {
+	if (!existsSync(join(ROOT, ".git"))) return undefined;
+	return git("rev-parse", "HEAD").catch(() => undefined);
+}
+
 async function git(...args: string[]): Promise<string> {
 	const { stdout } = await run("git", args, { cwd: ROOT, timeout: GIT_TIMEOUT_MS });
 	return stdout.trim();

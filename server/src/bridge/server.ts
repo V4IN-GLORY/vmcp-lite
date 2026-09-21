@@ -25,7 +25,7 @@ import { Session, type ProgressUpdate } from "./session.js";
 import type { SessionRegistry } from "./registry.js";
 import type { ToolService } from "../mcp.js";
 import { applyPluginUpdate, pendingPluginUpdate } from "../plugin-update.js";
-import { applyServerUpdate, pendingServerUpdate } from "../server-update.js";
+import { applyServerUpdate, headCommit, pendingServerUpdate, runningCommit } from "../server-update.js";
 
 const HANDSHAKE_TIMEOUT_MS = 5_000;
 const ROBLOX_ORIGIN = /^https:\/\/([a-z0-9-]+\.)*roblox\.com$/i;
@@ -122,6 +122,11 @@ function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegist
 
 		if (msg.method.startsWith("ctx/")) {
 			handleContext(socket, msg, session, registry);
+			return;
+		}
+
+		if (msg.method === "updates/check") {
+			void updatesState().then((state) => replyOk(socket, msg, state));
 			return;
 		}
 
@@ -365,23 +370,34 @@ function handleHello(
 	registry.add(session);
 	replyOk(socket, msg, { protocolVersion: PROTOCOL_VERSION });
 
-	// Offer, never install: the panel shows a button and the person decides. Server first, since
-	// a new checkout usually brings a new plugin build with it.
-	void pendingServerUpdate().then((update) => {
-		if (!update || socket.readyState !== socket.OPEN) return;
-		log(`upstream is ${update.commits} commit(s) ahead (${update.to.slice(0, 8)}); offered to ${session.placeName}`);
-		socket.send(JSON.stringify({ jsonrpc: "2.0", method: "server/update-available", params: update }));
+	// Report, never install: the panel shows what's available and the person decides. The same
+	// state answers `updates/check` whenever the panel asks again.
+	void updatesState().then((state) => {
+		if (socket.readyState !== socket.OPEN) return;
+		if (state.server) log(`upstream is ${state.server.commits} commit(s) ahead; reported to ${session.placeName}`);
+		if (state.plugin) log(`a different plugin build is bundled (${state.plugin.sha256.slice(0, 12)}); reported to ${session.placeName}`);
+		socket.send(JSON.stringify({ jsonrpc: "2.0", method: "updates/state", params: state }));
 	});
-	const update = pendingPluginUpdate();
-	if (update) {
-		log(`a different plugin build is bundled (sha256 ${update.sha256.slice(0, 12)}); offered to ${session.placeName}`);
-		socket.send(JSON.stringify({
-			jsonrpc: "2.0",
-			method: "plugin/update-available",
-			params: { sha256: update.sha256, destination: update.destination, fresh: update.fresh, bytes: update.bytes.length },
-		}));
-	}
 	return session;
+}
+
+/**
+ * Everything the panel's Updates section shows. `running` vs `head` differ once a server update
+ * has been applied on disk but this process is still the old build -- the panel turns that into
+ * "restart your session".
+ */
+async function updatesState() {
+	const [server, running, head] = await Promise.all([pendingServerUpdate(), runningCommit, headCommit()]);
+	const bundled = pendingPluginUpdate();
+	return {
+		server: server ?? null,
+		plugin: bundled
+			? { sha256: bundled.sha256, destination: bundled.destination, fresh: bundled.fresh, bytes: bundled.bytes.length }
+			: null,
+		running: running ?? null,
+		head: head ?? null,
+		git: head !== undefined,
+	};
 }
 
 /**

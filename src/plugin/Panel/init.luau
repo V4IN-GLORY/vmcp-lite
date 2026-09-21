@@ -45,26 +45,37 @@ local Panel = {
 	Root = nil :: any,
 	ConnectButton = nil :: any,
 	DisconnectButton = nil :: any,
-	UpdateButton = nil :: any,
+	CheckButton = nil :: any,
+	ServerUpdateButton = nil :: any,
+	PluginUpdateButton = nil :: any,
+	ServerLine = nil :: any,
+	PluginLine = nil :: any,
+	RestartLine = nil :: any,
 	PortInput = nil :: any,
 	TokenInput = nil :: any,
 	StatusLine = nil :: any,
 	StatusWord = nil :: any,
 	ConnectRequested = nil :: any,
 	DisconnectRequested = nil :: any,
-	UpdateRequested = nil :: any,
+	CheckUpdatesRequested = nil :: any,
+	ServerUpdateRequested = nil :: any,
+	PluginUpdateRequested = nil :: any,
 	PortChanged = nil :: any,
 	TokenChanged = nil :: any,
 }
 
 Panel._connectRequestedBindable = Instance.new("BindableEvent")
 Panel._disconnectRequestedBindable = Instance.new("BindableEvent")
-Panel._updateRequestedBindable = Instance.new("BindableEvent")
+Panel._checkUpdatesBindable = Instance.new("BindableEvent")
+Panel._serverUpdateBindable = Instance.new("BindableEvent")
+Panel._pluginUpdateBindable = Instance.new("BindableEvent")
 Panel._portChangedBindable = Instance.new("BindableEvent")
 Panel._tokenChangedBindable = Instance.new("BindableEvent")
 Panel.ConnectRequested = Panel._connectRequestedBindable.Event
 Panel.DisconnectRequested = Panel._disconnectRequestedBindable.Event
-Panel.UpdateRequested = Panel._updateRequestedBindable.Event
+Panel.CheckUpdatesRequested = Panel._checkUpdatesBindable.Event
+Panel.ServerUpdateRequested = Panel._serverUpdateBindable.Event
+Panel.PluginUpdateRequested = Panel._pluginUpdateBindable.Event
 Panel.PortChanged = Panel._portChangedBindable.Event
 Panel.TokenChanged = Panel._tokenChangedBindable.Event
 
@@ -200,13 +211,24 @@ function Panel.SetDisconnectEnabled(enabled: boolean)
 	Panel.DisconnectButton.Interactable = enabled
 end
 
--- Shown only while the server has a different plugin build bundled; nil hides it again.
-function Panel.SetUpdateOffer(label: string?)
-	Panel.UpdateButton.Visible = label ~= nil
-	Panel.UpdateButton.Interactable = label ~= nil
-	if label then
-		Panel.UpdateButton.Text = label
-	end
+export type UpdatesView = {
+	server: string, -- the line of text
+	serverAction: boolean, -- whether the Update button is live
+	plugin: string,
+	pluginAction: boolean,
+	restart: string?, -- shown when the disk has moved past the running server
+	checking: boolean?,
+}
+
+-- The Updates section is always there; this only changes what it says and which buttons work.
+function Panel.SetUpdates(view: UpdatesView)
+	Panel.ServerLine.Text = view.server
+	Panel.ServerUpdateButton.Interactable = view.serverAction
+	Panel.PluginLine.Text = view.plugin
+	Panel.PluginUpdateButton.Interactable = view.pluginAction
+	Panel.RestartLine.Text = view.restart or ""
+	Panel.RestartLine.Visible = view.restart ~= nil
+	Panel.CheckButton.Interactable = not view.checking
 end
 
 ---------------------------------------------------------------------- tree
@@ -302,13 +324,6 @@ function Panel.Mount(parent: Instance): Frame
 	Panel.DisconnectButton = button("Disconnect", "Disconnect", "Ghost", buttonRow)
 	Panel.DisconnectButton.Interactable = false
 
-	Panel.UpdateButton = button("Update", "Update plugin", "Ghost", body)
-	Panel.UpdateButton.Visible = false
-	Panel.UpdateButton.Interactable = false
-	Panel.UpdateButton.Activated:Connect(function()
-		Panel._updateRequestedBindable:Fire()
-	end)
-
 	-- footer
 	local footer = box("Footer", body, Enum.FillDirection.Vertical, 8)
 
@@ -344,7 +359,42 @@ function Panel.Mount(parent: Instance): Frame
 		TextTruncate = Enum.TextTruncate.AtEnd,
 	}, field("TokenField", tokenGroup))
 
+	-- updates: one row per half, always visible, buttons live only when there's something to do
+	local updates = box("Updates", body, Enum.FillDirection.Vertical, 8)
+	local updatesHeader = box("UpdatesHeader", updates, Enum.FillDirection.Horizontal, 6)
+	label("UpdatesLabel", "Updates", updatesHeader)
+	Panel.CheckButton = new("TextButton", { Name = "Check", Text = "Check", AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 14) }, updatesHeader)
+	Panel.CheckButton:AddTag("FieldLabel")
+
+	local function updateRow(name: string, text: string): (TextLabel, TextButton)
+		local row = box(name .. "Row", updates, Enum.FillDirection.Horizontal, 8)
+		local line = label(name .. "Line", text, row)
+		line.Size = UDim2.new(1, -92, 0, 14)
+		line.AutomaticSize = Enum.AutomaticSize.None
+		line.TextTruncate = Enum.TextTruncate.AtEnd
+		local btn = button(name .. "Update", "Update", "Ghost", row)
+		btn.Size = UDim2.fromOffset(84, 28)
+		btn.Interactable = false
+		return line, btn
+	end
+	Panel.ServerLine, Panel.ServerUpdateButton = updateRow("Server", "Server: connect to check")
+	Panel.PluginLine, Panel.PluginUpdateButton = updateRow("Plugin", "Plugin: connect to check")
+	Panel.RestartLine = label("RestartLine", "", updates)
+	Panel.RestartLine.Size = UDim2.new(1, 0, 0, 0)
+	Panel.RestartLine.AutomaticSize = Enum.AutomaticSize.Y
+	Panel.RestartLine.TextWrapped = true
+	Panel.RestartLine.Visible = false
+
 	Style.Attach(root)
+	Panel.CheckButton.Activated:Connect(function()
+		Panel._checkUpdatesBindable:Fire()
+	end)
+	Panel.ServerUpdateButton.Activated:Connect(function()
+		Panel._serverUpdateBindable:Fire()
+	end)
+	Panel.PluginUpdateButton.Activated:Connect(function()
+		Panel._pluginUpdateBindable:Fire()
+	end)
 	disclosure.Activated:Connect(function()
 		Panel.SetTokenOpen(not tokenOpen)
 	end)
@@ -378,6 +428,9 @@ function Panel.Destroy()
 	Panel._disconnectRequestedBindable:Destroy()
 	Panel._portChangedBindable:Destroy()
 	Panel._tokenChangedBindable:Destroy()
+	Panel._checkUpdatesBindable:Destroy()
+	Panel._serverUpdateBindable:Destroy()
+	Panel._pluginUpdateBindable:Destroy()
 end
 
 return Panel

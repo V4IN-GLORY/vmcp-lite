@@ -441,12 +441,14 @@ caller can put it back.
 `ledger/write` takes `{ "key": "<script path>", "entry": { ... } }` and merges the fields in
 (stamping `updatedAt`); an absent `entry` deletes the key. Both reply with `{ placeId, entries }`.
 
-## 9c. `*/update-available` and `*/update-apply` — updates, by consent
+## 9c. `updates/*` — updates, by consent
 
-After it accepts an edit session's hello, the server checks two things and only *reports* them:
-whether its git checkout is behind upstream (`server/update-available { from, to, commits }`,
-answered by `server/update-apply { commit }`, which fast-forwards and rebuilds), and whether the
-`VMCP.rbxmx` bundled next to it differs from the installed one:
+After it accepts an edit session's hello, and whenever the plugin sends `updates/check {}`, the
+server *reports* `updates/state { server, plugin, running, head, git }`: whether its git checkout
+is behind upstream (`server: { from, to, commits }`, applied by `server/update-apply { commit }`,
+which fast-forwards and rebuilds), whether the `VMCP.rbxmx` bundled next to it differs from the
+installed one (`plugin`, below), and the commit it's running vs. the one on disk. The old shape
+of the plugin part, for reference:
 
 ```json
 { "jsonrpc": "2.0", "method": "plugin/update-available",

@@ -66,16 +66,6 @@ Panel.Mount(widget)
 Panel.PortInput.Text = port
 Panel.TokenInput.Text = token or ""
 
-Bridge.OnStatus(function(signal: string, word: string, line: string)
-	Panel.SetSignal(signal)
-	Panel.SetStatusWord(word)
-	Panel.SetStatusLine(line)
-
-	local live = signal == "Live" or signal == "Work"
-	Panel.SetConnectEnabled(not live)
-	Panel.SetDisconnectEnabled(live)
-end)
-
 local function connect()
 	if not token or token == "" then
 		Panel.SetSignal("Fault")
@@ -103,41 +93,92 @@ end)
 Panel.ConnectRequested:Connect(connect)
 Panel.DisconnectRequested:Connect(Bridge.Disconnect)
 
--- The server only offers updates; nothing is pulled or written until this button is clicked. A
--- server offer wins the button over a plugin one, since the new checkout brings its own plugin
--- build and that gets offered on the next connect.
-local offered: Bridge.UpdateOffer? = nil
-Bridge.OnUpdateOffered(function(offer)
-	if offered and offered.kind == "server" and offer.kind == "plugin" then
+-- The server only reports what could be updated; nothing is pulled or written until a button in
+-- this panel is clicked. The state arrives on connect and whenever Check is pressed.
+local updates: Bridge.UpdatesState? = nil
+
+local function short(commit: string?): string
+	return if commit then string.sub(commit, 1, 8) else "?"
+end
+
+local function showUpdates()
+	local u = updates
+	if not u then
+		Panel.SetUpdates({ server = "Server: connect to check", serverAction = false, plugin = "Plugin: connect to check", pluginAction = false })
 		return
 	end
-	offered = offer
-	if offer.kind == "server" then
-		Panel.SetUpdateOffer(`Update server ({offer.commits} commit{if offer.commits == 1 then "" else "s"} behind)`)
-		Panel.SetStatusLine(`Upstream is at {string.sub(offer.to, 1, 8)}; this checkout is at {string.sub(offer.from, 1, 8)}.`)
-	else
-		local build = offer :: any -- luau-lsp doesn't narrow the union on `kind`
-		Panel.SetUpdateOffer(`{if build.fresh then "Install" else "Update"} plugin ({string.sub(build.sha256, 1, 8)})`)
-		Panel.SetStatusLine(`A different plugin build is bundled with the server: {build.destination}`)
+	local server = if not u.git
+		then "Server: not a git checkout, update it by hand"
+		elseif u.server then `Server: {u.server.commits} commit{if u.server.commits == 1 then "" else "s"} behind ({short(u.server.to)})`
+		else `Server: up to date ({short(u.head)})`
+	local plugin = if u.plugin
+		then `Plugin: {if u.plugin.fresh then "not installed" else "different build bundled"} ({string.sub(u.plugin.sha256, 1, 8)})`
+		else "Plugin: up to date"
+	local restart = if u.running and u.head and u.running ~= u.head
+		then `Server on disk is {short(u.head)} but this session runs {short(u.running)} -- restart the Claude/MCP session.`
+		else nil
+	Panel.SetUpdates({ server = server, serverAction = u.server ~= nil, plugin = plugin, pluginAction = u.plugin ~= nil, restart = restart })
+	if u.server then
+		print(`[VMCP] server update available: {u.server.commits} commit(s) behind. Open the VMCP panel to apply it.`)
+	end
+	if u.plugin then
+		print(`[VMCP] plugin update available ({string.sub(u.plugin.sha256, 1, 8)}). Open the VMCP panel to apply it.`)
+	end
+end
+
+Bridge.OnStatus(function(signal: string, word: string, line: string)
+	Panel.SetSignal(signal)
+	Panel.SetStatusWord(word)
+	Panel.SetStatusLine(line)
+
+	local live = signal == "Live" or signal == "Work"
+	Panel.SetConnectEnabled(not live)
+	Panel.SetDisconnectEnabled(live)
+	if signal ~= "Live" then
+		updates = nil
+		showUpdates()
 	end
 end)
 
-Panel.UpdateRequested:Connect(function()
-	local offer = offered
-	if not offer then
+Bridge.OnUpdates(function(state)
+	updates = state
+	showUpdates()
+end)
+
+Panel.CheckUpdatesRequested:Connect(function()
+	Panel.SetUpdates({ server = "Server: checking...", serverAction = false, plugin = "Plugin: checking...", pluginAction = false, checking = true })
+	local ok, state = Bridge.CheckUpdates()
+	if ok then
+		updates = state
+	else
+		Panel.SetStatusLine(`Couldn't check: {state}`)
+	end
+	showUpdates()
+end)
+
+Panel.ServerUpdateRequested:Connect(function()
+	local u = updates
+	if not u or not u.server then
 		return
 	end
-	offered = nil
-	Panel.SetUpdateOffer(nil)
-	Panel.SetStatusLine(if offer.kind == "server" then "Pulling and rebuilding the server..." else "Writing the plugin...")
-	local ok, detail = Bridge.ApplyUpdate(offer)
-	if not ok then
-		Panel.SetStatusLine(`Update failed: {detail}`)
-	elseif offer.kind == "server" then
-		Panel.SetStatusLine(`Server {detail}.`)
-	else
-		Panel.SetStatusLine(`Installed to {detail}. Studio reloads a changed local plugin on its own.`)
+	Panel.SetUpdates({ server = "Server: pulling and rebuilding...", serverAction = false, plugin = "Plugin: wait", pluginAction = false, checking = true })
+	local ok, detail = Bridge.ApplyUpdate("server", u.server.to)
+	Panel.SetStatusLine(if ok then `Server {detail}.` else `Server update failed: {detail}`)
+	local checked, state = Bridge.CheckUpdates()
+	updates = if checked then state else updates
+	showUpdates()
+end)
+
+Panel.PluginUpdateRequested:Connect(function()
+	local u = updates
+	if not u or not u.plugin then
+		return
 	end
+	local ok, detail = Bridge.ApplyUpdate("plugin", u.plugin.sha256)
+	Panel.SetStatusLine(if ok then `Plugin installed to {detail}. Studio reloads a changed local plugin on its own.` else `Plugin update failed: {detail}`)
+	local checked, state = Bridge.CheckUpdates()
+	updates = if checked then state else updates
+	showUpdates()
 end)
 
 button.Click:Connect(function()

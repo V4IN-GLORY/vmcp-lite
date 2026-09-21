@@ -71,16 +71,6 @@ Panel.Mount(widget)
 Panel.PortInput.Text = port
 Panel.TokenInput.Text = token or ""
 
-Bridge.OnStatus(function(signal: string, word: string, line: string)
-	Panel.SetSignal(signal)
-	Panel.SetStatusWord(word)
-	Panel.SetStatusLine(line)
-
-	local live = signal == "Live" or signal == "Work"
-	Panel.SetConnectEnabled(not live)
-	Panel.SetDisconnectEnabled(live)
-end)
-
 local function connect()
 	if not token or token == "" then
 		Panel.SetSignal("Fault")
@@ -108,41 +98,92 @@ end)
 Panel.ConnectRequested:Connect(connect)
 Panel.DisconnectRequested:Connect(Bridge.Disconnect)
 
--- The server only offers updates; nothing is pulled or written until this button is clicked. A
--- server offer wins the button over a plugin one, since the new checkout brings its own plugin
--- build and that gets offered on the next connect.
-local offered: Bridge.UpdateOffer? = nil
-Bridge.OnUpdateOffered(function(offer)
-	if offered and offered.kind == "server" and offer.kind == "plugin" then
+-- The server only reports what could be updated; nothing is pulled or written until a button in
+-- this panel is clicked. The state arrives on connect and whenever Check is pressed.
+local updates: Bridge.UpdatesState? = nil
+
+local function short(commit: string?): string
+	return if commit then string.sub(commit, 1, 8) else "?"
+end
+
+local function showUpdates()
+	local u = updates
+	if not u then
+		Panel.SetUpdates({ server = "Server: connect to check", serverAction = false, plugin = "Plugin: connect to check", pluginAction = false })
 		return
 	end
-	offered = offer
-	if offer.kind == "server" then
-		Panel.SetUpdateOffer(`Update server ({offer.commits} commit{if offer.commits == 1 then "" else "s"} behind)`)
-		Panel.SetStatusLine(`Upstream is at {string.sub(offer.to, 1, 8)}; this checkout is at {string.sub(offer.from, 1, 8)}.`)
-	else
-		local build = offer :: any -- luau-lsp doesn't narrow the union on `kind`
-		Panel.SetUpdateOffer(`{if build.fresh then "Install" else "Update"} plugin ({string.sub(build.sha256, 1, 8)})`)
-		Panel.SetStatusLine(`A different plugin build is bundled with the server: {build.destination}`)
+	local server = if not u.git
+		then "Server: not a git checkout, update it by hand"
+		elseif u.server then `Server: {u.server.commits} commit{if u.server.commits == 1 then "" else "s"} behind ({short(u.server.to)})`
+		else `Server: up to date ({short(u.head)})`
+	local plugin = if u.plugin
+		then `Plugin: {if u.plugin.fresh then "not installed" else "different build bundled"} ({string.sub(u.plugin.sha256, 1, 8)})`
+		else "Plugin: up to date"
+	local restart = if u.running and u.head and u.running ~= u.head
+		then `Server on disk is {short(u.head)} but this session runs {short(u.running)} -- restart the Claude/MCP session.`
+		else nil
+	Panel.SetUpdates({ server = server, serverAction = u.server ~= nil, plugin = plugin, pluginAction = u.plugin ~= nil, restart = restart })
+	if u.server then
+		print(`[VMCP] server update available: {u.server.commits} commit(s) behind. Open the VMCP panel to apply it.`)
+	end
+	if u.plugin then
+		print(`[VMCP] plugin update available ({string.sub(u.plugin.sha256, 1, 8)}). Open the VMCP panel to apply it.`)
+	end
+end
+
+Bridge.OnStatus(function(signal: string, word: string, line: string)
+	Panel.SetSignal(signal)
+	Panel.SetStatusWord(word)
+	Panel.SetStatusLine(line)
+
+	local live = signal == "Live" or signal == "Work"
+	Panel.SetConnectEnabled(not live)
+	Panel.SetDisconnectEnabled(live)
+	if signal ~= "Live" then
+		updates = nil
+		showUpdates()
 	end
 end)
 
-Panel.UpdateRequested:Connect(function()
-	local offer = offered
-	if not offer then
+Bridge.OnUpdates(function(state)
+	updates = state
+	showUpdates()
+end)
+
+Panel.CheckUpdatesRequested:Connect(function()
+	Panel.SetUpdates({ server = "Server: checking...", serverAction = false, plugin = "Plugin: checking...", pluginAction = false, checking = true })
+	local ok, state = Bridge.CheckUpdates()
+	if ok then
+		updates = state
+	else
+		Panel.SetStatusLine(`Couldn't check: {state}`)
+	end
+	showUpdates()
+end)
+
+Panel.ServerUpdateRequested:Connect(function()
+	local u = updates
+	if not u or not u.server then
 		return
 	end
-	offered = nil
-	Panel.SetUpdateOffer(nil)
-	Panel.SetStatusLine(if offer.kind == "server" then "Pulling and rebuilding the server..." else "Writing the plugin...")
-	local ok, detail = Bridge.ApplyUpdate(offer)
-	if not ok then
-		Panel.SetStatusLine(`Update failed: {detail}`)
-	elseif offer.kind == "server" then
-		Panel.SetStatusLine(`Server {detail}.`)
-	else
-		Panel.SetStatusLine(`Installed to {detail}. Studio reloads a changed local plugin on its own.`)
+	Panel.SetUpdates({ server = "Server: pulling and rebuilding...", serverAction = false, plugin = "Plugin: wait", pluginAction = false, checking = true })
+	local ok, detail = Bridge.ApplyUpdate("server", u.server.to)
+	Panel.SetStatusLine(if ok then `Server {detail}.` else `Server update failed: {detail}`)
+	local checked, state = Bridge.CheckUpdates()
+	updates = if checked then state else updates
+	showUpdates()
+end)
+
+Panel.PluginUpdateRequested:Connect(function()
+	local u = updates
+	if not u or not u.plugin then
+		return
 	end
+	local ok, detail = Bridge.ApplyUpdate("plugin", u.plugin.sha256)
+	Panel.SetStatusLine(if ok then `Plugin installed to {detail}. Studio reloads a changed local plugin on its own.` else `Plugin update failed: {detail}`)
+	local checked, state = Bridge.CheckUpdates()
+	updates = if checked then state else updates
+	showUpdates()
 end)
 
 button.Click:Connect(function()
@@ -169,8 +210,9 @@ end
 -- Bridge.Connect(port, token, as)     as: { role, linkId, alsoClient } -- the edit session omits it
 -- Bridge.Disconnect()                 deliberate; stops retrying
 -- Bridge.OnStatus(fn)                 fn(signal, word, line) -- drives the Panel
--- Bridge.OnUpdateOffered(fn)          fn(offer) -- upstream is ahead, or a different plugin build is bundled
--- Bridge.ApplyUpdate(offer)           the person clicked Update; applies only what that offer named
+-- Bridge.OnUpdates(fn)               fn(state) -- what the server can update, pushed on connect
+-- Bridge.CheckUpdates()              asks again; same state comes back
+-- Bridge.ApplyUpdate(kind, id)       the person clicked Update; applies only the commit / sha named
 -- Bridge.Invoke(name, arguments)      call another tool, in any context, through the server
 -- Bridge.Ctx*                         the timeline's shared context, which the server holds
 --
@@ -222,7 +264,7 @@ local state = {
 	alsoClient = false,
 	-- Assigned by the server: 0 for a test server, 1+ for each test client.
 	peerIndex = nil :: number?,
-	onUpdateOffered = nil :: ((offer: any) -> ())?,
+	onUpdates = nil :: ((state: any) -> ())?,
 	toolFolder = nil :: Instance?,
 	getPlaceGuid = nil :: (() -> string)?,
 	onStatus = nil :: ((signal: string, word: string, line: string) -> ())?,
@@ -385,11 +427,9 @@ local function openSocket()
 		end
 
 		-- Nothing updates on its own: the server only says what's available and waits for a click.
-		if message.method == "plugin/update-available" or message.method == "server/update-available" then
-			if state.onUpdateOffered then
-				local offer = message.params
-				offer.kind = if message.method == "server/update-available" then "server" else "plugin"
-				state.onUpdateOffered(offer)
+		if message.method == "updates/state" then
+			if state.onUpdates then
+				state.onUpdates(message.params)
 			end
 			return
 		end
@@ -505,21 +545,29 @@ function Bridge.OnStatus(fn: (signal: string, word: string, line: string) -> ())
 	state.onStatus = fn
 end
 
-export type UpdateOffer =
-	{ kind: "plugin", sha256: string, destination: string, fresh: boolean, bytes: number }
-	| { kind: "server", from: string, to: string, commits: number }
+export type UpdatesState = {
+	server: { from: string, to: string, commits: number }?,
+	plugin: { sha256: string, destination: string, fresh: boolean, bytes: number }?,
+	running: string?, -- commit the server process started from
+	head: string?, -- commit its checkout is at now
+	git: boolean, -- false when the server isn't a git checkout, so it can never update itself
+}
 
-function Bridge.OnUpdateOffered(fn: (offer: UpdateOffer) -> ())
-	state.onUpdateOffered = fn
+function Bridge.OnUpdates(fn: (state: UpdatesState) -> ())
+	state.onUpdates = fn
 end
 
-function Bridge.ApplyUpdate(offer: UpdateOffer): (boolean, string)
+function Bridge.CheckUpdates(): (boolean, any)
+	return Bridge.Request("updates/check", {}, 30)
+end
+
+function Bridge.ApplyUpdate(kind: "server" | "plugin", id: string): (boolean, string)
 	local ok, payload
-	if offer.kind == "server" then
+	if kind == "server" then
 		-- git merge + npm ci on the other side; give it minutes, not seconds.
-		ok, payload = Bridge.Request("server/update-apply", { commit = offer.to }, 300)
+		ok, payload = Bridge.Request("server/update-apply", { commit = id }, 300)
 	else
-		ok, payload = Bridge.Request("plugin/update-apply", { sha256 = offer.sha256 }, 15)
+		ok, payload = Bridge.Request("plugin/update-apply", { sha256 = id }, 15)
 	end
 	if not ok then
 		return false, tostring(payload)
@@ -5618,26 +5666,37 @@ local Panel = {
 	Root = nil :: any,
 	ConnectButton = nil :: any,
 	DisconnectButton = nil :: any,
-	UpdateButton = nil :: any,
+	CheckButton = nil :: any,
+	ServerUpdateButton = nil :: any,
+	PluginUpdateButton = nil :: any,
+	ServerLine = nil :: any,
+	PluginLine = nil :: any,
+	RestartLine = nil :: any,
 	PortInput = nil :: any,
 	TokenInput = nil :: any,
 	StatusLine = nil :: any,
 	StatusWord = nil :: any,
 	ConnectRequested = nil :: any,
 	DisconnectRequested = nil :: any,
-	UpdateRequested = nil :: any,
+	CheckUpdatesRequested = nil :: any,
+	ServerUpdateRequested = nil :: any,
+	PluginUpdateRequested = nil :: any,
 	PortChanged = nil :: any,
 	TokenChanged = nil :: any,
 }
 
 Panel._connectRequestedBindable = Instance.new("BindableEvent")
 Panel._disconnectRequestedBindable = Instance.new("BindableEvent")
-Panel._updateRequestedBindable = Instance.new("BindableEvent")
+Panel._checkUpdatesBindable = Instance.new("BindableEvent")
+Panel._serverUpdateBindable = Instance.new("BindableEvent")
+Panel._pluginUpdateBindable = Instance.new("BindableEvent")
 Panel._portChangedBindable = Instance.new("BindableEvent")
 Panel._tokenChangedBindable = Instance.new("BindableEvent")
 Panel.ConnectRequested = Panel._connectRequestedBindable.Event
 Panel.DisconnectRequested = Panel._disconnectRequestedBindable.Event
-Panel.UpdateRequested = Panel._updateRequestedBindable.Event
+Panel.CheckUpdatesRequested = Panel._checkUpdatesBindable.Event
+Panel.ServerUpdateRequested = Panel._serverUpdateBindable.Event
+Panel.PluginUpdateRequested = Panel._pluginUpdateBindable.Event
 Panel.PortChanged = Panel._portChangedBindable.Event
 Panel.TokenChanged = Panel._tokenChangedBindable.Event
 
@@ -5773,13 +5832,24 @@ function Panel.SetDisconnectEnabled(enabled: boolean)
 	Panel.DisconnectButton.Interactable = enabled
 end
 
--- Shown only while the server has a different plugin build bundled; nil hides it again.
-function Panel.SetUpdateOffer(label: string?)
-	Panel.UpdateButton.Visible = label ~= nil
-	Panel.UpdateButton.Interactable = label ~= nil
-	if label then
-		Panel.UpdateButton.Text = label
-	end
+export type UpdatesView = {
+	server: string, -- the line of text
+	serverAction: boolean, -- whether the Update button is live
+	plugin: string,
+	pluginAction: boolean,
+	restart: string?, -- shown when the disk has moved past the running server
+	checking: boolean?,
+}
+
+-- The Updates section is always there; this only changes what it says and which buttons work.
+function Panel.SetUpdates(view: UpdatesView)
+	Panel.ServerLine.Text = view.server
+	Panel.ServerUpdateButton.Interactable = view.serverAction
+	Panel.PluginLine.Text = view.plugin
+	Panel.PluginUpdateButton.Interactable = view.pluginAction
+	Panel.RestartLine.Text = view.restart or ""
+	Panel.RestartLine.Visible = view.restart ~= nil
+	Panel.CheckButton.Interactable = not view.checking
 end
 
 ---------------------------------------------------------------------- tree
@@ -5875,13 +5945,6 @@ function Panel.Mount(parent: Instance): Frame
 	Panel.DisconnectButton = button("Disconnect", "Disconnect", "Ghost", buttonRow)
 	Panel.DisconnectButton.Interactable = false
 
-	Panel.UpdateButton = button("Update", "Update plugin", "Ghost", body)
-	Panel.UpdateButton.Visible = false
-	Panel.UpdateButton.Interactable = false
-	Panel.UpdateButton.Activated:Connect(function()
-		Panel._updateRequestedBindable:Fire()
-	end)
-
 	-- footer
 	local footer = box("Footer", body, Enum.FillDirection.Vertical, 8)
 
@@ -5917,7 +5980,42 @@ function Panel.Mount(parent: Instance): Frame
 		TextTruncate = Enum.TextTruncate.AtEnd,
 	}, field("TokenField", tokenGroup))
 
+	-- updates: one row per half, always visible, buttons live only when there's something to do
+	local updates = box("Updates", body, Enum.FillDirection.Vertical, 8)
+	local updatesHeader = box("UpdatesHeader", updates, Enum.FillDirection.Horizontal, 6)
+	label("UpdatesLabel", "Updates", updatesHeader)
+	Panel.CheckButton = new("TextButton", { Name = "Check", Text = "Check", AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 14) }, updatesHeader)
+	Panel.CheckButton:AddTag("FieldLabel")
+
+	local function updateRow(name: string, text: string): (TextLabel, TextButton)
+		local row = box(name .. "Row", updates, Enum.FillDirection.Horizontal, 8)
+		local line = label(name .. "Line", text, row)
+		line.Size = UDim2.new(1, -92, 0, 14)
+		line.AutomaticSize = Enum.AutomaticSize.None
+		line.TextTruncate = Enum.TextTruncate.AtEnd
+		local btn = button(name .. "Update", "Update", "Ghost", row)
+		btn.Size = UDim2.fromOffset(84, 28)
+		btn.Interactable = false
+		return line, btn
+	end
+	Panel.ServerLine, Panel.ServerUpdateButton = updateRow("Server", "Server: connect to check")
+	Panel.PluginLine, Panel.PluginUpdateButton = updateRow("Plugin", "Plugin: connect to check")
+	Panel.RestartLine = label("RestartLine", "", updates)
+	Panel.RestartLine.Size = UDim2.new(1, 0, 0, 0)
+	Panel.RestartLine.AutomaticSize = Enum.AutomaticSize.Y
+	Panel.RestartLine.TextWrapped = true
+	Panel.RestartLine.Visible = false
+
 	Style.Attach(root)
+	Panel.CheckButton.Activated:Connect(function()
+		Panel._checkUpdatesBindable:Fire()
+	end)
+	Panel.ServerUpdateButton.Activated:Connect(function()
+		Panel._serverUpdateBindable:Fire()
+	end)
+	Panel.PluginUpdateButton.Activated:Connect(function()
+		Panel._pluginUpdateBindable:Fire()
+	end)
 	disclosure.Activated:Connect(function()
 		Panel.SetTokenOpen(not tokenOpen)
 	end)
@@ -5951,6 +6049,9 @@ function Panel.Destroy()
 	Panel._disconnectRequestedBindable:Destroy()
 	Panel._portChangedBindable:Destroy()
 	Panel._tokenChangedBindable:Destroy()
+	Panel._checkUpdatesBindable:Destroy()
+	Panel._serverUpdateBindable:Destroy()
+	Panel._pluginUpdateBindable:Destroy()
 end
 
 return Panel

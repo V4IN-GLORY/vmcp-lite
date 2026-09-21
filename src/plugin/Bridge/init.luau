@@ -8,8 +8,9 @@
 -- Bridge.Connect(port, token, as)     as: { role, linkId, alsoClient } -- the edit session omits it
 -- Bridge.Disconnect()                 deliberate; stops retrying
 -- Bridge.OnStatus(fn)                 fn(signal, word, line) -- drives the Panel
--- Bridge.OnUpdateOffered(fn)          fn(offer) -- upstream is ahead, or a different plugin build is bundled
--- Bridge.ApplyUpdate(offer)           the person clicked Update; applies only what that offer named
+-- Bridge.OnUpdates(fn)               fn(state) -- what the server can update, pushed on connect
+-- Bridge.CheckUpdates()              asks again; same state comes back
+-- Bridge.ApplyUpdate(kind, id)       the person clicked Update; applies only the commit / sha named
 -- Bridge.Invoke(name, arguments)      call another tool, in any context, through the server
 -- Bridge.Ctx*                         the timeline's shared context, which the server holds
 --
@@ -61,7 +62,7 @@ local state = {
 	alsoClient = false,
 	-- Assigned by the server: 0 for a test server, 1+ for each test client.
 	peerIndex = nil :: number?,
-	onUpdateOffered = nil :: ((offer: any) -> ())?,
+	onUpdates = nil :: ((state: any) -> ())?,
 	toolFolder = nil :: Instance?,
 	getPlaceGuid = nil :: (() -> string)?,
 	onStatus = nil :: ((signal: string, word: string, line: string) -> ())?,
@@ -224,11 +225,9 @@ local function openSocket()
 		end
 
 		-- Nothing updates on its own: the server only says what's available and waits for a click.
-		if message.method == "plugin/update-available" or message.method == "server/update-available" then
-			if state.onUpdateOffered then
-				local offer = message.params
-				offer.kind = if message.method == "server/update-available" then "server" else "plugin"
-				state.onUpdateOffered(offer)
+		if message.method == "updates/state" then
+			if state.onUpdates then
+				state.onUpdates(message.params)
 			end
 			return
 		end
@@ -344,21 +343,29 @@ function Bridge.OnStatus(fn: (signal: string, word: string, line: string) -> ())
 	state.onStatus = fn
 end
 
-export type UpdateOffer =
-	{ kind: "plugin", sha256: string, destination: string, fresh: boolean, bytes: number }
-	| { kind: "server", from: string, to: string, commits: number }
+export type UpdatesState = {
+	server: { from: string, to: string, commits: number }?,
+	plugin: { sha256: string, destination: string, fresh: boolean, bytes: number }?,
+	running: string?, -- commit the server process started from
+	head: string?, -- commit its checkout is at now
+	git: boolean, -- false when the server isn't a git checkout, so it can never update itself
+}
 
-function Bridge.OnUpdateOffered(fn: (offer: UpdateOffer) -> ())
-	state.onUpdateOffered = fn
+function Bridge.OnUpdates(fn: (state: UpdatesState) -> ())
+	state.onUpdates = fn
 end
 
-function Bridge.ApplyUpdate(offer: UpdateOffer): (boolean, string)
+function Bridge.CheckUpdates(): (boolean, any)
+	return Bridge.Request("updates/check", {}, 30)
+end
+
+function Bridge.ApplyUpdate(kind: "server" | "plugin", id: string): (boolean, string)
 	local ok, payload
-	if offer.kind == "server" then
+	if kind == "server" then
 		-- git merge + npm ci on the other side; give it minutes, not seconds.
-		ok, payload = Bridge.Request("server/update-apply", { commit = offer.to }, 300)
+		ok, payload = Bridge.Request("server/update-apply", { commit = id }, 300)
 	else
-		ok, payload = Bridge.Request("plugin/update-apply", { sha256 = offer.sha256 }, 15)
+		ok, payload = Bridge.Request("plugin/update-apply", { sha256 = id }, 15)
 	end
 	if not ok then
 		return false, tostring(payload)
