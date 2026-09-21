@@ -66,7 +66,7 @@ async function finish(directive: Directive): Promise<Outcome> {
 	try {
 		const scene = directive as unknown as Scene;
 		const surface = renderScene(scene, await loadMaterials(materialsOf(scene)));
-		const path = outputPath(directive, "images", "canvas", "png");
+		const path = outputPath(directive, "images", "render", "png");
 		const png = encodePng(surface);
 		writeFileSync(path, png);
 		log(`wrote ${path}`);

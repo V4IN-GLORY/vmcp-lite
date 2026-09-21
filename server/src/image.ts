@@ -86,11 +86,3 @@ export function encodePng(surface: Surface): Buffer {
 		chunk("IEND", Buffer.alloc(0)),
 	]);
 }
-
-/** Width and height from the IHDR, or undefined when the bytes aren't a PNG. */
-const PNG_COLOR_CHANNELS: Record<number, number> = { 0: 1, 2: 3, 4: 2, 6: 4 };
-
-/**
- * Decodes an 8-bit non-interlaced PNG into a Surface. Covers what encodePng and OpenPencil
- * write; palette, 16-bit and interlaced files return undefined rather than a wrong picture.
- */

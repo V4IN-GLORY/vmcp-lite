@@ -444,13 +444,9 @@ caller can put it back.
 ## 10. `postProcess` — asking the server to finish a result
 
 A tool result may carry a `postProcess` object alongside `content`. It's for work the plugin
-genuinely can't do, which means writing a file or talking to Open Cloud. Kinds: `png` replays a
-Canvas recording, `scene` renders collected part geometry as a blockout picture, `ui` rasterizes a
-GUI walk (asset images are drawn for real when `~/.vmcp/images/assets.json` maps their id to a
-PNG this server uploaded), `gprx` writes a base64 `data` field out as a MicroProfiler capture
-under `~/.vmcp/profiles/<name>.gprx`, and `upload` publishes a PNG (`file` under
-`~/.vmcp/images`, or `pixels`) as a Roblox Image asset — refused under 4096px on the long side
-unless `allowSmall` is set — and records the id in `assets.json`.
+genuinely can't do, which means writing a file. Kinds: `scene` renders collected part geometry
+as a blockout picture under `~/.vmcp/images/<name>.png`, and `gprx` writes a base64 `data` field
+out as a MicroProfiler capture under `~/.vmcp/profiles/<name>.gprx`.
 
 ```json
 {

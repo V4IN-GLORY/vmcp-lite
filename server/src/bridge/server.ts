@@ -26,6 +26,7 @@ import type { SessionRegistry } from "./registry.js";
 import type { ToolService } from "../mcp.js";
 
 const HANDSHAKE_TIMEOUT_MS = 5_000;
+const ROBLOX_ORIGIN = /^https:\/\/([a-z0-9-]+\.)*roblox\.com$/i;
 
 /** Resolves once listening; rejects with the bind error (EADDRINUSE when another VMCP owns the port). */
 export function startBridge(registry: SessionRegistry, service: ToolService): Promise<WebSocketServer> {
@@ -34,8 +35,15 @@ export function startBridge(registry: SessionRegistry, service: ToolService): Pr
 			host: config.host,
 			port: config.port,
 			maxPayload: config.maxMessageBytes,
-			// A webpage can open a socket to localhost; a Studio plugin never sends an Origin.
-			verifyClient: (info: { origin?: string }) => info.origin === undefined,
+			// A webpage can open a socket to localhost, so browser origins are refused. The token is
+			// the real gate; this just keeps a stray tab from even reaching it. Studio has sent no
+			// Origin so far, but a roblox.com one is allowed in case a build starts adding it.
+			verifyClient: (info: { origin?: string; req: HttpRequest }) => {
+				const origin = info.origin;
+				if (origin === undefined || ROBLOX_ORIGIN.test(origin)) return true;
+				log(`refused an upgrade from ${info.req.socket.remoteAddress} -- origin ${origin}`);
+				return false;
+			},
 		});
 
 		wss.once("error", reject);
@@ -117,7 +125,7 @@ function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegist
 
 		if (msg.method === "post/process") {
 			// A snippet asking this server to finish something it can't do itself -- writing a
-			// Canvas recording out as a PNG. A tool result can carry the same directive, but a
+			// capture out as a file. A tool result can carry the same directive, but a
 			// timeline event isn't a tool result, so it asks directly.
 			const directive = (msg as JsonRpcRequest).params as Record<string, unknown> | undefined;
 			if (!directive || typeof directive !== "object") {
@@ -421,8 +429,8 @@ async function invokeTool(
 	}
 
 	try {
-		// Through the same finishing pass as a direct MCP call, so a snippet that draws a Canvas
-		// gets the PNG written whichever side asked for the tool.
+		// Through the same finishing pass as a direct MCP call, so a render gets its PNG written
+		// whichever side asked for the tool.
 		const result = await settle(await target.call(params.name, { ...args, __depth: depth + 1 }));
 		replyOk(socket, msg, { result });
 	} catch (err) {
