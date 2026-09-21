@@ -108,7 +108,7 @@ local function showUpdates()
 		return
 	end
 	local server = if not u.git
-		then "Server: not a git checkout, update it by hand"
+		then `Server: can't self-update -- {u.gitProblem or "git unavailable"}`
 		elseif u.server then `Server: {u.server.commits} commit{if u.server.commits == 1 then "" else "s"} behind ({short(u.server.to)})`
 		else `Server: up to date ({short(u.head)})`
 	local plugin = if u.plugin

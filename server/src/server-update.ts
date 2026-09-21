@@ -9,6 +9,42 @@ const run = promisify(execFile);
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const GIT_TIMEOUT_MS = 15_000;
 
+// An MCP client can spawn this process with a bare PATH, so "git" alone often isn't found even
+// though it's installed. VMCP_GIT wins; otherwise the usual Windows installs are tried.
+const GIT_CANDIDATES = [
+	process.env.VMCP_GIT,
+	"git",
+	...(process.platform === "win32"
+		? [
+				join(process.env.ProgramFiles ?? "C:\Program Files", "Git", "cmd", "git.exe"),
+				join(process.env.LOCALAPPDATA ?? "", "Programs", "Git", "cmd", "git.exe"),
+			]
+		: []),
+].filter((candidate): candidate is string => Boolean(candidate));
+
+const gitBinary: Promise<string> = (async () => {
+	for (const candidate of GIT_CANDIDATES) {
+		try {
+			await run(candidate, ["--version"], { timeout: GIT_TIMEOUT_MS });
+			return candidate;
+		} catch {
+			// next
+		}
+	}
+	throw new Error("git isn't on this process's PATH; set VMCP_GIT to git.exe");
+})();
+
+/** Why git can't be used here, or undefined when it can. Shown in the panel instead of a silent "not a checkout". */
+export async function gitProblem(): Promise<string | undefined> {
+	if (!existsSync(join(ROOT, ".git"))) return `${ROOT} is not a git checkout`;
+	try {
+		await gitBinary;
+		return undefined;
+	} catch (err) {
+		return (err as Error).message;
+	}
+}
+
 export interface ServerUpdate {
 	from: string;
 	to: string;
@@ -26,7 +62,7 @@ export async function headCommit(): Promise<string | undefined> {
 }
 
 async function git(...args: string[]): Promise<string> {
-	const { stdout } = await run("git", args, { cwd: ROOT, timeout: GIT_TIMEOUT_MS });
+	const { stdout } = await run(await gitBinary, args, { cwd: ROOT, timeout: GIT_TIMEOUT_MS });
 	return stdout.trim();
 }
 

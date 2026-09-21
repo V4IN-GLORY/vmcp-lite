@@ -25,7 +25,7 @@ import { Session, type ProgressUpdate } from "./session.js";
 import type { SessionRegistry } from "./registry.js";
 import type { ToolService } from "../mcp.js";
 import { applyPluginUpdate, pendingPluginUpdate } from "../plugin-update.js";
-import { applyServerUpdate, headCommit, pendingServerUpdate, runningCommit } from "../server-update.js";
+import { applyServerUpdate, gitProblem, headCommit, pendingServerUpdate, runningCommit } from "../server-update.js";
 
 const HANDSHAKE_TIMEOUT_MS = 5_000;
 const ROBLOX_ORIGIN = /^https:\/\/([a-z0-9-]+\.)*roblox\.com$/i;
@@ -387,7 +387,7 @@ function handleHello(
  * "restart your session".
  */
 async function updatesState() {
-	const [server, running, head] = await Promise.all([pendingServerUpdate(), runningCommit, headCommit()]);
+	const [server, running, head, problem] = await Promise.all([pendingServerUpdate(), runningCommit, headCommit(), gitProblem()]);
 	const bundled = pendingPluginUpdate();
 	return {
 		server: server ?? null,
@@ -396,7 +396,8 @@ async function updatesState() {
 			: null,
 		running: running ?? null,
 		head: head ?? null,
-		git: head !== undefined,
+		git: problem === undefined,
+		gitProblem: problem ?? null,
 	};
 }
 

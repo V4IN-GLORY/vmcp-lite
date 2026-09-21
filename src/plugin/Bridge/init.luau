@@ -348,7 +348,8 @@ export type UpdatesState = {
 	plugin: { sha256: string, destination: string, fresh: boolean, bytes: number }?,
 	running: string?, -- commit the server process started from
 	head: string?, -- commit its checkout is at now
-	git: boolean, -- false when the server isn't a git checkout, so it can never update itself
+	git: boolean, -- false when the server can't use git, so it can never update itself
+	gitProblem: string?, -- why, when git is false
 }
 
 function Bridge.OnUpdates(fn: (state: UpdatesState) -> ())
