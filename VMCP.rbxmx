@@ -108,22 +108,41 @@ end)
 Panel.ConnectRequested:Connect(connect)
 Panel.DisconnectRequested:Connect(Bridge.Disconnect)
 
--- The server only offers a plugin build; nothing is written to disk until this button is clicked.
-local offeredSha: string? = nil
+-- The server only offers updates; nothing is pulled or written until this button is clicked. A
+-- server offer wins the button over a plugin one, since the new checkout brings its own plugin
+-- build and that gets offered on the next connect.
+local offered: Bridge.UpdateOffer? = nil
 Bridge.OnUpdateOffered(function(offer)
-	offeredSha = offer.sha256
-	Panel.SetUpdateOffer(`{if offer.fresh then "Install" else "Update"} plugin ({string.sub(offer.sha256, 1, 8)})`)
-	Panel.SetStatusLine(`A different plugin build is bundled with the server: {offer.destination}`)
+	if offered and offered.kind == "server" and offer.kind == "plugin" then
+		return
+	end
+	offered = offer
+	if offer.kind == "server" then
+		Panel.SetUpdateOffer(`Update server ({offer.commits} commit{if offer.commits == 1 then "" else "s"} behind)`)
+		Panel.SetStatusLine(`Upstream is at {string.sub(offer.to, 1, 8)}; this checkout is at {string.sub(offer.from, 1, 8)}.`)
+	else
+		local build = offer :: any -- luau-lsp doesn't narrow the union on `kind`
+		Panel.SetUpdateOffer(`{if build.fresh then "Install" else "Update"} plugin ({string.sub(build.sha256, 1, 8)})`)
+		Panel.SetStatusLine(`A different plugin build is bundled with the server: {build.destination}`)
+	end
 end)
 
 Panel.UpdateRequested:Connect(function()
-	if not offeredSha then
+	local offer = offered
+	if not offer then
 		return
 	end
+	offered = nil
 	Panel.SetUpdateOffer(nil)
-	local ok, detail = Bridge.ApplyUpdate(offeredSha)
-	offeredSha = nil
-	Panel.SetStatusLine(if ok then `Installed to {detail}. Studio reloads a changed local plugin on its own.` else `Update failed: {detail}`)
+	Panel.SetStatusLine(if offer.kind == "server" then "Pulling and rebuilding the server..." else "Writing the plugin...")
+	local ok, detail = Bridge.ApplyUpdate(offer)
+	if not ok then
+		Panel.SetStatusLine(`Update failed: {detail}`)
+	elseif offer.kind == "server" then
+		Panel.SetStatusLine(`Server {detail}.`)
+	else
+		Panel.SetStatusLine(`Installed to {detail}. Studio reloads a changed local plugin on its own.`)
+	end
 end)
 
 button.Click:Connect(function()
@@ -150,8 +169,8 @@ end
 -- Bridge.Connect(port, token, as)     as: { role, linkId, alsoClient } -- the edit session omits it
 -- Bridge.Disconnect()                 deliberate; stops retrying
 -- Bridge.OnStatus(fn)                 fn(signal, word, line) -- drives the Panel
--- Bridge.OnUpdateOffered(fn)          fn(offer) -- the server has a different plugin build bundled
--- Bridge.ApplyUpdate(sha256)          the person clicked Update; writes only the build with that sha
+-- Bridge.OnUpdateOffered(fn)          fn(offer) -- upstream is ahead, or a different plugin build is bundled
+-- Bridge.ApplyUpdate(offer)           the person clicked Update; applies only what that offer named
 -- Bridge.Invoke(name, arguments)      call another tool, in any context, through the server
 -- Bridge.Ctx*                         the timeline's shared context, which the server holds
 --
@@ -365,10 +384,12 @@ local function openSocket()
 			return
 		end
 
-		-- The server never installs a plugin build on its own; it only says one is bundled.
-		if message.method == "plugin/update-available" then
+		-- Nothing updates on its own: the server only says what's available and waits for a click.
+		if message.method == "plugin/update-available" or message.method == "server/update-available" then
 			if state.onUpdateOffered then
-				state.onUpdateOffered(message.params)
+				local offer = message.params
+				offer.kind = if message.method == "server/update-available" then "server" else "plugin"
+				state.onUpdateOffered(offer)
 			end
 			return
 		end
@@ -484,18 +505,26 @@ function Bridge.OnStatus(fn: (signal: string, word: string, line: string) -> ())
 	state.onStatus = fn
 end
 
-export type UpdateOffer = { sha256: string, destination: string, fresh: boolean, bytes: number }
+export type UpdateOffer =
+	{ kind: "plugin", sha256: string, destination: string, fresh: boolean, bytes: number }
+	| { kind: "server", from: string, to: string, commits: number }
 
 function Bridge.OnUpdateOffered(fn: (offer: UpdateOffer) -> ())
 	state.onUpdateOffered = fn
 end
 
-function Bridge.ApplyUpdate(sha256: string): (boolean, string)
-	local ok, payload = Bridge.Request("plugin/update-apply", { sha256 = sha256 }, 15)
+function Bridge.ApplyUpdate(offer: UpdateOffer): (boolean, string)
+	local ok, payload
+	if offer.kind == "server" then
+		-- git merge + npm ci on the other side; give it minutes, not seconds.
+		ok, payload = Bridge.Request("server/update-apply", { commit = offer.to }, 300)
+	else
+		ok, payload = Bridge.Request("plugin/update-apply", { sha256 = offer.sha256 }, 15)
+	end
 	if not ok then
 		return false, tostring(payload)
 	end
-	return true, tostring(payload.destination)
+	return true, tostring(payload.note or payload.destination)
 end
 
 -- `as` is how a playtest DataModel says which one it is. The edit session leaves it out.

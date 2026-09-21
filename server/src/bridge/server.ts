@@ -25,6 +25,7 @@ import { Session, type ProgressUpdate } from "./session.js";
 import type { SessionRegistry } from "./registry.js";
 import type { ToolService } from "../mcp.js";
 import { applyPluginUpdate, pendingPluginUpdate } from "../plugin-update.js";
+import { applyServerUpdate, pendingServerUpdate } from "../server-update.js";
 
 const HANDSHAKE_TIMEOUT_MS = 5_000;
 const ROBLOX_ORIGIN = /^https:\/\/([a-z0-9-]+\.)*roblox\.com$/i;
@@ -121,6 +122,19 @@ function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegist
 
 		if (msg.method.startsWith("ctx/")) {
 			handleContext(socket, msg, session, registry);
+			return;
+		}
+
+		if (msg.method === "server/update-apply") {
+			const commit = (msg.params as { commit?: unknown } | undefined)?.commit;
+			if (session.role !== "plugin" || typeof commit !== "string") {
+				replyError(socket, msg, VmcpErrorCode.InvalidParams, "update-apply needs the offered commit, from the edit session");
+				return;
+			}
+			applyServerUpdate(commit).then(
+				(note) => replyOk(socket, msg, { note }),
+				(err: Error) => replyError(socket, msg, VmcpErrorCode.InvalidParams, err.message),
+			);
 			return;
 		}
 
@@ -351,7 +365,13 @@ function handleHello(
 	registry.add(session);
 	replyOk(socket, msg, { protocolVersion: PROTOCOL_VERSION });
 
-	// Offer, never install: the panel shows a button and the person decides.
+	// Offer, never install: the panel shows a button and the person decides. Server first, since
+	// a new checkout usually brings a new plugin build with it.
+	void pendingServerUpdate().then((update) => {
+		if (!update || socket.readyState !== socket.OPEN) return;
+		log(`upstream is ${update.commits} commit(s) ahead (${update.to.slice(0, 8)}); offered to ${session.placeName}`);
+		socket.send(JSON.stringify({ jsonrpc: "2.0", method: "server/update-available", params: update }));
+	});
 	const update = pendingPluginUpdate();
 	if (update) {
 		log(`a different plugin build is bundled (sha256 ${update.sha256.slice(0, 12)}); offered to ${session.placeName}`);

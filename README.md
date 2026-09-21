@@ -82,9 +82,9 @@ rojo build plugin.project.json -o "$LOCALAPPDATA/Roblox/Plugins/VMCP.rbxm"
 
 Restart Studio afterwards — it only picks up newly installed plugins on load.
 
-After that, updates are offered, not pushed: when the bundled `VMCP.rbxmx` differs from the
-installed one, the panel shows an **Update plugin** button and nothing is written until it's
-clicked. [`docs/plugin-updates.md`](docs/plugin-updates.md) has the why and how to pin the server.
+After that, nothing updates by itself. When the server's checkout is behind upstream, or the
+bundled `VMCP.rbxmx` differs from the installed one, the panel shows an **Update** button and
+nothing is pulled or written until it's clicked. [`docs/plugin-updates.md`](docs/plugin-updates.md).
 
 Or work from the place instead: `rojo serve`, then right-click **ServerStorage → VMCP** and pick
 *Save as Local Plugin*. That menu item only appears on a `Script`, which is why `src/plugin` has

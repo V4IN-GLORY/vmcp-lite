@@ -103,22 +103,41 @@ end)
 Panel.ConnectRequested:Connect(connect)
 Panel.DisconnectRequested:Connect(Bridge.Disconnect)
 
--- The server only offers a plugin build; nothing is written to disk until this button is clicked.
-local offeredSha: string? = nil
+-- The server only offers updates; nothing is pulled or written until this button is clicked. A
+-- server offer wins the button over a plugin one, since the new checkout brings its own plugin
+-- build and that gets offered on the next connect.
+local offered: Bridge.UpdateOffer? = nil
 Bridge.OnUpdateOffered(function(offer)
-	offeredSha = offer.sha256
-	Panel.SetUpdateOffer(`{if offer.fresh then "Install" else "Update"} plugin ({string.sub(offer.sha256, 1, 8)})`)
-	Panel.SetStatusLine(`A different plugin build is bundled with the server: {offer.destination}`)
+	if offered and offered.kind == "server" and offer.kind == "plugin" then
+		return
+	end
+	offered = offer
+	if offer.kind == "server" then
+		Panel.SetUpdateOffer(`Update server ({offer.commits} commit{if offer.commits == 1 then "" else "s"} behind)`)
+		Panel.SetStatusLine(`Upstream is at {string.sub(offer.to, 1, 8)}; this checkout is at {string.sub(offer.from, 1, 8)}.`)
+	else
+		local build = offer :: any -- luau-lsp doesn't narrow the union on `kind`
+		Panel.SetUpdateOffer(`{if build.fresh then "Install" else "Update"} plugin ({string.sub(build.sha256, 1, 8)})`)
+		Panel.SetStatusLine(`A different plugin build is bundled with the server: {build.destination}`)
+	end
 end)
 
 Panel.UpdateRequested:Connect(function()
-	if not offeredSha then
+	local offer = offered
+	if not offer then
 		return
 	end
+	offered = nil
 	Panel.SetUpdateOffer(nil)
-	local ok, detail = Bridge.ApplyUpdate(offeredSha)
-	offeredSha = nil
-	Panel.SetStatusLine(if ok then `Installed to {detail}. Studio reloads a changed local plugin on its own.` else `Update failed: {detail}`)
+	Panel.SetStatusLine(if offer.kind == "server" then "Pulling and rebuilding the server..." else "Writing the plugin...")
+	local ok, detail = Bridge.ApplyUpdate(offer)
+	if not ok then
+		Panel.SetStatusLine(`Update failed: {detail}`)
+	elseif offer.kind == "server" then
+		Panel.SetStatusLine(`Server {detail}.`)
+	else
+		Panel.SetStatusLine(`Installed to {detail}. Studio reloads a changed local plugin on its own.`)
+	end
 end)
 
 button.Click:Connect(function()

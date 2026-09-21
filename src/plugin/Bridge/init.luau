@@ -8,8 +8,8 @@
 -- Bridge.Connect(port, token, as)     as: { role, linkId, alsoClient } -- the edit session omits it
 -- Bridge.Disconnect()                 deliberate; stops retrying
 -- Bridge.OnStatus(fn)                 fn(signal, word, line) -- drives the Panel
--- Bridge.OnUpdateOffered(fn)          fn(offer) -- the server has a different plugin build bundled
--- Bridge.ApplyUpdate(sha256)          the person clicked Update; writes only the build with that sha
+-- Bridge.OnUpdateOffered(fn)          fn(offer) -- upstream is ahead, or a different plugin build is bundled
+-- Bridge.ApplyUpdate(offer)           the person clicked Update; applies only what that offer named
 -- Bridge.Invoke(name, arguments)      call another tool, in any context, through the server
 -- Bridge.Ctx*                         the timeline's shared context, which the server holds
 --
@@ -223,10 +223,12 @@ local function openSocket()
 			return
 		end
 
-		-- The server never installs a plugin build on its own; it only says one is bundled.
-		if message.method == "plugin/update-available" then
+		-- Nothing updates on its own: the server only says what's available and waits for a click.
+		if message.method == "plugin/update-available" or message.method == "server/update-available" then
 			if state.onUpdateOffered then
-				state.onUpdateOffered(message.params)
+				local offer = message.params
+				offer.kind = if message.method == "server/update-available" then "server" else "plugin"
+				state.onUpdateOffered(offer)
 			end
 			return
 		end
@@ -342,18 +344,26 @@ function Bridge.OnStatus(fn: (signal: string, word: string, line: string) -> ())
 	state.onStatus = fn
 end
 
-export type UpdateOffer = { sha256: string, destination: string, fresh: boolean, bytes: number }
+export type UpdateOffer =
+	{ kind: "plugin", sha256: string, destination: string, fresh: boolean, bytes: number }
+	| { kind: "server", from: string, to: string, commits: number }
 
 function Bridge.OnUpdateOffered(fn: (offer: UpdateOffer) -> ())
 	state.onUpdateOffered = fn
 end
 
-function Bridge.ApplyUpdate(sha256: string): (boolean, string)
-	local ok, payload = Bridge.Request("plugin/update-apply", { sha256 = sha256 }, 15)
+function Bridge.ApplyUpdate(offer: UpdateOffer): (boolean, string)
+	local ok, payload
+	if offer.kind == "server" then
+		-- git merge + npm ci on the other side; give it minutes, not seconds.
+		ok, payload = Bridge.Request("server/update-apply", { commit = offer.to }, 300)
+	else
+		ok, payload = Bridge.Request("plugin/update-apply", { sha256 = offer.sha256 }, 15)
+	end
 	if not ok then
 		return false, tostring(payload)
 	end
-	return true, tostring(payload.destination)
+	return true, tostring(payload.note or payload.destination)
 end
 
 -- `as` is how a playtest DataModel says which one it is. The edit session leaves it out.
