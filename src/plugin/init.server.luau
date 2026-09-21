@@ -103,6 +103,24 @@ end)
 Panel.ConnectRequested:Connect(connect)
 Panel.DisconnectRequested:Connect(Bridge.Disconnect)
 
+-- The server only offers a plugin build; nothing is written to disk until this button is clicked.
+local offeredSha: string? = nil
+Bridge.OnUpdateOffered(function(offer)
+	offeredSha = offer.sha256
+	Panel.SetUpdateOffer(`{if offer.fresh then "Install" else "Update"} plugin ({string.sub(offer.sha256, 1, 8)})`)
+	Panel.SetStatusLine(`A different plugin build is bundled with the server: {offer.destination}`)
+end)
+
+Panel.UpdateRequested:Connect(function()
+	if not offeredSha then
+		return
+	end
+	Panel.SetUpdateOffer(nil)
+	local ok, detail = Bridge.ApplyUpdate(offeredSha)
+	offeredSha = nil
+	Panel.SetStatusLine(if ok then `Installed to {detail}. Studio reloads a changed local plugin on its own.` else `Update failed: {detail}`)
+end)
+
 button.Click:Connect(function()
 	widget.Enabled = not widget.Enabled
 end)

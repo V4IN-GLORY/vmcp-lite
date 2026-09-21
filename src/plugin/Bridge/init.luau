@@ -8,6 +8,8 @@
 -- Bridge.Connect(port, token, as)     as: { role, linkId, alsoClient } -- the edit session omits it
 -- Bridge.Disconnect()                 deliberate; stops retrying
 -- Bridge.OnStatus(fn)                 fn(signal, word, line) -- drives the Panel
+-- Bridge.OnUpdateOffered(fn)          fn(offer) -- the server has a different plugin build bundled
+-- Bridge.ApplyUpdate(sha256)          the person clicked Update; writes only the build with that sha
 -- Bridge.Invoke(name, arguments)      call another tool, in any context, through the server
 -- Bridge.Ctx*                         the timeline's shared context, which the server holds
 --
@@ -59,6 +61,7 @@ local state = {
 	alsoClient = false,
 	-- Assigned by the server: 0 for a test server, 1+ for each test client.
 	peerIndex = nil :: number?,
+	onUpdateOffered = nil :: ((offer: any) -> ())?,
 	toolFolder = nil :: Instance?,
 	getPlaceGuid = nil :: (() -> string)?,
 	onStatus = nil :: ((signal: string, word: string, line: string) -> ())?,
@@ -220,6 +223,14 @@ local function openSocket()
 			return
 		end
 
+		-- The server never installs a plugin build on its own; it only says one is bundled.
+		if message.method == "plugin/update-available" then
+			if state.onUpdateOffered then
+				state.onUpdateOffered(message.params)
+			end
+			return
+		end
+
 		Dispatch.Handle(send, message)
 	end)
 
@@ -331,6 +342,20 @@ function Bridge.OnStatus(fn: (signal: string, word: string, line: string) -> ())
 	state.onStatus = fn
 end
 
+export type UpdateOffer = { sha256: string, destination: string, fresh: boolean, bytes: number }
+
+function Bridge.OnUpdateOffered(fn: (offer: UpdateOffer) -> ())
+	state.onUpdateOffered = fn
+end
+
+function Bridge.ApplyUpdate(sha256: string): (boolean, string)
+	local ok, payload = Bridge.Request("plugin/update-apply", { sha256 = sha256 }, 15)
+	if not ok then
+		return false, tostring(payload)
+	end
+	return true, tostring(payload.destination)
+end
+
 -- `as` is how a playtest DataModel says which one it is. The edit session leaves it out.
 function Bridge.Connect(port: string, token: string, as: { role: string, linkId: string, alsoClient: boolean? }?)
 	state.port = port
@@ -379,8 +404,8 @@ end
 
 -- The timeline's shared context. It lives on the server because the edit DataModel, the test
 -- server and each test client are separate processes -- this socket is the only thing they share.
--- Asks the VMCP server to finish something this side can't: writing a MicroProfiler capture out
--- as a file. A tool result can carry the same directive back, but a timeline event isn't a tool result.
+-- Asks the VMCP server to finish something this side can't: writing a Canvas recording out as a
+-- PNG. A tool result can carry the same directive back, but a timeline event isn't a tool result.
 function Bridge.Post(directive: { [string]: any }): (boolean, string)
 	local ok, payload = Bridge.Request("post/process", directive, 30)
 	if not ok then

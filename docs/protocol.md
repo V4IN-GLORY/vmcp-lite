@@ -441,6 +441,27 @@ caller can put it back.
 `ledger/write` takes `{ "key": "<script path>", "entry": { ... } }` and merges the fields in
 (stamping `updatedAt`); an absent `entry` deletes the key. Both reply with `{ placeId, entries }`.
 
+## 9c. `plugin/update-available` and `plugin/update-apply` — plugin updates, by consent
+
+After it accepts an edit session's hello, the server compares the `VMCP.rbxmx` bundled next to
+it with the installed one. If they differ it sends a notification and does nothing else:
+
+```json
+{ "jsonrpc": "2.0", "method": "plugin/update-available",
+  "params": { "sha256": "<hex>", "destination": "<path>", "fresh": false, "bytes": 311993 } }
+```
+
+The plugin shows a button. When a person clicks it, the plugin sends the sha it was shown:
+
+```json
+{ "jsonrpc": "2.0", "id": 9, "method": "plugin/update-apply", "params": { "sha256": "<hex>" } }
+```
+
+The server re-reads the bundled file and writes it only if its sha still matches, replying
+`{ "destination": "<path>" }`, or an `InvalidParams` error when the bytes changed since the offer,
+nothing is pending, or the request didn't come from the edit session. See
+[`plugin-updates.md`](plugin-updates.md).
+
 ## 10. `postProcess` — asking the server to finish a result
 
 A tool result may carry a `postProcess` object alongside `content`. It's for work the plugin

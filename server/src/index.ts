@@ -6,18 +6,10 @@ import { SessionRegistry } from "./bridge/registry.js";
 import { startBridge } from "./bridge/server.js";
 import { localService, startMcp, type ToolService } from "./mcp.js";
 import { connectProxy } from "./proxy.js";
-import { installBundledPlugin } from "./install-plugin.js";
 
 const RETRY_MS = 1_000;
 
 async function main(): Promise<void> {
-	if (process.argv.includes("--auto-install-plugin")) {
-		try {
-			installBundledPlugin();
-		} catch (err) {
-			log("plugin install skipped:", err);
-		}
-	}
 	loadOrCreateToken();
 
 	const manifest = new Manifest();

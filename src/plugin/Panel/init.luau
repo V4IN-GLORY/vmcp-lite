@@ -45,22 +45,26 @@ local Panel = {
 	Root = nil :: any,
 	ConnectButton = nil :: any,
 	DisconnectButton = nil :: any,
+	UpdateButton = nil :: any,
 	PortInput = nil :: any,
 	TokenInput = nil :: any,
 	StatusLine = nil :: any,
 	StatusWord = nil :: any,
 	ConnectRequested = nil :: any,
 	DisconnectRequested = nil :: any,
+	UpdateRequested = nil :: any,
 	PortChanged = nil :: any,
 	TokenChanged = nil :: any,
 }
 
 Panel._connectRequestedBindable = Instance.new("BindableEvent")
 Panel._disconnectRequestedBindable = Instance.new("BindableEvent")
+Panel._updateRequestedBindable = Instance.new("BindableEvent")
 Panel._portChangedBindable = Instance.new("BindableEvent")
 Panel._tokenChangedBindable = Instance.new("BindableEvent")
 Panel.ConnectRequested = Panel._connectRequestedBindable.Event
 Panel.DisconnectRequested = Panel._disconnectRequestedBindable.Event
+Panel.UpdateRequested = Panel._updateRequestedBindable.Event
 Panel.PortChanged = Panel._portChangedBindable.Event
 Panel.TokenChanged = Panel._tokenChangedBindable.Event
 
@@ -196,6 +200,15 @@ function Panel.SetDisconnectEnabled(enabled: boolean)
 	Panel.DisconnectButton.Interactable = enabled
 end
 
+-- Shown only while the server has a different plugin build bundled; nil hides it again.
+function Panel.SetUpdateOffer(label: string?)
+	Panel.UpdateButton.Visible = label ~= nil
+	Panel.UpdateButton.Interactable = label ~= nil
+	if label then
+		Panel.UpdateButton.Text = label
+	end
+end
+
 ---------------------------------------------------------------------- tree
 
 function Panel.Mount(parent: Instance): Frame
@@ -288,6 +301,13 @@ function Panel.Mount(parent: Instance): Frame
 	new("UIFlexItem", { FlexMode = Enum.UIFlexMode.Fill }, Panel.ConnectButton)
 	Panel.DisconnectButton = button("Disconnect", "Disconnect", "Ghost", buttonRow)
 	Panel.DisconnectButton.Interactable = false
+
+	Panel.UpdateButton = button("Update", "Update plugin", "Ghost", body)
+	Panel.UpdateButton.Visible = false
+	Panel.UpdateButton.Interactable = false
+	Panel.UpdateButton.Activated:Connect(function()
+		Panel._updateRequestedBindable:Fire()
+	end)
 
 	-- footer
 	local footer = box("Footer", body, Enum.FillDirection.Vertical, 8)

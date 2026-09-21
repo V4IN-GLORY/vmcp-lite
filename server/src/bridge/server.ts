@@ -24,6 +24,7 @@ import { routeFor, ownerOf } from "./routing.js";
 import { Session, type ProgressUpdate } from "./session.js";
 import type { SessionRegistry } from "./registry.js";
 import type { ToolService } from "../mcp.js";
+import { applyPluginUpdate, pendingPluginUpdate } from "../plugin-update.js";
 
 const HANDSHAKE_TIMEOUT_MS = 5_000;
 const ROBLOX_ORIGIN = /^https:\/\/([a-z0-9-]+\.)*roblox\.com$/i;
@@ -123,9 +124,24 @@ function attach(socket: WebSocket, request: HttpRequest, registry: SessionRegist
 			return;
 		}
 
+		if (msg.method === "plugin/update-apply") {
+			// Only an authenticated edit session gets here, and only with the sha it was shown.
+			const sha = (msg.params as { sha256?: unknown } | undefined)?.sha256;
+			if (session.role !== "plugin" || typeof sha !== "string") {
+				replyError(socket, msg, VmcpErrorCode.InvalidParams, "update-apply needs the offered sha256, from the edit session");
+				return;
+			}
+			try {
+				replyOk(socket, msg, { destination: applyPluginUpdate(sha) });
+			} catch (err) {
+				replyError(socket, msg, VmcpErrorCode.InvalidParams, (err as Error).message);
+			}
+			return;
+		}
+
 		if (msg.method === "post/process") {
 			// A snippet asking this server to finish something it can't do itself -- writing a
-			// capture out as a file. A tool result can carry the same directive, but a
+			// Canvas recording out as a PNG. A tool result can carry the same directive, but a
 			// timeline event isn't a tool result, so it asks directly.
 			const directive = (msg as JsonRpcRequest).params as Record<string, unknown> | undefined;
 			if (!directive || typeof directive !== "object") {
@@ -334,6 +350,17 @@ function handleHello(
 
 	registry.add(session);
 	replyOk(socket, msg, { protocolVersion: PROTOCOL_VERSION });
+
+	// Offer, never install: the panel shows a button and the person decides.
+	const update = pendingPluginUpdate();
+	if (update) {
+		log(`a different plugin build is bundled (sha256 ${update.sha256.slice(0, 12)}); offered to ${session.placeName}`);
+		socket.send(JSON.stringify({
+			jsonrpc: "2.0",
+			method: "plugin/update-available",
+			params: { sha256: update.sha256, destination: update.destination, fresh: update.fresh, bytes: update.bytes.length },
+		}));
+	}
 	return session;
 }
 
@@ -429,8 +456,8 @@ async function invokeTool(
 	}
 
 	try {
-		// Through the same finishing pass as a direct MCP call, so a render gets its PNG written
-		// whichever side asked for the tool.
+		// Through the same finishing pass as a direct MCP call, so a snippet that draws a Canvas
+		// gets the PNG written whichever side asked for the tool.
 		const result = await settle(await target.call(params.name, { ...args, __depth: depth + 1 }));
 		replyOk(socket, msg, { result });
 	} catch (err) {
