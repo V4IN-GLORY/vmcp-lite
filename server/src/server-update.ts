@@ -16,7 +16,7 @@ const GIT_CANDIDATES = [
 	"git",
 	...(process.platform === "win32"
 		? [
-				join(process.env.ProgramFiles ?? "C:\Program Files", "Git", "cmd", "git.exe"),
+				join(process.env.ProgramFiles ?? "C:\\Program Files", "Git", "cmd", "git.exe"),
 				join(process.env.LOCALAPPDATA ?? "", "Programs", "Git", "cmd", "git.exe"),
 			]
 		: []),
@@ -36,7 +36,9 @@ const gitBinary: Promise<string> = (async () => {
 
 /** Why git can't be used here, or undefined when it can. Shown in the panel instead of a silent "not a checkout". */
 export async function gitProblem(): Promise<string | undefined> {
-	if (!existsSync(join(ROOT, ".git"))) return `${ROOT} is not a git checkout`;
+	if (!existsSync(join(ROOT, ".git"))) {
+		return `${ROOT} isn't a git clone (an npx cache?) -- install from a clone, see docs/plugin-updates.md`;
+	}
 	try {
 		await gitBinary;
 		return undefined;
