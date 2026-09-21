@@ -1,30 +1,10 @@
-import { deflateSync, inflateSync } from "node:zlib";
+import { deflateSync } from "node:zlib";
 
 /**
- * Replays a Canvas recording into a PNG.
- *
- * The plugin already drew the same operations with EditableImage, so this is a second
- * implementation of the same few primitives rather than a conversion of a finished image — there
- * is no way to read an EditableImage's pixels out of Studio and across the socket cheaply, and a
- * recording is a few hundred bytes where a 1024x1024 image is four megabytes.
+ * An RGBA surface the scene renderer draws into, and a PNG encoder for it.
  *
  * No dependencies: zlib ships with Node, and the rest is a byte array.
  */
-
-export interface DrawOp {
-	kind: string;
-	[key: string]: unknown;
-}
-
-export interface Recording {
-	width: number;
-	height: number;
-	ops: DrawOp[];
-	/** The image's real RGBA, base64. When present it wins over replaying `ops`. */
-	pixels?: string;
-}
-
-const MAX_SIZE = 1024;
 
 export class Surface {
 	readonly pixels: Uint8ClampedArray;
@@ -49,109 +29,6 @@ export class Surface {
 		const opacity = was[at + 3] ?? 0;
 		was[at + 3] = opacity + (255 - opacity) * alpha;
 	}
-}
-
-function colorOf(op: DrawOp): [number, number, number] {
-	const raw = Array.isArray(op.color) ? (op.color as number[]) : [0, 0, 0];
-	return [(raw[0] ?? 0) * 255, (raw[1] ?? 0) * 255, (raw[2] ?? 0) * 255];
-}
-
-function alphaOf(op: DrawOp): number {
-	return typeof op.alpha === "number" ? Math.min(Math.max(op.alpha, 0), 1) : 1;
-}
-
-function num(op: DrawOp, key: string): number {
-	return typeof op[key] === "number" ? (op[key] as number) : 0;
-}
-
-/** How much of the pixel at `column,row` lies within `radius` of the point, 0..1, one pixel of feather. */
-function coverage(distance: number, radius: number): number {
-	return Math.min(Math.max(radius + 0.5 - distance, 0), 1);
-}
-
-function fillRect(surface: Surface, x: number, y: number, w: number, h: number, op: DrawOp): void {
-	const [r, g, b] = colorOf(op);
-	const alpha = alphaOf(op);
-	const right = x + w;
-	const bottom = y + h;
-	for (let row = Math.floor(y); row < Math.ceil(bottom); row++) {
-		const rowCover = Math.min(row + 1, bottom) - Math.max(row, y);
-		for (let column = Math.floor(x); column < Math.ceil(right); column++) {
-			const columnCover = Math.min(column + 1, right) - Math.max(column, x);
-			surface.blend(column, row, r, g, b, alpha * rowCover * columnCover);
-		}
-	}
-}
-
-function fillDisc(surface: Surface, cx: number, cy: number, radius: number, op: DrawOp): void {
-	const [r, g, b] = colorOf(op);
-	const alpha = alphaOf(op);
-	for (let row = Math.floor(cy - radius - 1); row <= Math.ceil(cy + radius + 1); row++) {
-		for (let column = Math.floor(cx - radius - 1); column <= Math.ceil(cx + radius + 1); column++) {
-			const cover = coverage(Math.hypot(column + 0.5 - cx, row + 0.5 - cy), radius);
-			if (cover > 0) surface.blend(column, row, r, g, b, alpha * cover);
-		}
-	}
-}
-
-/** A capsule: every pixel within thickness/2 of the segment, feathered at the edge. */
-function strokeLine(surface: Surface, op: DrawOp): void {
-	const [r, g, b] = colorOf(op);
-	const alpha = alphaOf(op);
-	const x1 = num(op, "x1");
-	const y1 = num(op, "y1");
-	const x2 = num(op, "x2");
-	const y2 = num(op, "y2");
-	const radius = Math.max(num(op, "thickness") || 1, 1) / 2;
-	const dx = x2 - x1;
-	const dy = y2 - y1;
-	const lengthSquared = dx * dx + dy * dy || 1;
-
-	for (let row = Math.floor(Math.min(y1, y2) - radius - 1); row <= Math.ceil(Math.max(y1, y2) + radius + 1); row++) {
-		for (let column = Math.floor(Math.min(x1, x2) - radius - 1); column <= Math.ceil(Math.max(x1, x2) + radius + 1); column++) {
-			const px = column + 0.5;
-			const py = row + 0.5;
-			const t = Math.min(Math.max(((px - x1) * dx + (py - y1) * dy) / lengthSquared, 0), 1);
-			const cover = coverage(Math.hypot(px - (x1 + dx * t), py - (y1 + dy * t)), radius);
-			if (cover > 0) surface.blend(column, row, r, g, b, alpha * cover);
-		}
-	}
-}
-
-export function rasterize(recording: Recording): Surface {
-	const width = Math.min(Math.max(Math.round(recording.width), 1), MAX_SIZE);
-	const height = Math.min(Math.max(Math.round(recording.height), 1), MAX_SIZE);
-	const surface = new Surface(width, height);
-
-	// The plugin sends the pixels it actually has when they fit the socket, so DrawImage and
-	// WritePixelsBuffer work show up too. A size mismatch means a different image than claimed.
-	if (typeof recording.pixels === "string") {
-		const bytes = Buffer.from(recording.pixels, "base64");
-		if (bytes.length === width * height * 4) {
-			surface.pixels.set(bytes);
-			return surface;
-		}
-	}
-
-	for (const op of recording.ops ?? []) {
-		switch (op.kind) {
-			case "clear":
-				fillRect(surface, 0, 0, width, height, op);
-				break;
-			case "rect":
-				fillRect(surface, num(op, "x"), num(op, "y"), num(op, "w"), num(op, "h"), op);
-				break;
-			case "circle":
-				fillDisc(surface, num(op, "x"), num(op, "y"), num(op, "r"), op);
-				break;
-			case "line":
-				strokeLine(surface, op);
-				break;
-			// An unknown op is skipped rather than thrown: a newer plugin drawing something this
-			// server doesn't know about should still produce most of the picture.
-		}
-	}
-	return surface;
 }
 
 const CRC_TABLE = (() => {
@@ -211,71 +88,9 @@ export function encodePng(surface: Surface): Buffer {
 }
 
 /** Width and height from the IHDR, or undefined when the bytes aren't a PNG. */
-export function pngSize(png: Buffer): { width: number; height: number } | undefined {
-	if (png.length < 24 || !png.subarray(0, 8).equals(SIGNATURE)) return undefined;
-	return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
-}
-
 const PNG_COLOR_CHANNELS: Record<number, number> = { 0: 1, 2: 3, 4: 2, 6: 4 };
 
 /**
  * Decodes an 8-bit non-interlaced PNG into a Surface. Covers what encodePng and OpenPencil
  * write; palette, 16-bit and interlaced files return undefined rather than a wrong picture.
  */
-export function decodePng(png: Buffer): Surface | undefined {
-	const size = pngSize(png);
-	if (!size) return undefined;
-	const depth = png[24];
-	const colorType = png[25] ?? -1;
-	const channels = PNG_COLOR_CHANNELS[colorType];
-	if (depth !== 8 || !channels || png[28] !== 0) return undefined;
-
-	const idat: Buffer[] = [];
-	for (let at = 8; at + 8 <= png.length; ) {
-		const length = png.readUInt32BE(at);
-		const type = png.toString("ascii", at + 4, at + 8);
-		if (type === "IDAT") idat.push(png.subarray(at + 8, at + 8 + length));
-		if (type === "IEND") break;
-		at += 12 + length;
-	}
-	const raw = inflateSync(Buffer.concat(idat));
-	const { width, height } = size;
-	const stride = width * channels;
-	const surface = new Surface(width, height);
-	const out = surface.pixels;
-	const previous = Buffer.alloc(stride);
-	const line = Buffer.alloc(stride);
-	for (let row = 0; row < height; row++) {
-		const at = row * (stride + 1);
-		const filter = raw[at];
-		raw.copy(line, 0, at + 1, at + 1 + stride);
-		for (let i = 0; i < stride; i++) {
-			const a = i >= channels ? (line[i - channels] ?? 0) : 0;
-			const b = previous[i] ?? 0;
-			const c = i >= channels ? (previous[i - channels] ?? 0) : 0;
-			let predictor = 0;
-			if (filter === 1) predictor = a;
-			else if (filter === 2) predictor = b;
-			else if (filter === 3) predictor = (a + b) >> 1;
-			else if (filter === 4) {
-				const p = a + b - c;
-				const pa = Math.abs(p - a);
-				const pb = Math.abs(p - b);
-				const pc = Math.abs(p - c);
-				predictor = pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
-			}
-			line[i] = ((line[i] ?? 0) + predictor) & 0xff;
-		}
-		for (let x = 0; x < width; x++) {
-			const src = x * channels;
-			const dst = (row * width + x) * 4;
-			const grey = channels < 3;
-			out[dst] = line[src] ?? 0;
-			out[dst + 1] = grey ? (line[src] ?? 0) : (line[src + 1] ?? 0);
-			out[dst + 2] = grey ? (line[src] ?? 0) : (line[src + 2] ?? 0);
-			out[dst + 3] = channels === 4 ? (line[src + 3] ?? 0) : channels === 2 ? (line[src + 1] ?? 0) : 255;
-		}
-		line.copy(previous);
-	}
-	return surface;
-}

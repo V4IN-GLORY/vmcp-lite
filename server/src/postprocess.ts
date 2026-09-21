@@ -1,18 +1,16 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { config, log } from "./config.js";
 import type { ToolResult, ToolResultContent } from "./protocol.js";
-import { encodePng, pngSize, rasterize, type Recording } from "./image.js";
+import { encodePng } from "./image.js";
 import { materialsOf, renderScene, type Scene } from "./scene.js";
 import { loadMaterials } from "./materials.js";
-import { renderUiScene, type UiScene } from "./ui.js";
-import { rememberAsset, storeApiKey, uploadImage } from "./upload.js";
 
 /**
  * The one place the relay acts on a result instead of passing it along.
  *
- * A tool can return a `postProcess` directive asking for something only this side can do — writing
- * a Canvas recording out as a PNG, or a MicroProfiler capture out as a .gprx, since the plugin has
+ * A tool can return a `postProcess` directive asking for something only this side can do — drawing
+ * a build scene out as a PNG, or a MicroProfiler capture out as a .gprx, since the plugin has
  * no filesystem. Kept deliberately narrow: one field, a `kind` that has to be recognised, and a
  * line of text back. Anything broader and the relay stops being a relay.
  */
@@ -50,19 +48,6 @@ function writeCapture(directive: Directive): Outcome {
 	}
 }
 
-// Every asset is exported at 4K and Roblox does the downsampling, so a small upload is a mistake
-// (it would be upscaled on most screens) unless the caller says otherwise.
-const MIN_ASSET_SIDE = 4096;
-
-function tooSmall(png: Buffer): string | undefined {
-	const size = pngSize(png);
-	if (!size) return "not a PNG";
-	if (Math.max(size.width, size.height) < MIN_ASSET_SIDE) {
-		return `${size.width}x${size.height} is under ${MIN_ASSET_SIDE}px on its long side -- export at 4K and let Roblox downsample, or pass allowSmall = true`;
-	}
-	return undefined;
-}
-
 // Past this the image is more of the reply than the words are, and the file on disk is the better
 // way to look at it.
 const INLINE_LIMIT = 1_500_000;
@@ -72,86 +57,20 @@ interface Outcome {
 	png?: Buffer;
 }
 
-/** Writes the image and returns a line to append to the tool's own output, plus the bytes. */
-/** Publishes a PNG as a Roblox Image asset: one Render wrote earlier, or pixels sent along. */
-async function uploadDirective(directive: Directive): Promise<Outcome> {
-	let stored = "";
-	if (typeof directive.apiKey === "string" && directive.apiKey.trim() !== "") {
-		stored = `[remembered the API key in ${storeApiKey(directive.apiKey)}] `;
-	}
-	if (typeof directive.name !== "string") {
-		return { text: stored || "[nothing to upload]" };
-	}
-
-	let png: Buffer;
-	let file: string;
-	if (typeof directive.file === "string") {
-		const path = outputPath({ name: directive.file }, "images", "canvas", "png");
-		if (!existsSync(path)) return { text: `${stored}[no image at ${path} -- render it first]` };
-		png = readFileSync(path);
-		file = path;
-	} else if (typeof directive.pixels === "string") {
-		png = encodePng(rasterize(directive as unknown as Recording));
-		file = outputPath(directive, "images", "canvas", "png");
-		writeFileSync(file, png);
-	} else {
-		return { text: `${stored}[upload needs a file name or pixels]` };
-	}
-	const small = directive.allowSmall === true ? undefined : tooSmall(png);
-	if (small) return { text: `${stored}[not uploaded: ${small}]` };
-
-	try {
-		const id = await uploadImage(png, {
-			name: directive.name,
-			description: typeof directive.description === "string" ? directive.description : undefined,
-			userId: typeof directive.userId === "number" ? directive.userId : undefined,
-			groupId: typeof directive.groupId === "number" ? directive.groupId : undefined,
-		});
-		rememberAsset(id, file);
-		return { text: `${stored}[uploaded as rbxassetid://${id}]`, png };
-	} catch (err) {
-		return { text: `${stored}[upload failed: ${(err as Error).message}]` };
-	}
-}
-
 async function finish(directive: Directive): Promise<Outcome> {
 	if (directive.kind === "gprx") return writeCapture(directive);
-	if (directive.kind === "upload") return uploadDirective(directive);
-	if (directive.kind !== "png" && directive.kind !== "scene" && directive.kind !== "ui") {
+	if (directive.kind !== "scene") {
 		return { text: `[vmcp doesn't know how to finish a "${String(directive.kind)}" job]` };
 	}
 
 	try {
-		let surface;
-		let note = "";
-		if (directive.kind === "scene") {
-			const scene = directive as unknown as Scene;
-			surface = renderScene(scene, await loadMaterials(materialsOf(scene)));
-		} else if (directive.kind === "ui") {
-			({ surface, note } = renderUiScene(directive as unknown as UiScene));
-		} else {
-			surface = rasterize(directive as unknown as Recording);
-		}
+		const scene = directive as unknown as Scene;
+		const surface = renderScene(scene, await loadMaterials(materialsOf(scene)));
 		const path = outputPath(directive, "images", "canvas", "png");
 		const png = encodePng(surface);
 		writeFileSync(path, png);
 		log(`wrote ${path}`);
-		let asset = typeof directive.assetId === "number" ? ` (uploaded as rbxassetid://${directive.assetId})` : "";
-		// The plugin asks this side to upload when Studio's own CreateAssetAsync isn't available.
-		if (directive.upload === true && !asset) {
-			const name = typeof directive.name === "string" ? directive.name : "vmcp-canvas";
-			const userId = typeof directive.userId === "number" ? directive.userId : undefined;
-			try {
-				const groupId = typeof directive.groupId === "number" ? directive.groupId : undefined;
-				const id = await uploadImage(png, { name, userId, groupId });
-				rememberAsset(id, path);
-				asset = ` (uploaded as rbxassetid://${id})`;
-			} catch (err) {
-				asset = ` (upload failed: ${(err as Error).message})`;
-			}
-		}
-		const coverage = note ? ` [${note}]` : "";
-		return { text: `[wrote the image to ${path}${asset}]${coverage}`, png };
+		return { text: `[wrote the image to ${path}]`, png };
 	} catch (err) {
 		return { text: `[couldn't write the image: ${(err as Error).message}]` };
 	}
@@ -163,8 +82,8 @@ export async function runPostProcess(directive: Directive): Promise<string> {
 }
 
 /**
- * Every path a tool result can take back out of the plugin goes through here, so a Canvas
- * recording gets written whether the MCP client called the tool or another context did through
+ * Every path a tool result can take back out of the plugin goes through here, so a scene
+ * gets drawn whether the MCP client called the tool or another context did through
  * `tool/invoke`. The directive itself never travels on — it was addressed to this server.
  *
  * The picture rides back inline as well as being written, so the model that asked for it sees it

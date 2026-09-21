@@ -1,12 +1,12 @@
 {
-  "name": "@v4in-glory/mcp-test",
+  "name": "@v4in-glory/vmcp-lite",
   "version": "0.1.0",
   "type": "module",
   "bin": {
     "vmcp": "server/dist/index.js"
   },
   "scripts": {
-    "prepare": "tsc -p server && rojo build plugin.project.json -o VMCP.rbxmx && npm --prefix openpencil-headless install --no-audit --no-fund"
+    "prepare": "tsc -p server && rojo build plugin.project.json -o VMCP.rbxmx"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",

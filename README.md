@@ -1,6 +1,20 @@
-# VMCP
+# VMCP Lite
 
 An MCP server that lets Claude drive Roblox Studio, where **the tools are written in Luau**.
+
+This is the scripts-and-building cut of [VMCP](https://github.com/V4IN-GLORY/mcp-test): the
+same server and plugin with the UI, styling, icon and animation tooling removed. What's left:
+
+| area | tools |
+|---|---|
+| scripts | `run_luau`, `search_scripts`, `get_tree`, `get_logs`, `print`, `count_lines`, `try_scripts`, `apply_fix` |
+| building | `apply_build`, `render_build`, `get_build` |
+| runtime | `playtest`, `run_timeline`, `review_remotes` |
+| performance | `profile_scripts`, `lint_hotpaths`, `optimization_ledger` |
+
+Skills under `.claude/skills/`: `vmcp-build`, `vmcp-debugging`, `vmcp-optimization`, `vmcp-timeline`.
+`vmcp-build` is a short core plus a `references/` library the model loads per phase, with
+`references/types/` for per-build-type tips you can add to by PR.
 
 Two halves:
 
@@ -120,25 +134,3 @@ Standard Rojo project, built with [Rojo](https://rojo.space/) 7.7.0-rc.1:
 rojo build -o "VMCP.rbxlx"
 rojo serve
 ```
-
-## UI: icons, stories, the theme
-
-The place carries a worked example of the UI pipeline (`src/client/UI/`, `src/design/`):
-
-- **Icons and plates** are vectors — Iconify names, SVG, or JSX — rasterized at 4096px by
-  OpenPencil's core running headless in Node, so Roblox does the downsampling. Two ways in:
-  `openpencil-headless/` is an MCP server (wired in `.mcp.json`) that serves OpenPencil's own
-  tools (`render`, `search_icons`, `import_svg`, …) over one in-memory `.fig` — upstream's MCP
-  only relays to the desktop app — and `node server/scripts/icons.mjs <spec.json>` builds a whole
-  set from `src/client/UI/design/icons.json`. `upload_image` refuses anything under 4096px unless
-  told otherwise and records every id in `~/.vmcp/images/assets.json` so `screenshot_ui` can draw
-  the real picture.
-- **Components** are folders with `init.luau` (plain Instances, Vide only for state and motion)
-  and a `*.story.luau` in [UI Labs](https://ui-labs.luau.page/) format. The `mount_story` tool
-  mounts a story into StarterGui and screenshots it; the UI Labs plugin (asset 14293316215)
-  shows the same stories to a human with hot reload and controls. `wally install` fetches Vide
-  and the UI Labs utils into `Packages/`.
-- **The theme** is `ReplicatedStorage.Design`, a module that builds the Style Editor's sheet
-  layout (rules, tokens, themes) on first require, since Rojo can't author StyleRule properties.
-
-The skills under `.claude/skills/` (`vmcp-icons`, `vmcp-ui`, `vmcp-styling`) are the working notes.

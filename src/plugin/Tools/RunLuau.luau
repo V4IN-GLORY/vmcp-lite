@@ -89,8 +89,8 @@ function Tool.Run(arguments: { code: string?, vm: string?, timeoutSeconds: numbe
 	else
 		local produced: any
 		ok, produced = Inject.Run(code, Env, timeout)
-		-- A snippet asks for work on the VMCP server -- writing a Canvas recording out as a PNG,
-		-- so far -- by returning a table with a postProcess field. It rides back untouched.
+		-- A snippet asks for work on the VMCP server -- writing a capture out as a file -- by
+		-- returning a table with a postProcess field. It rides back untouched.
 		directive = if ok and type(produced) == "table" then produced.postProcess else nil
 
 		if directive then

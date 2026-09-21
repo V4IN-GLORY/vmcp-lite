@@ -17,6 +17,3 @@ globalTypes.d.luau
 # root package (npx github: install)
 /node_modules/
 /package-lock.json
-
-# headless OpenPencil MCP deps
-openpencil-headless/node_modules/

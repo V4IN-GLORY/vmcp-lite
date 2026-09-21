@@ -503,8 +503,8 @@ end
 
 -- The timeline's shared context. It lives on the server because the edit DataModel, the test
 -- server and each test client are separate processes -- this socket is the only thing they share.
--- Asks the VMCP server to finish something this side can't: writing a Canvas recording out as a
--- PNG. A tool result can carry the same directive back, but a timeline event isn't a tool result.
+-- Asks the VMCP server to finish something this side can't: writing a MicroProfiler capture out
+-- as a file. A tool result can carry the same directive back, but a timeline event isn't a tool result.
 function Bridge.Post(directive: { [string]: any }): (boolean, string)
 	local ok, payload = Bridge.Request("post/process", directive, 30)
 	if not ok then
@@ -733,11 +733,9 @@ return Registry
 local Bridge = require(script.Parent.Bridge)
 
 local Env = {
-	Anim = require(script.Parent.Lib.Anim),
 	Audit = require(script.Parent.Lib.Audit),
 	Bench = require(script.Parent.Lib.Bench),
 	Build = require(script.Parent.Lib.Build),
-	Canvas = require(script.Parent.Lib.Canvas),
 	Equiv = require(script.Parent.Lib.Equiv),
 	Exploit = require(script.Parent.Lib.Exploit),
 	Instrument = require(script.Parent.Lib.Instrument),
@@ -745,37 +743,9 @@ local Env = {
 	Load = require(script.Parent.Lib.Load),
 	Profile = require(script.Parent.Lib.Profile),
 	Remotes = require(script.Parent.Lib.Remotes),
-	Rig = require(script.Parent.Lib.Rig),
-	Style = require(script.Parent.Lib.Style),
 	Serialize = require(script.Parent.Exec.Serialize),
 	Game = require(script.Parent.Exec.GameVm),
 }
-
-function Env.Render(canvas: any, name: string?, options: { upload: boolean?, groupId: number? }?): (boolean, string)
-	local serverUpload = false
-	if options and options.upload then
-		if type(canvas) ~= "table" or not canvas.Upload then
-			return false, "upload needs a Canvas, not a recording"
-		end
-		-- Studio's own upload when it's enabled and the user owns it; otherwise the server does
-		-- it over Open Cloud.
-		serverUpload = options.groupId ~= nil or canvas:Upload(name or "vmcp-canvas") == nil
-	end
-	local recording = if type(canvas) == "table" and canvas.Recording then canvas:Recording() else canvas
-	if type(recording) ~= "table" then
-		return false, "Render wants a Canvas, or the table its Recording() gave you"
-	end
-	recording.name = name
-	if serverUpload then
-		recording.upload = true
-		recording.groupId = options and options.groupId
-		local ok, userId = pcall(function()
-			return game:GetService("StudioService"):GetUserId()
-		end)
-		recording.userId = if ok then userId else nil
-	end
-	return Bridge.Post(recording)
-end
 
 function Env.Tool(name: string, arguments: { [string]: any }?): (boolean, string)
 	local reached, result = Bridge.Invoke(name, arguments, 120)
@@ -1471,274 +1441,6 @@ return Serialize
       </Properties>
       <Item class="ModuleScript" referent="11">
         <Properties>
-          <string name="Name">Anim</string>
-          <string name="Source"><![CDATA[--!strict
-
--- Compiles per-joint tracks into the Keyframe/Pose trees the engine wants, and reads them back.
---
--- The authoring model is "the right arm does this over time". The engine's format is "at t=0.3,
--- here is every joint in the body". The first is how animation is thought about and the second is
--- what has to be written, so the whole job here is the translation between them: union every
--- track's timestamps, fill each keyframe's pose tree from the rig, and interpolate the joints
--- that have no key at that moment.
---
--- Easing is written on the key it leaves *from*, because Pose.EasingStyle describes how to reach
--- the next keyframe's value, not this one's.
-
-local KeyframeSequenceProvider = game:GetService("KeyframeSequenceProvider")
-
-local Rig = require(script.Parent.Rig)
-
-local Anim = {}
-
-export type Key = {
-	time: number,
-	-- Degrees, XYZ, in character space (see cframeOf). `cframe` wins if given.
-	angles: { number }?,
-	-- Studs, XYZ, in character space: +X right, +Y up, +Z back.
-	offset: { number }?,
-	-- Raw Motor6D Transform, in the joint's C0 space. What Decompile hands back.
-	cframe: (CFrame | { number })?,
-	-- "CubicV2/InOut", "Bounce/Out", "Elastic/In", "Constant", "Linear". Applies from this key toward the next.
-	easing: string?,
-	weight: number?,
-}
-
-export type Tracks = { [string]: { Key } }
-
-export type Compiled = {
-	id: string,
-	length: number,
-	joints: { string },
-	keyframes: number,
-}
-
--- Motor6D.Transform is applied inside C0, and C0 carries a rotation on many rigs (every R6
--- joint: the shoulders are turned 90 about Y, the root and neck -90 about X). Raw angles there
--- mean "Z swings the arm forward" and "Y lifts the torso backwards", which nobody guesses right.
--- So angles/offset are taken in character space (+X right, +Y up, +Z back, same on every rig)
--- and conjugated by C0's rotation: C0 * T = C0.pos * R * C0.rot, i.e. R acts on the parent's axes
--- at the joint pivot. `cframe` stays raw so a decompiled track round-trips untouched.
-local function cframeOf(key: Key, basis: CFrame): CFrame
-	local cframe = key.cframe
-	if typeof(cframe) == "CFrame" then
-		return cframe
-	end
-	-- Over JSON a CFrame arrives as its 12 components.
-	if type(cframe) == "table" and #cframe == 12 then
-		return CFrame.new(table.unpack(cframe))
-	end
-	local angles = key.angles or { 0, 0, 0 }
-	local offset = key.offset or { 0, 0, 0 }
-	local local_ = CFrame.new(offset[1] or 0, offset[2] or 0, offset[3] or 0)
-		* CFrame.Angles(math.rad(angles[1] or 0), math.rad(angles[2] or 0), math.rad(angles[3] or 0))
-	return basis:Inverse() * local_ * basis
-end
-
--- nil for anything that isn't a real PoseEasingStyle, so "Quad" is an error, not a silent Linear.
-local function easingOf(key: Key): (Enum.PoseEasingStyle?, Enum.PoseEasingDirection?)
-	local style, direction = string.match(key.easing or "Linear", "^(%a+)/?(%a*)$")
-	local resolved = (Enum.PoseEasingStyle :: any)[style or "Linear"]
-	-- In is the engine's default direction, and in Pose terms means slow start, fast finish.
-	local towards = (Enum.PoseEasingDirection :: any)[direction ~= "" and direction or "In"]
-	return resolved, towards
-end
-
--- The value of one joint at an arbitrary time. Before the first key it holds the first value,
--- after the last it holds the last, and between two it lerps -- so a joint keyed only at the ends
--- still has a sensible pose in every keyframe the other joints introduced.
--- `motor` is the joint the track drives; its C0 rotation is the basis angles/offset are read in.
-function Anim.Sample(keys: { Key }, at: number, motor: Motor6D?): CFrame
-	if #keys == 0 then
-		return CFrame.identity
-	end
-	local basis = if motor then motor.C0.Rotation else CFrame.identity
-	if at <= keys[1].time then
-		return cframeOf(keys[1], basis)
-	end
-
-	for index = 1, #keys - 1 do
-		local from, to = keys[index], keys[index + 1]
-		if at >= from.time and at <= to.time then
-			local span = to.time - from.time
-			local alpha = if span > 0 then (at - from.time) / span else 1
-			return cframeOf(from, basis):Lerp(cframeOf(to, basis), alpha)
-		end
-	end
-	return cframeOf(keys[#keys], basis)
-end
-
-local function keyAt(keys: { Key }, at: number): Key?
-	for _, key in keys do
-		if math.abs(key.time - at) < 1e-4 then
-			return key
-		end
-	end
-	return nil
-end
-
--- Also returns the union of every track's timestamps, which is the keyframe list: a keyframe
--- holds the whole body, so any joint moving at time t forces a pose for every joint at time t.
-local function validate(rig: Rig.Rig, tracks: Tracks): ({ number }, { string }, string?)
-	local times: { number } = {}
-	local touched: { string } = {}
-
-	for joint, keys in tracks do
-		if not rig.byName[joint] then
-			return {}, {}, `this rig has no joint named "{joint}". It has:\n{Rig.Describe(rig)}`
-		end
-		if type(keys) ~= "table" or #keys == 0 then
-			return {}, {}, `track "{joint}" has no keys`
-		end
-		table.insert(touched, joint)
-
-		table.sort(keys, function(a, b)
-			return a.time < b.time
-		end)
-		for _, key in keys do
-			if type(key.time) ~= "number" or key.time < 0 then
-				return {}, {}, `a key on "{joint}" has no usable time`
-			end
-			if key.easing and not easingOf(key) then
-				return {},
-					{},
-					`"{key.easing}" isn't an easing; use Linear, Constant, CubicV2, Cubic, Elastic or Bounce, optionally /In /Out /InOut`
-			end
-			if not table.find(times, key.time) then
-				table.insert(times, key.time)
-			end
-		end
-	end
-
-	if #times == 0 then
-		return {}, {}, "no tracks, so there's nothing to compile"
-	end
-	table.sort(times)
-	return times, touched, nil
-end
-
-export type Options = { priority: string?, loop: boolean? }
-
--- The KeyframeSequence itself, parented nowhere. Put it in the place to publish it from Studio
--- (right-click > Save to Roblox); Compile registers it for preview instead.
-function Anim.Sequence(model: Instance, tracks: Tracks, options: Options?): (KeyframeSequence?, Compiled?, string?)
-	local rig, problem = Rig.Build(model)
-	if not rig then
-		return nil, nil, problem
-	end
-
-	local times, joints, bad = validate(rig, tracks)
-	if bad then
-		return nil, nil, bad
-	end
-
-	local sequence = Instance.new("KeyframeSequence")
-	sequence.Name = model.Name
-	local settings = options or ({} :: Options)
-	sequence.Loop = settings.loop ~= false
-	local priority = (Enum.AnimationPriority :: any)[settings.priority or "Action"]
-	if priority then
-		sequence.Priority = priority
-	end
-
-	for _, at in times do
-		local keyframe = Instance.new("Keyframe")
-		keyframe.Time = at
-
-		local pose = Rig.PoseTree(rig, function(joint: string): CFrame?
-			local keys = tracks[joint]
-			return if keys then Anim.Sample(keys, at, rig.byName[joint].motor) else nil
-		end)
-
-		-- Easing and weight are per-pose and only meaningful where the author actually put a key.
-		for _, descendant in pose:GetDescendants() do
-			local keys = tracks[descendant.Name]
-			local key = if keys then keyAt(keys, at) else nil
-			if key and descendant:IsA("Pose") then
-				local style, direction = easingOf(key)
-				if style and direction then
-					descendant.EasingStyle, descendant.EasingDirection = style, direction
-				end
-				if key.weight then
-					descendant.Weight = key.weight
-				end
-			end
-		end
-
-		pose.Parent = keyframe
-		keyframe.Parent = sequence
-	end
-
-	-- KeyframeSequence.Length reads 0 until the sequence is loaded, so the length is the last
-	-- keyframe time and nothing else.
-	return sequence, { id = "", length = times[#times], joints = joints, keyframes = #times }, nil
-end
-
--- Returns a temporary hash id usable straight away as Animation.AnimationId. Studio only, and
--- nothing is uploaded -- which is what makes previewing an animation a one-call loop.
-function Anim.Register(sequence: KeyframeSequence): (string?, string?)
-	local ok, id = pcall(function()
-		return KeyframeSequenceProvider:RegisterKeyframeSequence(sequence)
-	end)
-	if not ok then
-		return nil, `couldn't register the sequence: {id}`
-	end
-	return id, nil
-end
-
-function Anim.Compile(model: Instance, tracks: Tracks, options: Options?): (Compiled?, string?)
-	local sequence, built, problem = Anim.Sequence(model, tracks, options)
-	if not sequence or not built then
-		return nil, problem
-	end
-	local id, bad = Anim.Register(sequence)
-	sequence:Destroy()
-	if not id then
-		return nil, bad
-	end
-	built.id = id
-	return built, nil
-end
-
--- The other direction, so an uploaded animation can be pulled down with
--- AnimationClipProvider:GetAnimationClipAsync, edited as tracks, and recompiled for preview
--- without ever going back through the website.
-function Anim.Decompile(sequence: KeyframeSequence): Tracks
-	local tracks: Tracks = {}
-	local keyframes = sequence:GetKeyframes()
-	table.sort(keyframes, function(a, b)
-		return (a :: Keyframe).Time < (b :: Keyframe).Time
-	end)
-
-	for _, item in keyframes do
-		local keyframe = item :: Keyframe
-		for _, descendant in keyframe:GetDescendants() do
-			if not descendant:IsA("Pose") then
-				continue
-			end
-			-- An identity pose is the rest position, which is the same thing as having no key.
-			if descendant.CFrame == CFrame.identity then
-				continue
-			end
-			local keys = tracks[descendant.Name] or {}
-			tracks[descendant.Name] = keys
-			table.insert(keys, {
-				time = keyframe.Time,
-				cframe = descendant.CFrame,
-				easing = `{descendant.EasingStyle.Name}/{descendant.EasingDirection.Name}`,
-				weight = if descendant.Weight ~= 1 then descendant.Weight else nil,
-			})
-		end
-	end
-	return tracks
-end
-
-return Anim
-]]></string>
-        </Properties>
-      </Item>
-      <Item class="ModuleScript" referent="12">
-        <Properties>
           <string name="Name">Audit</string>
           <string name="Source"><![CDATA[--!strict
 
@@ -1876,7 +1578,7 @@ return Audit
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="13">
+      <Item class="ModuleScript" referent="12">
         <Properties>
           <string name="Name">Bench</string>
           <string name="Source"><![CDATA[--!strict
@@ -2013,7 +1715,7 @@ return Bench
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="14">
+      <Item class="ModuleScript" referent="13">
         <Properties>
           <string name="Name">Build</string>
           <string name="Source"><![CDATA[--!strict
@@ -2768,229 +2470,7 @@ return Build
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="15">
-        <Properties>
-          <string name="Name">Canvas</string>
-          <string name="Source"><![CDATA[--!strict
---!native
-
--- An EditableImage that writes everything down.
---
--- The drawing itself is the engine's -- DrawRectangle, DrawCircle, DrawLine all exist and are
--- faster than anything written here would be. What earns this module its place is the recording:
--- the same list of operations goes back to Node, which replays it into a PNG. So one snippet
--- gives a live preview in Studio and a file on disk, from one description.
---
--- Render also ships the real pixels (ReadPixelsBuffer, base64) when the image is small enough,
--- so anything drawn straight on `canvas.image` -- DrawImage, WritePixelsBuffer -- lands in the
--- PNG too. The recording stays as the portable description and the fallback for big images.
-
-local AssetService = game:GetService("AssetService")
-
--- The engine's hard cap. An EditableImage can't be resized either, so a bigger one means a new
--- image and a DrawImageTransformed into it.
-local MAX_SIZE = 1024
--- Past this many bytes of RGBA the base64 alone is most of the socket's message budget, so the
--- server replays the recording instead. 512x512 is 1 MB raw, 1.4 MB encoded.
-local MAX_PIXEL_BYTES = 512 * 512 * 4
-
-local BLEND = Enum.ImageCombineType.AlphaBlend
-local SMOOTH = Enum.AntiAliasing.Enabled
-
-local Canvas = {}
-
-export type Op = { [string]: any }
-
-export type Canvas = {
-	image: EditableImage,
-	width: number,
-	height: number,
-	ops: { Op },
-	assetId: number?,
-	Clear: (self: Canvas, color: Color3, alpha: number?) -> Canvas,
-	Rect: (self: Canvas, x: number, y: number, w: number, h: number, color: Color3, alpha: number?) -> Canvas,
-	Circle: (self: Canvas, x: number, y: number, radius: number, color: Color3, alpha: number?) -> Canvas,
-	Line: (self: Canvas, x1: number, y1: number, x2: number, y2: number, color: Color3, thickness: number?) -> Canvas,
-	Content: (self: Canvas) -> Content,
-	Pixels: (self: Canvas) -> string?,
-	Upload: (self: Canvas, name: string, description: string?) -> (number?, string?),
-	Recording: (self: Canvas) -> { [string]: any },
-}
-
-local Methods = {}
-Methods.__index = Methods
-
-local function record(self: any, op: Op): any
-	table.insert(self.ops, op)
-	return self
-end
-
-local function rgb(color: Color3): { number }
-	return { color.R, color.G, color.B }
-end
-
-function Methods.Clear(self: any, color: Color3, alpha: number?): any
-	self.image:DrawRectangle(
-		Vector2.zero,
-		Vector2.new(self.width, self.height),
-		color,
-		1 - (alpha or 1),
-		Enum.ImageCombineType.Overwrite
-	)
-	return record(self, { kind = "clear", color = rgb(color), alpha = alpha or 1 })
-end
-
-function Methods.Rect(self: any, x: number, y: number, w: number, h: number, color: Color3, alpha: number?): any
-	self.image:DrawRectangle(Vector2.new(x, y), Vector2.new(w, h), color, 1 - (alpha or 1), BLEND)
-	return record(self, { kind = "rect", x = x, y = y, w = w, h = h, color = rgb(color), alpha = alpha or 1 })
-end
-
-function Methods.Circle(self: any, x: number, y: number, radius: number, color: Color3, alpha: number?): any
-	self.image:DrawCircle(Vector2.new(x, y), radius, color, 1 - (alpha or 1), BLEND, SMOOTH)
-	return record(self, { kind = "circle", x = x, y = y, r = radius, color = rgb(color), alpha = alpha or 1 })
-end
-
--- DrawLine is one pixel wide and refuses an endpoint outside the image, so a thick line is a
--- stack of parallel ones, each clamped inside.
-function Methods.Line(self: any, x1: number, y1: number, x2: number, y2: number, color: Color3, thickness: number?): any
-	local width = math.max(1, math.round(thickness or 1))
-	local dx, dy = x2 - x1, y2 - y1
-	local length = math.max(1e-3, math.sqrt(dx * dx + dy * dy))
-	local nx, ny = -dy / length, dx / length
-	local maxX, maxY = self.width - 1, self.height - 1
-	for i = 1, width do
-		local offset = (i - 1) - (width - 1) / 2
-		self.image:DrawLine(
-			Vector2.new(math.clamp(x1 + nx * offset, 0, maxX), math.clamp(y1 + ny * offset, 0, maxY)),
-			Vector2.new(math.clamp(x2 + nx * offset, 0, maxX), math.clamp(y2 + ny * offset, 0, maxY)),
-			color,
-			0,
-			BLEND,
-			SMOOTH
-		)
-	end
-	return record(self, { kind = "line", x1 = x1, y1 = y1, x2 = x2, y2 = y2, color = rgb(color), thickness = width })
-end
-
--- Assign to an ImageLabel's ImageContent to see it. Only one EditableImage refreshes per frame on
--- the display side, so a wall of live previews updates one at a time.
-function Methods.Content(self: any): Content
-	return Content.fromObject(self.image)
-end
-
-local ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-local ENCODE = table.create(64)
-for i = 1, 64 do
-	ENCODE[i - 1] = string.byte(ALPHABET, i)
-end
-
--- JSON has no bytes, so the RGBA buffer goes over as base64. Three input bytes to four output
--- bytes, written straight into a second buffer; no string concatenation on the way.
-local function base64(bytes: buffer): string
-	local length = buffer.len(bytes)
-	local out = buffer.create(math.ceil(length / 3) * 4)
-	local o = 0
-	local full = length - length % 3
-	for i = 0, full - 1, 3 do
-		local a, b, c = buffer.readu8(bytes, i), buffer.readu8(bytes, i + 1), buffer.readu8(bytes, i + 2)
-		local n = a * 65536 + b * 256 + c
-		buffer.writeu8(out, o, ENCODE[n // 262144])
-		buffer.writeu8(out, o + 1, ENCODE[n // 4096 % 64])
-		buffer.writeu8(out, o + 2, ENCODE[n // 64 % 64])
-		buffer.writeu8(out, o + 3, ENCODE[n % 64])
-		o += 4
-	end
-	local rest = length - full
-	if rest == 1 then
-		local a = buffer.readu8(bytes, full)
-		buffer.writeu8(out, o, ENCODE[a // 4])
-		buffer.writeu8(out, o + 1, ENCODE[a % 4 * 16])
-		buffer.writeu8(out, o + 2, 61)
-		buffer.writeu8(out, o + 3, 61)
-	elseif rest == 2 then
-		local a, b = buffer.readu8(bytes, full), buffer.readu8(bytes, full + 1)
-		buffer.writeu8(out, o, ENCODE[a // 4])
-		buffer.writeu8(out, o + 1, ENCODE[a % 4 * 16 + b // 16])
-		buffer.writeu8(out, o + 2, ENCODE[b % 16 * 4])
-		buffer.writeu8(out, o + 3, 61)
-	end
-	return buffer.tostring(out)
-end
-
--- Any EditableImage's real RGBA as base64, or nil when it's over the size the socket is happy
--- carrying or can't be read (Mesh & Image APIs off).
-function Canvas.Base64Pixels(image: EditableImage): string?
-	local size = image.Size
-	if size.X * size.Y * 4 > MAX_PIXEL_BYTES then
-		return nil
-	end
-	local ok, bytes = pcall(function()
-		return image:ReadPixelsBuffer(Vector2.zero, size)
-	end)
-	if not ok then
-		return nil
-	end
-	return base64(bytes)
-end
-
-function Methods.Pixels(self: any): string?
-	return Canvas.Base64Pixels(self.image)
-end
-
--- Publishes the image as an Image asset owned by whoever is logged into Studio and remembers the
--- id, so a script can use rbxassetid://id with no EditableImage at runtime. Moderation runs after
--- upload, so the id exists at once and the picture follows a little later.
-function Methods.Upload(self: any, name: string, description: string?): (number?, string?)
-	local ok, result, id = pcall(function()
-		return AssetService:CreateAssetAsync(self.image, Enum.AssetType.Image, {
-			Name = name,
-			Description = description or "Generated with VMCP Canvas",
-		})
-	end)
-	if not ok then
-		return nil, `upload failed: {result}`
-	end
-	if result ~= Enum.CreateAssetResult.Success then
-		return nil, `upload refused: {result}`
-	end
-	self.assetId = id
-	return id, nil
-end
-
--- What vmcp.Render sends to the VMCP server, which writes it as a PNG. Returning it from a
--- run_luau snippet as `postProcess` does the same thing on the way out. Carries the real pixels
--- when they fit, and the op list either way.
-function Methods.Recording(self: any): { [string]: any }
-	return {
-		kind = "png",
-		width = self.width,
-		height = self.height,
-		ops = self.ops,
-		pixels = self:Pixels(),
-		assetId = self.assetId,
-	}
-end
-
-function Canvas.new(width: number, height: number): (Canvas?, string?)
-	if width < 1 or height < 1 or width > MAX_SIZE or height > MAX_SIZE then
-		return nil, `an EditableImage is 1 to {MAX_SIZE} pixels on a side; asked for {width}x{height}`
-	end
-
-	local ok, image = pcall(function()
-		return AssetService:CreateEditableImage({ Size = Vector2.new(width, height) })
-	end)
-	if not ok then
-		return nil, `couldn't create the image: {image}`
-	end
-
-	return setmetatable({ image = image, width = width, height = height, ops = {} }, Methods) :: any, nil
-end
-
-return Canvas
-]]></string>
-        </Properties>
-      </Item>
-      <Item class="ModuleScript" referent="16">
+      <Item class="ModuleScript" referent="14">
         <Properties>
           <string name="Name">Equiv</string>
           <string name="Source"><![CDATA[--!strict
@@ -3285,7 +2765,7 @@ return Equiv
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="17">
+      <Item class="ModuleScript" referent="15">
         <Properties>
           <string name="Name">Exploit</string>
           <string name="Source"><![CDATA[--!strict
@@ -3796,7 +3276,7 @@ return Exploit
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="18">
+      <Item class="ModuleScript" referent="16">
         <Properties>
           <string name="Name">Instrument</string>
           <string name="Source"><![CDATA[--!strict
@@ -3913,7 +3393,7 @@ return Instrument
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="19">
+      <Item class="ModuleScript" referent="17">
         <Properties>
           <string name="Name">Lint</string>
           <string name="Source"><![CDATA[--!strict
@@ -4202,7 +3682,7 @@ return Lint
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="20">
+      <Item class="ModuleScript" referent="18">
         <Properties>
           <string name="Name">Load</string>
           <string name="Source"><![CDATA[--!strict
@@ -4291,7 +3771,7 @@ return Load
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="21">
+      <Item class="ModuleScript" referent="19">
         <Properties>
           <string name="Name">LuauScan</string>
           <string name="Source"><![CDATA[--!strict
@@ -4758,7 +4238,7 @@ return LuauScan
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="22">
+      <Item class="ModuleScript" referent="20">
         <Properties>
           <string name="Name">Profile</string>
           <string name="Source"><![CDATA[--!strict
@@ -5689,7 +5169,7 @@ return Profile
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="23">
+      <Item class="ModuleScript" referent="21">
         <Properties>
           <string name="Name">Remotes</string>
           <string name="Source"><![CDATA[--!strict
@@ -5926,241 +5406,12 @@ return Remotes
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="24">
-        <Properties>
-          <string name="Name">Rig</string>
-          <string name="Source"><![CDATA[--!strict
-
--- Derives a rig's pose hierarchy from the Motor6D graph it actually has.
---
--- This exists because of one trap that costs an afternoon every time: a Pose is *named* after a
--- BasePart, but the CFrame on it drives the Motor6D joining that part to its **parent pose's**
--- part. A Pose named LowerTorso drives the motor named Root. So a pose tree that looks sensible
--- but doesn't mirror the real joint graph animates the wrong joints, and nothing errors -- the
--- character just moves wrong.
---
--- Nothing here is hardcoded to a skeleton, so R6, R15 and custom rigs all work the same way.
-
-local Rig = {}
-
-export type Node = {
-	part: BasePart,
-	-- The motor that moves `part` relative to its parent. nil on the root, which nothing moves.
-	motor: Motor6D?,
-	children: { Node },
-}
-
-export type Rig = {
-	root: Node,
-	byName: { [string]: Node },
-	-- Every part name, parents before children, which is the order a pose tree has to be built in.
-	order: { string },
-}
-
-local function collect(model: Instance): ({ Motor6D }, { [BasePart]: true })
-	local motors: { Motor6D } = {}
-	local moved: { [BasePart]: true } = {}
-	for _, descendant in model:GetDescendants() do
-		if not descendant:IsA("Motor6D") then
-			continue
-		end
-		local child = descendant.Part1
-		if descendant.Part0 and child then
-			table.insert(motors, descendant)
-			moved[child] = true
-		end
-	end
-	return motors, moved
-end
-
--- Walks the Motor6D graph out from the one part nothing else moves. Returns the problem instead
--- of the rig when the graph doesn't describe a single tree, because every later step assumes it.
-function Rig.Build(model: Instance): (Rig?, string?)
-	local motors, moved = collect(model)
-	if #motors == 0 then
-		return nil, `{model:GetFullName()} has no Motor6Ds, so there's no rig to read`
-	end
-
-	local roots: { BasePart } = {}
-	for _, motor in motors do
-		local part0 = motor.Part0 :: BasePart
-		if not moved[part0] and not table.find(roots, part0) then
-			table.insert(roots, part0)
-		end
-	end
-	if #roots == 0 then
-		return nil, "every part in this rig is driven by a motor, so the joints form a loop"
-	end
-	if #roots > 1 then
-		local names = {}
-		for _, part in roots do
-			table.insert(names, part.Name)
-		end
-		return nil, `this rig has {#roots} unmoved parts ({table.concat(names, ", ")}); it needs exactly one root`
-	end
-
-	local byName: { [string]: Node } = {}
-	local order: { string } = {}
-
-	local function node(part: BasePart, motor: Motor6D?): Node
-		local created: Node = { part = part, motor = motor, children = {} }
-		byName[part.Name] = created
-		table.insert(order, part.Name)
-		return created
-	end
-
-	local root = node(roots[1], nil)
-	local frontier = { root }
-	while #frontier > 0 do
-		local current = table.remove(frontier) :: Node
-		for _, motor in motors do
-			if motor.Part0 ~= current.part then
-				continue
-			end
-			local child = node(motor.Part1 :: BasePart, motor)
-			table.insert(current.children, child)
-			table.insert(frontier, child)
-		end
-	end
-
-	if #order < #motors + 1 then
-		return nil, `only {#order} of {#motors + 1} parts are reachable from {root.part.Name} -- the rig is in pieces`
-	end
-	return { root = root, byName = byName, order = order }, nil
-end
-
--- Builds one keyframe's worth of Poses: the same shape as the rig, one Pose per part, named after
--- the part but driving the motor above it. `cframeFor` supplies each joint's transform; anything
--- it has no opinion on stays at identity, which is the joint's rest position.
-function Rig.PoseTree(rig: Rig, cframeFor: (partName: string) -> CFrame?): Pose
-	local function build(node: Node): Pose
-		local pose = Instance.new("Pose")
-		pose.Name = node.part.Name
-		pose.CFrame = cframeFor(node.part.Name) or CFrame.identity
-		for _, child in node.children do
-			build(child).Parent = pose
-		end
-		return pose
-	end
-	return build(rig.root)
-end
-
--- Names the rig knows, so a typo in a track can be reported as "no such joint" instead of
--- animating nothing and looking like a broken export.
-function Rig.Describe(rig: Rig): string
-	local lines = {}
-	local function walk(node: Node, depth: number)
-		local motor = if node.motor then ` via {node.motor.Name}` else " (root)"
-		table.insert(lines, `{string.rep("  ", depth)}{node.part.Name}{motor}`)
-		for _, child in node.children do
-			walk(child, depth + 1)
-		end
-	end
-	walk(rig.root, 0)
-	return table.concat(lines, "\n")
-end
-
-return Rig
-]]></string>
-        </Properties>
-      </Item>
-      <Item class="ModuleScript" referent="25">
-        <Properties>
-          <string name="Name">Style</string>
-          <string name="Source"><![CDATA[--!strict
-
--- Two small checks around StyleRule, both of which exist because the engine fails quietly here.
---
--- StyleRule:SetProperties ignores a property name the target class doesn't have. No error, no
--- warning -- the rule just does less than it says, and the usual next move is to go and rewrite
--- the selector, which was never the problem. StyleRule.SelectorError is the same shape of trap in
--- the other direction: the message is there to read, but nothing makes you read it.
-
-local Style = {}
-
--- Instance.new is the only honest way to ask "does this class have this property". A probe costs
--- one instance that's thrown away immediately, and the answer is exact.
-local function probe(className: string): (Instance?, string?)
-	local ok, instance = pcall(Instance.new, className)
-	if not ok then
-		return nil,
-			`can't check against "{className}" -- either it isn't a class or it isn't creatable, `
-				.. "which is the case for abstract ones like GuiObject"
-	end
-	return instance, nil
-end
-
--- Returns the property names the class doesn't have. Empty means everything would land.
-function Style.Check(className: string, properties: { [string]: any }): ({ string }, string?)
-	local instance, problem = probe(className)
-	if not instance then
-		return {}, problem
-	end
-
-	local missing = {}
-	for name in properties do
-		if not pcall(function()
-			return (instance :: any)[name]
-		end) then
-			table.insert(missing, name)
-		end
-	end
-	instance:Destroy()
-
-	table.sort(missing)
-	return missing, nil
-end
-
--- Checks first, then applies. Returns the names it refused to set, so a typo shows up as a list
--- rather than as a rule that mysteriously does nothing.
-function Style.Apply(rule: StyleRule, className: string, properties: { [string]: any }): ({ string }, string?)
-	local missing, problem = Style.Check(className, properties)
-	if problem then
-		return {}, problem
-	end
-
-	local wanted = {}
-	for name, value in properties do
-		if not table.find(missing, name) then
-			wanted[name] = value
-		end
-	end
-	rule:SetProperties(wanted)
-	return missing, nil
-end
-
--- Sets a selector and hands back whatever the engine made of it. An empty return means it parsed.
-function Style.Selector(rule: StyleRule, selector: string): string?
-	rule.Selector = selector
-	local complaint = rule.SelectorError
-	return if complaint ~= "" then complaint else nil
-end
-
--- A styled value never shows up in a plain property read: `frame.BackgroundColor3` keeps saying
--- the default while the rule renders fine. GetStyled is the read that sees the rules, and this
--- is the same thing for several properties at once. A name the class doesn't have comes back
--- as the error string instead of a value.
-function Style.Read(instance: Instance, names: { string }): { [string]: any }
-	local out = {}
-	for _, name in names do
-		local ok, value = pcall(function()
-			return (instance :: any):GetStyled(name)
-		end)
-		out[name] = if ok then value else `no property "{name}"`
-	end
-	return out
-end
-
-return Style
-]]></string>
-        </Properties>
-      </Item>
     </Item>
-    <Item class="Folder" referent="26">
+    <Item class="Folder" referent="22">
       <Properties>
         <string name="Name">Log</string>
       </Properties>
-      <Item class="ModuleScript" referent="27">
+      <Item class="ModuleScript" referent="23">
         <Properties>
           <string name="Name">Buffer</string>
           <string name="Source"><![CDATA[--!strict
@@ -6245,7 +5496,7 @@ return Buffer
         </Properties>
       </Item>
     </Item>
-    <Item class="ModuleScript" referent="28">
+    <Item class="ModuleScript" referent="24">
       <Properties>
         <string name="Name">Panel</string>
         <string name="Source"><![CDATA[--!strict
@@ -6613,7 +5864,7 @@ end
 return Panel
 ]]></string>
       </Properties>
-      <Item class="ModuleScript" referent="29">
+      <Item class="ModuleScript" referent="25">
         <Properties>
           <string name="Name">Style</string>
           <string name="Source"><![CDATA[--!strict
@@ -6900,7 +6151,7 @@ return Style
         </Properties>
       </Item>
     </Item>
-    <Item class="ModuleScript" referent="30">
+    <Item class="ModuleScript" referent="26">
       <Properties>
         <string name="Name">Path</string>
         <string name="Source"><![CDATA[--!strict
@@ -6941,11 +6192,11 @@ return Path
 ]]></string>
       </Properties>
     </Item>
-    <Item class="Folder" referent="31">
+    <Item class="Folder" referent="27">
       <Properties>
         <string name="Name">Playtest</string>
       </Properties>
-      <Item class="ModuleScript" referent="32">
+      <Item class="ModuleScript" referent="28">
         <Properties>
           <string name="Name">Session</string>
           <string name="Source"><![CDATA[--!strict
@@ -7015,7 +6266,7 @@ return Session
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="33">
+      <Item class="ModuleScript" referent="29">
         <Properties>
           <string name="Name">Swap</string>
           <string name="Source"><![CDATA[--!strict
@@ -7147,11 +6398,11 @@ return Swap
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="34">
+    <Item class="Folder" referent="30">
       <Properties>
         <string name="Name">Timeline</string>
       </Properties>
-      <Item class="ModuleScript" referent="35">
+      <Item class="ModuleScript" referent="31">
         <Properties>
           <string name="Name">Runtime</string>
           <string name="Source"><![CDATA[--!strict
@@ -7434,11 +6685,11 @@ return Runtime
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="36">
+    <Item class="Folder" referent="32">
       <Properties>
         <string name="Name">Tools</string>
       </Properties>
-      <Item class="ModuleScript" referent="37">
+      <Item class="ModuleScript" referent="33">
         <Properties>
           <string name="Name">ApplyBuild</string>
           <string name="Source"><![CDATA[--!strict
@@ -7672,7 +6923,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="38">
+      <Item class="ModuleScript" referent="34">
         <Properties>
           <string name="Name">ApplyFix</string>
           <string name="Source"><![CDATA[--!strict
@@ -7856,7 +7107,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="39">
+      <Item class="ModuleScript" referent="35">
         <Properties>
           <string name="Name">CountLines</string>
           <string name="Source"><![CDATA[--!strict
@@ -8054,7 +7305,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="40">
+      <Item class="ModuleScript" referent="36">
         <Properties>
           <string name="Name">GetBuild</string>
           <string name="Source"><![CDATA[--!strict
@@ -8135,7 +7386,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="41">
+      <Item class="ModuleScript" referent="37">
         <Properties>
           <string name="Name">GetLogs</string>
           <string name="Source"><![CDATA[--!strict
@@ -8239,7 +7490,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="42">
+      <Item class="ModuleScript" referent="38">
         <Properties>
           <string name="Name">GetTree</string>
           <string name="Source"><![CDATA[--!strict
@@ -8373,175 +7624,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="43">
-        <Properties>
-          <string name="Name">InspectStyle</string>
-          <string name="Source"><![CDATA[--!strict
-
--- Answers "why does this rule do nothing" in one call. The engine has no API that says which
--- rules matched an instance, so this lays out everything that decides it: the instance's class,
--- name and tags (the selector's inputs), the direct value next to the styled value next to the
--- class default (the precedence fight), and every rule in the linked sheets that sets the
--- property, with its selector, priority, stored value and SelectorError.
-
-local CollectionService = game:GetService("CollectionService")
-
-local Path = require(script.Parent.Parent.Path)
-
-type Result = {
-	content: { { type: "text", text: string } },
-	isError: boolean?,
-}
-
-local Tool = {}
-
-Tool.Definition = {
-	name = "inspect_style",
-	description = "Explains what StyleSheet rules did to one instance. For each property: the value set "
-		.. "directly on the instance, the value the rules resolved (GetStyled), the class default, and "
-		.. "every rule in the linked sheets that sets that property (selector, priority, stored value, "
-		.. "SelectorError). Also lists the instance's tags, since `.Name` is a tag and `#Name` is the "
-		.. "instance name. A direct value that isn't the class default beats every rule; a rule whose "
-		.. "stored value is the class default may not reach a playtest client. Run it with context "
-		.. "client to see what the player actually gets.",
-	inputSchema = {
-		type = "object",
-		properties = {
-			root = { type = "string", description = "Dotted path to the GuiObject to inspect." },
-			properties = {
-				type = "array",
-				items = { type = "string" },
-				description = "Property names to explain. Defaults to the common visual ones.",
-			},
-			context = {
-				type = "string",
-				description = "Which DataModel. Defaults to plugin.",
-				enum = { "plugin", "server", "client" },
-			},
-			player = {
-				type = "integer",
-				description = "Which test client, 1-based. Only meaningful with context client.",
-				minimum = 1,
-				maximum = 8,
-			},
-		},
-		required = { "root" },
-	},
-	tags = { title = "Inspect Style", readOnly = true },
-	timeoutMs = 15000,
-}
-
-local DEFAULT_PROPERTIES: { string } = {
-	"BackgroundColor3", "BackgroundTransparency", "TextColor3", "TextSize", "TextXAlignment",
-	"FontFace", "ImageColor3", "ImageTransparency", "Size", "Position", "Visible",
-}
-
-local function show(value: any): string
-	local kind = typeof(value)
-	if kind == "Color3" then
-		local c = value :: Color3
-		return `rgb({math.round(c.R * 255)}, {math.round(c.G * 255)}, {math.round(c.B * 255)})`
-	elseif kind == "Font" then
-		return (value :: Font).Family:match("([^/]+)%.json$") or tostring(value)
-	end
-	return tostring(value)
-end
-
--- Every sheet the instance can see: the StyleLinks on it and its ancestors, plus what those
--- sheets derive from.
-local function sheets(instance: Instance): { StyleSheet }
-	local out, seen = {}, {}
-	local function add(sheet: StyleSheet?)
-		if not sheet or seen[sheet] then
-			return
-		end
-		seen[sheet] = true
-		table.insert(out, sheet)
-		for _, derive in sheet:GetChildren() do
-			if derive:IsA("StyleDerive") then
-				add(derive.StyleSheet)
-			end
-		end
-	end
-	local node: Instance? = instance
-	while node do
-		for _, child in node:GetChildren() do
-			if child:IsA("StyleLink") then
-				add(child.StyleSheet)
-			end
-		end
-		node = node.Parent
-	end
-	return out
-end
-
-local function fail(text: string): Result
-	return { content = { { type = "text", text = text } }, isError = true }
-end
-
-function Tool.Run(arguments: { root: string, properties: { string }? }): Result
-	local found, problem = Path.Resolve(arguments.root)
-	if not found then
-		return fail(problem :: string)
-	end
-	local instance = found :: Instance
-	local names: { string } = if arguments.properties and #arguments.properties > 0 then arguments.properties else DEFAULT_PROPERTIES
-
-	local defaults: any = nil
-	pcall(function()
-		defaults = Instance.new(instance.ClassName)
-	end)
-
-	local rules = {}
-	local linked = sheets(instance)
-	for _, sheet in linked do
-		for _, rule in sheet:GetDescendants() do
-			if rule:IsA("StyleRule") then
-				table.insert(rules, rule)
-			end
-		end
-	end
-
-	local lines = {
-		`{instance:GetFullName()} ({instance.ClassName}) tags: {table.concat(CollectionService:GetTags(instance), ", ")}`,
-		`sheets: {#linked}, rules: {#rules}`,
-	}
-	for _, name in names do
-		local okDirect, direct = pcall(function()
-			return (instance :: any)[name]
-		end)
-		if not okDirect then
-			table.insert(lines, `\n{name}: no such property on {instance.ClassName}`)
-			continue
-		end
-		local okStyled, styled = pcall(function()
-			return (instance :: any):GetStyled(name)
-		end)
-		local default = if defaults then (defaults :: any)[name] else nil
-		local verdict = if direct ~= default
-			then "direct value wins (not the class default)"
-			elseif okStyled and styled ~= direct then "a rule decides it"
-			else "class default; no rule changed it"
-		table.insert(lines, `\n{name}: direct={show(direct)} styled={if okStyled then show(styled) else "?"} default={show(default)} -- {verdict}`)
-		for _, rule in rules do
-			local value = rule:GetProperty(name)
-			if value ~= nil then
-				local err = rule.SelectorError
-				table.insert(lines, `  [{rule.Priority}] {rule.Selector} = {show(value)}{if err ~= "" then " SELECTOR ERROR: " .. err else ""}{if value == default then " (class default: may not reach a client)" else ""}`)
-			end
-		end
-	end
-	if defaults then
-		defaults:Destroy()
-	end
-	return { content = { { type = "text", text = table.concat(lines, "\n") } } }
-end
-
-return Tool
-]]></string>
-        </Properties>
-      </Item>
-      <Item class="ModuleScript" referent="44">
+      <Item class="ModuleScript" referent="39">
         <Properties>
           <string name="Name">LintHotpaths</string>
           <string name="Source"><![CDATA[--!strict
@@ -8707,300 +7790,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="45">
-        <Properties>
-          <string name="Name">MountStory</string>
-          <string name="Source"><![CDATA[--!strict
-
--- Mounts a UI Labs story the way the UI Labs plugin would, into a ScreenGui under StarterGui,
--- and hands back a screenshot_ui picture of it. The story file is the contract: the same module
--- the human opens in UI Labs is what this draws, so there is one source of truth for a component.
---
--- Studio's require cache is per instance, and Rojo syncs an edit into the same instance, so a
--- plain require would keep serving the first version. The story's folder is cloned beside the
--- original for the mount (relative requires still resolve) and destroyed afterwards.
-
-local Path = require(script.Parent.Parent.Path)
-local ScreenshotUi = require(script.Parent.ScreenshotUi)
-
-local StarterGui = game:GetService("StarterGui")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-
-local GUI_NAME = "VMCPStory"
-local STYLE_RESOLVE_WAIT = 0.2 -- a StyleLink reads class defaults for a frame after linking
-
-type Result = {
-	content: { { type: "text", text: string } },
-	isError: boolean?,
-	postProcess: { [string]: any }?,
-}
-
-local Tool = {}
-
-Tool.Definition = {
-	name = "mount_story",
-	description = "Mounts a UI Labs story (a *.story ModuleScript) into a ScreenGui under "
-		.. "StarterGui with the given control values and returns a screenshot_ui picture of it. "
-		.. "Handles Vide stories ({ vide, story, controls }), generic stories ({ render, "
-		.. "controls }) and function stories. The story's folder is cloned for the mount so a "
-		.. "just-synced edit is what runs. ReplicatedStorage.Design.StyleSheet is linked when it "
-		.. "exists. Unless keep is set, the mount is torn down after the screenshot; with keep "
-		.. "the ScreenGui stays as StarterGui.VMCPStory for inspect_style and run_luau probes.",
-	inputSchema = {
-		type = "object",
-		properties = {
-			story = {
-				type = "string",
-				description = "Dotted path to the component module or folder, e.g. StarterPlayer.StarterPlayerScripts.Client.UI.HexStat; its *.story child is mounted. A dotted path can't name the story itself (its name has a dot).",
-			},
-			controls = {
-				type = "object",
-				description = "Control values to override the story's defaults, keyed by control name.",
-			},
-			size = {
-				type = "array",
-				items = { type = "number" },
-				description = "Target frame size in pixels [w, h]. Defaults to [1280, 720].",
-			},
-			background = {
-				type = "string",
-				description = 'Target frame colour as "r,g,b" 0-255. Defaults to the story\'s `background` field, else a dark grey.',
-			},
-			keep = { type = "boolean", description = "Leave the mount in StarterGui.VMCPStory after the screenshot." },
-			scale = {
-				type = "number",
-				description = "Screenshot scale 0.1-1, passed to screenshot_ui.",
-				minimum = 0.1,
-				maximum = 1,
-			},
-		},
-		required = { "story" },
-	},
-	tags = { title = "Mount Story" },
-	timeoutMs = 60000,
-}
-
-local function fail(text: string): Result
-	return { content = { { type = "text", text = text } }, isError = true }
-end
-
--- UI Labs control entries are either a raw default or { EntryType = "Control", ControlValue = default }.
-local function controlDefault(entry: any): any
-	if type(entry) == "table" and entry.EntryType == "Control" then
-		return entry.ControlValue
-	end
-	return entry
-end
-
-local function parseColor(text: string?): Color3?
-	if not text then
-		return nil
-	end
-	local r, g, b = string.match(text, "^%s*(%d+)%s*,%s*(%d+)%s*,%s*(%d+)%s*$")
-	if not r then
-		return nil
-	end
-	return Color3.fromRGB(tonumber(r) :: number, tonumber(g) :: number, tonumber(b) :: number)
-end
-
-local mounted: { gui: ScreenGui?, clone: Instance?, cleanup: (() -> ())? } = {}
-
-local function teardown()
-	if mounted.cleanup then
-		pcall(mounted.cleanup)
-	end
-	if mounted.gui then
-		mounted.gui:Destroy()
-	end
-	if mounted.clone then
-		mounted.clone:Destroy()
-	end
-	mounted.gui, mounted.clone, mounted.cleanup = nil, nil, nil
-	local stale = StarterGui:FindFirstChild(GUI_NAME)
-	if stale then
-		stale:Destroy()
-	end
-end
-
--- Runs the story and returns its cleanup. `values` are the resolved control values.
-local function mountStory(story: any, target: Frame, values: { [string]: any }): (() -> ())?
-	if type(story) == "function" then
-		return story(target)
-	end
-	if type(story) ~= "table" then
-		error(`a story module returns a function or a table, not {typeof(story)}`)
-	end
-
-	if story.vide then
-		local Vide = story.vide
-		local sources = {}
-		for name, value in values do
-			sources[name] = Vide.source(value)
-		end
-		local props = { target = target, controls = sources }
-		local unroot = Vide.root(function()
-			local result = story.story(props)
-			if typeof(result) == "Instance" then
-				result.Parent = target
-			end
-		end)
-		return unroot
-	end
-
-	if story.fusion then
-		error("Fusion stories aren't supported here; use a Vide, generic or function story")
-	end
-
-	local render = story.render or story.story
-	if type(render) ~= "function" then
-		error("story table needs `story` (Vide) or `render` (generic)")
-	end
-	local props = {
-		target = target,
-		controls = values,
-		-- Controls never change during a mount, so a subscription has nothing to deliver.
-		subscribe = function(): () -> ()
-			return function() end
-		end,
-	}
-	local result = render(props)
-	if typeof(result) == "Instance" then
-		result.Parent = target
-		return function()
-			result:Destroy()
-		end
-	end
-	return result
-end
-
-function Tool.Run(arguments: {
-	story: string,
-	controls: { [string]: any }?,
-	size: { number }?,
-	background: string?,
-	keep: boolean?,
-	scale: number?,
-}): Result
-	teardown()
-
-	local container, problem = Path.Resolve(arguments.story)
-	if not container then
-		return fail(problem :: string)
-	end
-	local found: ModuleScript? = nil
-	for _, child in container:GetChildren() do
-		if child:IsA("ModuleScript") and string.match(child.Name, "%.story$") then
-			found = child
-			break
-		end
-	end
-	if not found then
-		return fail(`{container:GetFullName()} has no *.story ModuleScript child`)
-	end
-
-	-- Clone the folder the story lives in so this run sees the current source of everything in it.
-	local original = found.Parent :: Instance
-	local clone = original:Clone()
-	clone.Name = original.Name
-	clone.Parent = original.Parent
-	local storyModule = clone:FindFirstChild(found.Name) :: ModuleScript
-	mounted.clone = clone
-
-	local okRequire, story = pcall(require, storyModule)
-	if not okRequire then
-		teardown()
-		return fail(`story failed to load: {story}`)
-	end
-
-	local values: { [string]: any } = {}
-	if type(story) == "table" and type(story.controls) == "table" then
-		for name, entry in story.controls do
-			values[name] = controlDefault(entry)
-		end
-	end
-	local overrides: { [string]: any } = arguments.controls or {}
-	for name, value in overrides do
-		if typeof(values[name]) == "Color3" and type(value) == "string" then
-			values[name] = parseColor(value) or values[name]
-		else
-			values[name] = value
-		end
-	end
-
-	local size = arguments.size or { 1280, 720 }
-	local gui = Instance.new("ScreenGui")
-	gui.Name = GUI_NAME
-	gui.ResetOnSpawn = false
-	gui.IgnoreGuiInset = true
-	gui.Parent = StarterGui
-	mounted.gui = gui
-
-	local target = Instance.new("Frame")
-	target.Name = "Target"
-	target.Size = UDim2.fromOffset(size[1], size[2])
-	target.AnchorPoint = Vector2.new(0.5, 0.5)
-	target.Position = UDim2.fromScale(0.5, 0.5)
-	target.BorderSizePixel = 0
-	target.BackgroundColor3 = parseColor(arguments.background)
-		or (
-			if type(story) == "table" and typeof(story.background) == "Color3"
-				then story.background
-				else Color3.fromRGB(24, 24, 28)
-		)
-	target.Parent = gui
-
-	-- Design builds its sheets on first require (Rojo can't author StyleRules).
-	local design = ReplicatedStorage:FindFirstChild("Design")
-	if design and design:IsA("ModuleScript") then
-		pcall(require, design)
-	end
-	local sheet = if design then design:FindFirstChild("StyleSheet") else nil
-	if sheet and sheet:IsA("StyleSheet") then
-		local link = Instance.new("StyleLink")
-		link.Parent = gui
-		link.StyleSheet = sheet
-	end
-
-	local okMount, cleanupOrError = pcall(mountStory, story, target, values)
-	if not okMount then
-		teardown()
-		return fail(`story errored while mounting: {cleanupOrError}`)
-	end
-	mounted.cleanup = if type(cleanupOrError) == "function" then cleanupOrError else nil
-
-	task.wait(STYLE_RESOLVE_WAIT)
-
-	local shot = ScreenshotUi.Run({
-		root = `StarterGui.{GUI_NAME}`,
-		scale = arguments.scale,
-		name = `story-{string.gsub(found.Name, "[^%w_-]", "")}`,
-	})
-
-	local summary = { `mounted {found:GetFullName()} at {size[1]}x{size[2]}` }
-	local names = {}
-	for name, value in values do
-		table.insert(names, `{name}={tostring(value)}`)
-	end
-	table.sort(names)
-	if #names > 0 then
-		table.insert(summary, `controls: {table.concat(names, ", ")}`)
-	end
-	if arguments.keep then
-		table.insert(summary, `kept as StarterGui.{GUI_NAME} -- call mount_story again or run_luau to remove it`)
-	else
-		teardown()
-	end
-
-	local header: { type: "text", text: string } = { type = "text", text = table.concat(summary, "\n") }
-	table.insert(shot.content, 1, header)
-	return shot
-end
-
-return Tool
-]]></string>
-        </Properties>
-      </Item>
-      <Item class="ModuleScript" referent="46">
+      <Item class="ModuleScript" referent="40">
         <Properties>
           <string name="Name">OptimizationLedger</string>
           <string name="Source"><![CDATA[--!strict
@@ -9117,7 +7907,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="47">
+      <Item class="ModuleScript" referent="41">
         <Properties>
           <string name="Name">Peer</string>
           <string name="Source"><![CDATA[--!strict
@@ -9174,7 +7964,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="48">
+      <Item class="ModuleScript" referent="42">
         <Properties>
           <string name="Name">Playtest</string>
           <string name="Source"><![CDATA[--!strict
@@ -9270,7 +8060,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="49">
+      <Item class="ModuleScript" referent="43">
         <Properties>
           <string name="Name">Print</string>
           <string name="Source"><![CDATA[--!strict
@@ -9369,7 +8159,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="50">
+      <Item class="ModuleScript" referent="44">
         <Properties>
           <string name="Name">ProfileScripts</string>
           <string name="Source"><![CDATA[--!strict
@@ -9864,592 +8654,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="51">
-        <Properties>
-          <string name="Name">RenderAnim</string>
-          <string name="Source"><![CDATA[--!strict
-
-local Players = game:GetService("Players")
-local AnimationClipProvider = game:GetService("AnimationClipProvider")
-
-local Anim = require(script.Parent.Parent.Lib.Anim)
-local Build = require(script.Parent.Parent.Lib.Build)
-local Rig = require(script.Parent.Parent.Lib.Rig)
-local Path = require(script.Parent.Parent.Path)
-
-local MAX_FRAMES = 16
-local DUMMY_PREFIX = "VMCPRig"
-
-type Result = {
-	content: { { type: "text", text: string } },
-	isError: boolean?,
-	postProcess: { [string]: any }?,
-}
-
-local Tool = {}
-
-Tool.Definition = {
-	name = "render_anim",
-	description = "Draws an animation as a contact sheet: the rig posed at each keyframe, laid out in "
-		.. "reading order, one panel per view (four views in a 2x2 grid by default, so one 4k image "
-		.. "shows the whole thing). Takes the same per-joint tracks vmcp.Anim.Compile takes, compiles "
-		.. "them, and returns a temporary animation id you can play straight away. Nothing in the place "
-		.. "moves; poses are computed from the rig's Motor6Ds, and anything welded to the rig (a held "
-		.. "tool, accessories) comes along. With no rig given it spawns a classic-coloured R15 or R6 "
-		.. `dummy at Workspace.{DUMMY_PREFIX}R15 / R6 and reuses it. Works on any Motor6D rig.`,
-	inputSchema = {
-		type = "object",
-		properties = {
-			tracks = {
-				type = "object",
-				description = "Joint name -> keys. A key is { time, angles = [x, y, z] degrees, easing } or "
-					.. '{ time, cframe = [12 CFrame components], easing }. easing is "Style/Direction": '
-					.. "CubicV2, Bounce, Elastic, Constant, Linear with In, Out, InOut; it sits on the key it "
-					.. "leaves from. Rig joint names: R15 UpperTorso, Head, RightUpperArm, RightLowerArm, "
-					.. 'RightHand, RightUpperLeg...; R6 Torso, Head, "Right Arm", "Left Leg"...',
-			},
-			animationId = {
-				type = "string",
-				description = "Draw an existing animation (rbxassetid://...) instead of tracks. Its tracks come back in the text.",
-			},
-			rig = {
-				type = "string",
-				description = "Dotted path to a rigged model. Defaults to the dummy for rigType.",
-			},
-			rigType = {
-				type = "string",
-				enum = { "R15", "R6" },
-				description = "Which dummy to spawn when rig isn't given. Defaults to R15.",
-			},
-			holding = {
-				type = "string",
-				description = "Dotted path to a Tool or a Model with a Handle, drawn in the rig's right hand "
-					.. "the way the engine grips it (RightGripAttachment and Tool.Grip). Nothing is welded.",
-			},
-			times = {
-				type = "array",
-				items = { type = "number" },
-				description = `Seconds to sample at. Defaults to every keyframe time, up to {MAX_FRAMES}.`,
-				maxItems = MAX_FRAMES,
-			},
-			views = {
-				type = "array",
-				items = { type = { "string", "object" } },
-				description = "Angles, one panel each: front, right, left, back, top, iso, or { yaw, pitch, name }. Defaults to front, right, iso, top.",
-				maxItems = 4,
-			},
-			size = {
-				type = "integer",
-				description = "Pixels per panel. Defaults to 2048.",
-				minimum = 128,
-				maximum = 2048,
-			},
-			loop = { type = "boolean", description = "Sequence loops. Defaults to true." },
-			priority = { type = "string", description = "Animation priority name. Defaults to Action." },
-			save = {
-				type = "string",
-				description = "Dotted path to a folder. Puts the KeyframeSequence there (named after `name`), "
-					.. "replacing one with the same name, so it can be published with right-click > Save to Roblox.",
-			},
-			name = { type = "string", description = "Sequence and file name. Defaults to a timestamp." },
-		},
-	},
-	tags = { title = "Render Animation" },
-	timeoutMs = 60000,
-}
-
--- Classic noob colours, because a grey dummy is one blob in a blockout render and this makes
--- head, torso, arms and legs tell apart at a glance. Keyed by what the name contains so R6's
--- "Right Arm" and R15's RightUpperArm land the same way.
-local YELLOW, BLUE, GREEN = Color3.fromRGB(245, 205, 48), Color3.fromRGB(13, 105, 172), Color3.fromRGB(75, 151, 75)
-local function classic(name: string): Color3?
-	if string.find(name, "Torso") then
-		return BLUE
-	end
-	if string.find(name, "Leg") or string.find(name, "Foot") then
-		return GREEN
-	end
-	if name == "Head" or string.find(name, "Arm") or string.find(name, "Hand") then
-		return YELLOW
-	end
-	return nil
-end
-
-local function dummy(rigType: string): (Model?, string?)
-	local name = DUMMY_PREFIX .. rigType
-	local existing = workspace:FindFirstChild(name)
-	if existing and existing:IsA("Model") then
-		return existing, nil
-	end
-	local kind = if rigType == "R6" then Enum.HumanoidRigType.R6 else Enum.HumanoidRigType.R15
-	local ok, model = pcall(function()
-		return Players:CreateHumanoidModelFromDescription(Instance.new("HumanoidDescription"), kind)
-	end)
-	if not ok then
-		return nil, `couldn't create a dummy ({model}); pass rig = a path to a rigged model instead`
-	end
-	model.Name = name
-	for _, child in model:GetChildren() do
-		local color = classic(child.Name)
-		if color and child:IsA("BasePart") then
-			child.Color = color
-		end
-	end
-	model:PivotTo(CFrame.new(0, 3, 0))
-	model.Parent = workspace
-	return model, nil
-end
-
-local function jointEnds(joint: Instance): (BasePart?, BasePart?)
-	if joint:IsA("JointInstance") then
-		return joint.Part0, joint.Part1
-	end
-	if joint:IsA("WeldConstraint") then
-		return joint.Part0, joint.Part1
-	end
-	return nil, nil
-end
-
--- Parts welded onto the rig (accessories, a tool handle, a backpack) and which rig part carries
--- them, followed through chains of welds. Their offset from that part is read off the model as it
--- sits now, so any joint type works and the pose it's in doesn't matter.
-type Rider = { part: BasePart, carrier: string, offset: CFrame }
-
-local function riders(rig: Rig.Rig, root: Instance): { Rider }
-	local carrierOf: { [BasePart]: string } = {}
-	local skeleton: { [Instance]: true } = {}
-	for name, node in rig.byName do
-		carrierOf[node.part] = name
-		if node.motor then
-			skeleton[node.motor] = true
-		end
-	end
-
-	local joints = {}
-	for _, descendant in root:GetDescendants() do
-		if not skeleton[descendant] and (descendant:IsA("JointInstance") or descendant:IsA("WeldConstraint")) then
-			table.insert(joints, descendant)
-		end
-	end
-
-	local found: { Rider } = {}
-	local grew = true
-	while grew do
-		grew = false
-		for _, joint in joints do
-			local a, b = jointEnds(joint)
-			if not a or not b then
-				continue
-			end
-			for _, pair in { { a, b }, { b, a } } do
-				local carrier, rider = pair[1], pair[2]
-				local carrierName = carrierOf[carrier]
-				if carrierName and not carrierOf[rider] then
-					carrierOf[rider] = carrierName
-					table.insert(found, {
-						part = rider,
-						carrier = carrierName,
-						offset = carrier.CFrame:Inverse() * rider.CFrame,
-					})
-					grew = true
-				end
-			end
-		end
-	end
-	return found
-end
-
--- A tool in the right hand, placed the way Humanoid equips it: the handle sits on the grip
--- attachment, offset by Tool.Grip. Other parts of the tool ride on the handle.
-local function held(rig: Rig.Rig, thing: Instance): ({ Rider }?, string?)
-	local handle = thing:FindFirstChild("Handle")
-	if not handle or not handle:IsA("BasePart") then
-		return nil, `{thing:GetFullName()} has no Handle part`
-	end
-	local gripName, attachment
-	for name, node in rig.byName do
-		local found = node.part:FindFirstChild("RightGripAttachment")
-		if found and found:IsA("Attachment") then
-			gripName, attachment = name, found
-			break
-		end
-	end
-	if not gripName or not attachment then
-		return nil, "the rig has no RightGripAttachment to hold anything with"
-	end
-	local grip = if thing:IsA("Tool") then thing.Grip else CFrame.identity
-	local handleOffset = attachment.CFrame * grip:Inverse()
-
-	local found: { Rider } = { { part = handle, carrier = gripName, offset = handleOffset } }
-	for _, descendant in thing:GetDescendants() do
-		if descendant:IsA("BasePart") and descendant ~= handle then
-			table.insert(found, {
-				part = descendant,
-				carrier = gripName,
-				offset = handleOffset * handle.CFrame:Inverse() * descendant.CFrame,
-			})
-		end
-	end
-	return found, nil
-end
-
--- World CFrame of every rig part with the joint transforms applied, the root placed at `base`.
--- Motor6D: Part1 = Part0 * C0 * Transform * C1^-1, so an identity Transform is the rest pose.
-local function pose(rig: Rig.Rig, at: number, tracks: Anim.Tracks, base: CFrame): { [string]: CFrame }
-	local world: { [string]: CFrame } = { [rig.root.part.Name] = base }
-	local function walk(node: Rig.Node)
-		for _, child in node.children do
-			local motor = child.motor :: Motor6D
-			local keys = tracks[child.part.Name]
-			local transform = if keys then Anim.Sample(keys, at, motor) else CFrame.identity
-			world[child.part.Name] = world[node.part.Name] * motor.C0 * transform * motor.C1:Inverse()
-			walk(child)
-		end
-	end
-	walk(rig.root)
-	return world
-end
-
-local function fetch(animationId: string): (KeyframeSequence?, string?)
-	local ok, clip = pcall(function()
-		return AnimationClipProvider:GetAnimationClipAsync(animationId)
-	end)
-	if not ok then
-		return nil, `couldn't load {animationId}: {clip}`
-	end
-	if not clip:IsA("KeyframeSequence") then
-		return nil, `{animationId} is a {clip.ClassName}, not a KeyframeSequence`
-	end
-	return clip, nil
-end
-
-local function fmt(value: number): string
-	return string.format("%.3g", value)
-end
-
--- Decompiled keys carry CFrames; written back as angles so they can be edited and sent straight in.
-local function keyText(key: Anim.Key): string
-	local cframe = key.cframe :: CFrame
-	local rx, ry, rz = cframe:ToEulerAnglesXYZ()
-	local value = `angles = [{fmt(math.deg(rx))}, {fmt(math.deg(ry))}, {fmt(math.deg(rz))}]`
-	if cframe.Position ~= Vector3.zero then
-		value ..= ` (+ position {fmt(cframe.X)}, {fmt(cframe.Y)}, {fmt(cframe.Z)})`
-	end
-	local easing = if key.easing then `, easing = "{key.easing}"` else ""
-	return `\{ time = {fmt(key.time)}, {value}{easing} }`
-end
-
--- Every transition Linear reads as robotic; say so once rather than let it ship unnoticed.
-local function easingNote(tracks: Anim.Tracks): string?
-	local transitions, eased = 0, 0
-	for _, keys in tracks do
-		for index = 1, #keys - 1 do
-			transitions += 1
-			local easing = keys[index].easing
-			if easing and not string.find(easing, "^Linear") then
-				eased += 1
-			end
-		end
-	end
-	if transitions >= 2 and eased == 0 then
-		return "every transition is Linear. Body motion usually wants CubicV2/InOut (or /Out to snap then settle); Bounce and Elastic for impacts; Constant for a hard cut."
-	end
-	return nil
-end
-
--- A joint's transform as the author thinks of it: offset and angles in character space
--- (+X right, +Y up, +Z back), which is Anim's conjugation undone. { x, y, z, pitch, yaw, roll }.
-local function characterSpace(motor: Motor6D, transform: CFrame): { number }
-	local basis = motor.C0.Rotation
-	local local_ = basis * transform * basis:Inverse()
-	local pitch, yaw, roll = local_:ToEulerAnglesXYZ()
-	return { local_.X, local_.Y, local_.Z, math.deg(pitch), math.deg(yaw), math.deg(roll) }
-end
-
-local CHANNELS = { "x", "y", "z", "pitch", "yaw", "roll" }
-
--- One line per joint with the range each channel covers over the frames drawn. This is what
--- catches a walk whose torso slides back and forth because its "bob" went into the wrong axis,
--- or a whole body tilted 5 degrees in every frame -- a filmstrip hides both. A channel that
--- moves but never touches zero is called out, since that is almost always an unintended lean.
-local function motionText(motion: { [string]: { { number } } }): string
-	local lines = {}
-	for joint, frames in motion do
-		local items = {}
-		for channel = 1, 6 do
-			local low, high = math.huge, -math.huge
-			for _, values in frames do
-				low, high = math.min(low, values[channel]), math.max(high, values[channel])
-			end
-			local threshold = if channel <= 3 then 0.02 else 0.5
-			if math.max(math.abs(low), math.abs(high)) < threshold then
-				continue
-			end
-			local unit = if channel <= 3 then "" else "°"
-			local item = if high - low < threshold
-				then `{CHANNELS[channel]} {fmt(high)}{unit} constant`
-				else `{CHANNELS[channel]} {fmt(low)}..{fmt(high)}{unit}`
-			if low > threshold or high < -threshold then
-				item ..= " (never at rest)"
-			end
-			table.insert(items, item)
-		end
-		table.insert(lines, `{joint}: {if #items > 0 then table.concat(items, ", ") else "at rest"}`)
-	end
-	table.sort(lines)
-	return table.concat(lines, "\n")
-end
-
--- Mirrors the renderer's camera basis: eye on the yaw/pitch sphere looking at the origin,
--- screen-right = forward x up. Used to say which panels read right-to-left, since one world
--- layout can't read left-to-right from every angle (left vs right, for one).
-local function screenRight(yawDegrees: number, pitchDegrees: number): Vector3
-	local yaw, pitch = math.rad(yawDegrees), math.rad(pitchDegrees)
-	local forward = -Vector3.new(math.cos(pitch) * math.sin(yaw), math.sin(pitch), math.cos(pitch) * math.cos(yaw))
-	local up = if math.abs(forward.Y) > 0.999 then Vector3.zAxis else Vector3.yAxis
-	return forward:Cross(up).Unit
-end
-
-local PRESETS: { [string]: { number } } = {
-	iso = { 45, 30 },
-	front = { 0, 0 },
-	back = { 180, 0 },
-	left = { 90, 0 },
-	right = { -90, 0 },
-	top = { 0, 89.9 },
-	bottom = { 0, -89.9 },
-	corner = { -135, 20 },
-}
--- The build renderer's iso and top look down the frame diagonal and would stack the frames;
--- these see it side-on and read left-to-right, so they stand in when a sheet asks for them.
-local ANIM_PRESETS: { [string]: { number } } = {
-	iso = { -45, 30 },
-	top = { -45, 85 },
-}
-
-local function resolveViews(views: { any }, step: Vector3): ({ any }, { string })
-	local resolved, mirrored = {}, {}
-	for _, view in views do
-		local name = if type(view) == "string" then string.lower(view) else nil
-		local angles = if name then ANIM_PRESETS[name] or PRESETS[name] else nil
-		if name and angles then
-			view = { name = view, yaw = angles[1], pitch = angles[2] }
-		end
-		if type(view) == "table" and type(view.yaw) == "number" and type(view.pitch) == "number" then
-			if screenRight(view.yaw, view.pitch):Dot(step) < 0 then
-				table.insert(mirrored, tostring(view.name or `{view.yaw}/{view.pitch}`))
-			end
-		end
-		table.insert(resolved, view)
-	end
-	return resolved, mirrored
-end
-
-local function timesOf(tracks: Anim.Tracks): { number }
-	local seen: { [number]: true } = {}
-	local times = {}
-	for _, keys in tracks do
-		for _, key in keys do
-			if not seen[key.time] then
-				seen[key.time] = true
-				table.insert(times, key.time)
-			end
-		end
-	end
-	table.sort(times)
-	return times
-end
-
-function Tool.Run(arguments: {
-	tracks: Anim.Tracks?,
-	animationId: string?,
-	rig: string?,
-	rigType: string?,
-	holding: string?,
-	times: { number }?,
-	views: { any }?,
-	size: number?,
-	loop: boolean?,
-	priority: string?,
-	save: string?,
-	name: string?,
-}): Result
-	local function fail(text: string): Result
-		return { content = { { type = "text", text = text } }, isError = true }
-	end
-
-	local model: Instance?, problem: string?
-	if arguments.rig then
-		model, problem = Path.Resolve(arguments.rig)
-	else
-		model, problem = dummy(arguments.rigType or "R15")
-	end
-	if not model then
-		return fail(problem :: string)
-	end
-	if not model:IsA("Model") then
-		return fail(`{model:GetFullName()} is a {model.ClassName}, not a Model`)
-	end
-
-	local rig
-	rig, problem = Rig.Build(model)
-	if not rig then
-		return fail(problem :: string)
-	end
-
-	local tracks = arguments.tracks
-	local decompiled = false
-	if arguments.animationId then
-		local clip
-		clip, problem = fetch(arguments.animationId)
-		if not clip then
-			return fail(problem :: string)
-		end
-		tracks = Anim.Decompile(clip)
-		decompiled = true
-	end
-	if type(tracks) ~= "table" or next(tracks) == nil then
-		return fail("give tracks or an animationId")
-	end
-	local resolved = tracks :: Anim.Tracks
-
-	local sequence, built
-	sequence, built, problem = Anim.Sequence(model, resolved, { loop = arguments.loop, priority = arguments.priority })
-	if not sequence or not built then
-		return fail(problem :: string)
-	end
-	local id
-	id, problem = Anim.Register(sequence)
-	if not id then
-		sequence:Destroy()
-		return fail(problem :: string)
-	end
-	local saved = ""
-	if arguments.save then
-		local folder
-		folder, problem = Path.Resolve(arguments.save)
-		if not folder then
-			sequence:Destroy()
-			return fail(problem :: string)
-		end
-		sequence.Name = arguments.name or model.Name
-		local old = folder:FindFirstChild(sequence.Name)
-		if old and old:IsA("KeyframeSequence") then
-			old:Destroy()
-		end
-		sequence.Parent = folder
-		saved =
-			`\nsaved as {sequence:GetFullName()} -- right-click it in Explorer > Save to Roblox to get a real asset id`
-	else
-		sequence:Destroy()
-	end
-
-	local extras = riders(rig, model)
-	if arguments.holding then
-		local thing
-		thing, problem = Path.Resolve(arguments.holding)
-		if not thing then
-			return fail(problem :: string)
-		end
-		local grip
-		grip, problem = held(rig, thing)
-		if not grip then
-			return fail(problem :: string)
-		end
-		for _, rider in grip do
-			table.insert(extras, rider)
-		end
-	end
-
-	local times: { number } = arguments.times or {}
-	if #times == 0 then
-		times = timesOf(resolved)
-	end
-	if #times > MAX_FRAMES then
-		return fail(`{#times} frames is too many to read; pass times to pick up to {MAX_FRAMES}`)
-	end
-
-	-- The renderer's "front" camera sits on +Z and a character faces -Z, so the rig is turned to
-	-- look at it; that also puts its right side towards the "right" camera. Frames step along the
-	-- diagonal that reads left-to-right in the front, right and (yaw -45) iso cameras, and wrap
-	-- into rows that drop in Y plus a slide away from the iso camera so the top view separates them.
-	local _, extents = model:GetBoundingBox()
-	local columns = math.ceil(math.sqrt(#times))
-	local step = Vector3.new(1, 0, 1).Unit * extents.X * 2
-	local drop = Vector3.new(0, -extents.Y * 1.3, 0) + Vector3.new(-1, 0, 1).Unit * extents.X * 2
-	local facing = CFrame.Angles(0, math.pi, 0)
-	local parts = {}
-	local motion: { [string]: { { number } } } = {}
-	for frame, at in times do
-		local column, row = (frame - 1) % columns, (frame - 1) // columns
-		local world = pose(rig, at, resolved, CFrame.new(step * column + drop * row) * facing)
-		for _, name in rig.order do
-			local part = rig.byName[name].part
-			if part.Transparency < 1 then
-				table.insert(parts, Build.Describe(part, #parts + 1, world[name]))
-			end
-		end
-		for _, rider in extras do
-			if rider.part.Transparency < 1 then
-				table.insert(parts, Build.Describe(rider.part, #parts + 1, world[rider.carrier] * rider.offset))
-			end
-		end
-		for _, joint in built.joints do
-			local channels = motion[joint] or {}
-			motion[joint] = channels
-			table.insert(channels, characterSpace(rig.byName[joint].motor :: Motor6D, Anim.Sample(resolved[joint], at, rig.byName[joint].motor)))
-		end
-	end
-
-	local labels = {}
-	for _, at in times do
-		table.insert(labels, `t={fmt(at)}`)
-	end
-	local text = `{model:GetFullName()}: {#times} frame(s) in reading order, {columns} per row: {table.concat(
-		labels,
-		"  "
-	)}\n` .. `id = {id}  length = {fmt(built.length)}  joints = {table.concat(built.joints, ", ")}{saved}`
-	text ..= "\nmotion (character space: +x right, +y up, +z back; pitch + tips the top back / swings a hanging limb forward):\n"
-		.. motionText(motion)
-	local views, mirrored = resolveViews(arguments.views or { "front", "right", "iso", "top" }, step)
-	if #mirrored > 0 then
-		text ..= `\nnote: {table.concat(mirrored, ", ")} read right-to-left`
-	end
-	local note = easingNote(resolved)
-	if note then
-		text ..= `\nnote: {note}`
-	end
-	if decompiled then
-		local lines = {}
-		for joint, keys in resolved do
-			local items = {}
-			for _, key in keys do
-				table.insert(items, keyText(key))
-			end
-			table.insert(lines, `{joint} = [{table.concat(items, ", ")}]`)
-		end
-		table.sort(lines)
-		text ..= "\ntracks:\n" .. table.concat(lines, "\n")
-	end
-
-	return {
-		content = { { type = "text", text = text } },
-		postProcess = {
-			kind = "scene",
-			name = arguments.name,
-			size = arguments.size or 2048,
-			views = (Build.ResolveViews(views)),
-			badges = false,
-			parts = parts,
-		},
-	}
-end
-
-return Tool
-]]></string>
-        </Properties>
-      </Item>
-      <Item class="ModuleScript" referent="52">
+      <Item class="ModuleScript" referent="45">
         <Properties>
           <string name="Name">RenderBuild</string>
           <string name="Source"><![CDATA[--!strict
@@ -10592,7 +8797,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="53">
+      <Item class="ModuleScript" referent="46">
         <Properties>
           <string name="Name">ReviewRemotes</string>
           <string name="Source"><![CDATA[--!strict
@@ -10651,7 +8856,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="54">
+      <Item class="ModuleScript" referent="47">
         <Properties>
           <string name="Name">RunLuau</string>
           <string name="Source"><![CDATA[--!strict
@@ -10745,8 +8950,8 @@ function Tool.Run(arguments: { code: string?, vm: string?, timeoutSeconds: numbe
 	else
 		local produced: any
 		ok, produced = Inject.Run(code, Env, timeout)
-		-- A snippet asks for work on the VMCP server -- writing a Canvas recording out as a PNG,
-		-- so far -- by returning a table with a postProcess field. It rides back untouched.
+		-- A snippet asks for work on the VMCP server -- writing a capture out as a file -- by
+		-- returning a table with a postProcess field. It rides back untouched.
 		directive = if ok and type(produced) == "table" then produced.postProcess else nil
 
 		if directive then
@@ -10784,7 +8989,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="55">
+      <Item class="ModuleScript" referent="48">
         <Properties>
           <string name="Name">RunTimeline</string>
           <string name="Source"><![CDATA[--!strict
@@ -11116,453 +9321,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="56">
-        <Properties>
-          <string name="Name">ScreenshotUi</string>
-          <string name="Source"><![CDATA[--!strict
-
--- Draws a GUI tree as a picture. Studio has no screenshot a plugin can take, so this walks the
--- GuiObjects in render order, reads every visual property through GetStyled (the only read that
--- sees StyleRules), and hands the flat list to the VMCP server, which rasterizes it.
---
--- What comes back is a layout check, not a render: boxes, strokes, gradients, corner radii and
--- rotation are exact; text is a bitmap font; EditableImage pixels are real, asset images are real
--- when this server uploaded them (~/.vmcp/images/assets.json) and a placeholder otherwise, and a
--- ViewportFrame is a box naming what's inside it.
-
-local Path = require(script.Parent.Parent.Path)
-
-local MAX_NODES = 4000
--- Pixels for an ImageLabel backed by an EditableImage are shipped when it's this small or less;
--- bigger ones (a wall of previews) get the placeholder so the payload stays sane.
-local MAX_IMAGE_SIDE = 128
-local DEFAULT_MAX_SIDE = 1024
-
-type Result = {
-	content: { { type: "text", text: string } },
-	isError: boolean?,
-	postProcess: { [string]: any }?,
-}
-
-type Rect = { x: number, y: number, w: number, h: number }
-
-local Tool = {}
-
-Tool.Definition = {
-	name = "screenshot_ui",
-	description = "Draws a ScreenGui (or any GuiObject) as a PNG so you can look at the layout "
-		.. "instead of reading AbsolutePosition numbers. Reads styled values, so StyleSheet rules "
-		.. "show. Boxes, strokes, gradients, corners and rotation are exact; text is a bitmap "
-		.. "font (check overflow with TextFits, not by eye); EditableImage icons and assets that "
-		.. "upload_image published are real pixels, other asset images a tinted placeholder, "
-		.. "ViewportFrames a box naming their contents. "
-		.. "context plugin draws StarterGui as Studio lays it out; context client draws the "
-		.. "player's live PlayerGui.",
-	inputSchema = {
-		type = "object",
-		properties = {
-			root = {
-				type = "string",
-				description = "Dotted path to a ScreenGui, GuiObject, or a container of ScreenGuis. "
-					.. "Defaults to StarterGui in the edit session and the local PlayerGui in a client.",
-			},
-			context = {
-				type = "string",
-				description = "Which DataModel. Defaults to plugin.",
-				enum = { "plugin", "server", "client" },
-			},
-			player = {
-				type = "integer",
-				description = "Which test client, 1-based. Only meaningful with context client.",
-				minimum = 1,
-				maximum = 8,
-			},
-			scale = {
-				type = "number",
-				description = "Output pixels per screen pixel, 0.1 to 1. Defaults to whatever fits the longer side into 1024.",
-				minimum = 0.1,
-				maximum = 1,
-			},
-			name = {
-				type = "string",
-				description = "File name, letters digits underscore hyphen. Defaults to a timestamp.",
-			},
-		},
-	},
-	tags = { title = "Screenshot UI", readOnly = true },
-	timeoutMs = 60000,
-}
-
-local function styled(instance: Instance, name: string): any
-	local ok, value = pcall(function()
-		return (instance :: any):GetStyled(name)
-	end)
-	if ok then
-		return value
-	end
-	return (instance :: any)[name]
-end
-
-local function rgb(color: Color3): { number }
-	return { color.R, color.G, color.B }
-end
-
-local function intersect(a: Rect?, b: Rect): Rect
-	if not a then
-		return b
-	end
-	local x1, y1 = math.max(a.x, b.x), math.max(a.y, b.y)
-	local x2, y2 = math.min(a.x + a.w, b.x + b.w), math.min(a.y + a.h, b.y + b.h)
-	return { x = x1, y = y1, w = math.max(x2 - x1, 0), h = math.max(y2 - y1, 0) }
-end
-
-local ALIGN_X = { [Enum.TextXAlignment.Left] = 0, [Enum.TextXAlignment.Center] = 0.5, [Enum.TextXAlignment.Right] = 1 }
-local ALIGN_Y = { [Enum.TextYAlignment.Top] = 0, [Enum.TextYAlignment.Center] = 0.5, [Enum.TextYAlignment.Bottom] = 1 }
-
-local base64: (buffer) -> string
-do
-	local ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	local ENCODE = table.create(64)
-	for i = 1, 64 do
-		ENCODE[i - 1] = string.byte(ALPHABET, i)
-	end
-	base64 = function(bytes: buffer): string
-		local length = buffer.len(bytes)
-		local out = buffer.create(math.ceil(length / 3) * 4)
-		local o = 0
-		local full = length - length % 3
-		for i = 0, full - 1, 3 do
-			local n = buffer.readu8(bytes, i) * 65536 + buffer.readu8(bytes, i + 1) * 256 + buffer.readu8(bytes, i + 2)
-			buffer.writeu8(out, o, ENCODE[n // 262144])
-			buffer.writeu8(out, o + 1, ENCODE[n // 4096 % 64])
-			buffer.writeu8(out, o + 2, ENCODE[n // 64 % 64])
-			buffer.writeu8(out, o + 3, ENCODE[n % 64])
-			o += 4
-		end
-		local rest = length - full
-		if rest == 1 then
-			local a = buffer.readu8(bytes, full)
-			buffer.writeu8(out, o, ENCODE[a // 4])
-			buffer.writeu8(out, o + 1, ENCODE[a % 4 * 16])
-			buffer.writeu8(out, o + 2, 61)
-			buffer.writeu8(out, o + 3, 61)
-		elseif rest == 2 then
-			local a, b = buffer.readu8(bytes, full), buffer.readu8(bytes, full + 1)
-			buffer.writeu8(out, o, ENCODE[a // 4])
-			buffer.writeu8(out, o + 1, ENCODE[a % 4 * 16 + b // 16])
-			buffer.writeu8(out, o + 2, ENCODE[b % 16 * 4])
-			buffer.writeu8(out, o + 3, 61)
-		end
-		return buffer.tostring(out)
-	end
-end
-
--- One EditableImage's pixels are read once however many labels show it.
-local pixelCache: { [EditableImage]: { px: string, pw: number, ph: number }? } = {}
-
-local function imagePixels(image: EditableImage): { px: string, pw: number, ph: number }?
-	local cached = pixelCache[image]
-	if cached ~= nil then
-		return cached
-	end
-	local size = image.Size
-	local result = nil
-	if size.X <= MAX_IMAGE_SIDE and size.Y <= MAX_IMAGE_SIDE then
-		local ok, bytes = pcall(function()
-			return image:ReadPixelsBuffer(Vector2.zero, size)
-		end)
-		if ok then
-			result = { px = base64(bytes), pw = size.X, ph = size.Y }
-		end
-	end
-	pixelCache[image] = result
-	return result
-end
-
-type Walk = { nodes: { any }, origin: Vector2, count: number, skipped: number, global: boolean }
-
-local function describe(state: Walk, gui: GuiObject, clip: Rect?)
-	local pos = gui.AbsolutePosition - state.origin
-	local size = gui.AbsoluteSize
-	local node: { [string]: any } = {
-		k = "rect",
-		x = pos.X,
-		y = pos.Y,
-		w = size.X,
-		h = size.Y,
-		rot = gui.AbsoluteRotation,
-		bg = rgb(styled(gui, "BackgroundColor3")),
-		a = 1 - styled(gui, "BackgroundTransparency"),
-		clip = clip,
-		z = styled(gui, "ZIndex"),
-	}
-
-	for _, child in gui:GetChildren() do
-		if
-			child:IsA("UIStroke")
-			and styled(child, "Enabled")
-			and styled(child, "ApplyStrokeMode") == Enum.ApplyStrokeMode.Border
-		then
-			node.stroke = {
-				color = rgb(styled(child, "Color")),
-				a = 1 - styled(child, "Transparency"),
-				t = styled(child, "Thickness"),
-			}
-		elseif child:IsA("UICorner") then
-			local radius: UDim = styled(child, "CornerRadius")
-			node.corner = radius.Offset + radius.Scale * math.min(size.X, size.Y)
-		elseif child:IsA("UIGradient") and styled(child, "Enabled") then
-			local colors, alphas = {}, {}
-			for _, key in (styled(child, "Color") :: ColorSequence).Keypoints do
-				table.insert(colors, { key.Time, key.Value.R, key.Value.G, key.Value.B })
-			end
-			for _, key in (styled(child, "Transparency") :: NumberSequence).Keypoints do
-				table.insert(alphas, { key.Time, key.Value })
-			end
-			node.grad = { rot = styled(child, "Rotation"), colors = colors, alphas = alphas }
-		end
-	end
-
-	if gui:IsA("TextLabel") or gui:IsA("TextButton") or gui:IsA("TextBox") then
-		node.k = "text"
-		local text: string = styled(gui, "Text")
-		if gui:IsA("TextBox") and text == "" then
-			text = styled(gui, "PlaceholderText")
-		end
-		local textSize: number = if styled(gui, "TextScaled")
-			then math.min(gui.TextBounds.Y, size.Y)
-			else styled(gui, "TextSize")
-		node.text = {
-			s = text,
-			size = textSize,
-			color = rgb(styled(gui, "TextColor3")),
-			a = 1 - styled(gui, "TextTransparency"),
-			ax = ALIGN_X[styled(gui, "TextXAlignment")] or 0.5,
-			ay = ALIGN_Y[styled(gui, "TextYAlignment")] or 0.5,
-			wrap = styled(gui, "TextWrapped") == true,
-		}
-	elseif gui:IsA("ImageLabel") or gui:IsA("ImageButton") then
-		node.k = "image"
-		local image: { [string]: any } = {
-			color = rgb(styled(gui, "ImageColor3")),
-			a = 1 - styled(gui, "ImageTransparency"),
-		}
-		local content: Content = styled(gui, "ImageContent")
-		local object = if content.SourceType == Enum.ContentSourceType.Object then content.Object else nil
-		if object and object:IsA("EditableImage") then
-			local pixels = imagePixels(object)
-			if pixels then
-				image.px, image.pw, image.ph = pixels.px, pixels.pw, pixels.ph
-			end
-		else
-			local uri: string = if content.SourceType == Enum.ContentSourceType.Uri
-				then content.Uri
-				else styled(gui, "Image")
-			local id = string.match(uri, "^rbxassetid://(%d+)$") or string.match(uri, "[?&]id=(%d+)")
-			if id then
-				-- The server draws real pixels when it uploaded this id itself (assets.json).
-				image.asset = tonumber(id)
-			elseif uri == "" then
-				image.a = 0
-			end
-		end
-		local scaleType = styled(gui, "ScaleType")
-		if scaleType == Enum.ScaleType.Fit then
-			image.fit = true
-		end
-		if scaleType == Enum.ScaleType.Tile then
-			local tile: UDim2 = styled(gui, "TileSize")
-			image.tile = { w = tile.X.Offset + tile.X.Scale * size.X, h = tile.Y.Offset + tile.Y.Scale * size.Y }
-		end
-		node.image = image
-	elseif gui:IsA("ViewportFrame") then
-		node.k = "viewport"
-		local parts = 0
-		for _, d in gui:GetDescendants() do
-			if d:IsA("BasePart") then
-				parts += 1
-			end
-		end
-		node.label = if parts > 0 then `VIEWPORT: {parts} PARTS` else "VIEWPORT: EMPTY"
-	end
-
-	return node
-end
-
-local function walk(state: Walk, gui: GuiObject, clip: Rect?, order: { any })
-	if state.count >= MAX_NODES then
-		state.skipped += 1
-		return
-	end
-	if not styled(gui, "Visible") then
-		return
-	end
-	state.count += 1
-	local node = describe(state, gui, clip)
-	table.insert(order, node)
-
-	local childClip = clip
-	if styled(gui, "ClipsDescendants") then
-		childClip = intersect(clip, { x = node.x, y = node.y, w = node.w, h = node.h })
-	end
-
-	local children = {}
-	for index, child in gui:GetChildren() do
-		if child:IsA("GuiObject") then
-			table.insert(children, { child = child, z = styled(child, "ZIndex"), index = index })
-		end
-	end
-	if not state.global then
-		table.sort(children, function(a, b)
-			if a.z ~= b.z then
-				return a.z < b.z
-			end
-			return a.index < b.index
-		end)
-	end
-	for _, entry in children do
-		walk(state, entry.child, childClip, order)
-	end
-end
-
--- ScreenGuis in a container draw by DisplayOrder, then by the order they were added.
-local function screenGuisUnder(container: Instance): { ScreenGui }
-	local guis = {}
-	for _, child in container:GetChildren() do
-		if child:IsA("ScreenGui") and child.Enabled then
-			table.insert(guis, child)
-		end
-	end
-	table.sort(guis, function(a, b)
-		return a.DisplayOrder < b.DisplayOrder
-	end)
-	return guis
-end
-
-function Tool.Run(arguments: { root: string?, scale: number?, name: string? }): Result
-	local root: Instance
-	if type(arguments.root) == "string" and arguments.root ~= "" then
-		local found, problem = Path.Resolve(arguments.root)
-		if not found then
-			return { content = { { type = "text", text = problem :: string } }, isError = true }
-		end
-		root = found
-	else
-		local player = game:GetService("Players").LocalPlayer
-		local playerGui = if player then player:FindFirstChild("PlayerGui") else nil
-		root = playerGui or game:GetService("StarterGui")
-	end
-
-	-- Every list of GuiObjects to draw, each with the ScreenGui whose ZIndexBehavior governs it.
-	local layers: { { guis: { GuiObject }, global: boolean } } = {}
-	local reference: GuiBase2d? = nil
-	if root:IsA("GuiObject") then
-		local screen = root:FindFirstAncestorWhichIsA("ScreenGui")
-		local global = screen ~= nil and screen.ZIndexBehavior == Enum.ZIndexBehavior.Global
-		table.insert(layers, { guis = { root }, global = global })
-		reference = root
-	elseif root:IsA("ScreenGui") then
-		local guis = {}
-		for _, child in root:GetChildren() do
-			if child:IsA("GuiObject") then
-				table.insert(guis, child)
-			end
-		end
-		table.insert(layers, { guis = guis, global = root.ZIndexBehavior == Enum.ZIndexBehavior.Global })
-		reference = root
-	else
-		for _, screen in screenGuisUnder(root) do
-			local guis = {}
-			for _, child in screen:GetChildren() do
-				if child:IsA("GuiObject") then
-					table.insert(guis, child)
-				end
-			end
-			table.insert(layers, { guis = guis, global = screen.ZIndexBehavior == Enum.ZIndexBehavior.Global })
-			reference = reference or screen
-		end
-	end
-	if not reference then
-		return {
-			content = { { type = "text", text = `{root:GetFullName()} has no ScreenGui or GuiObject to draw` } },
-			isError = true,
-		}
-	end
-
-	local origin = reference.AbsolutePosition
-	local size = reference.AbsoluteSize
-	if size.X < 1 or size.Y < 1 then
-		return {
-			content = { { type = "text", text = `{reference:GetFullName()} has no size yet -- nothing is laid out` } },
-			isError = true,
-		}
-	end
-
-	table.clear(pixelCache)
-	local state: Walk = { nodes = {}, origin = origin, count = 0, skipped = 0, global = false }
-	for _, layer in layers do
-		state.global = layer.global
-		local order = {}
-		local children = {}
-		for index, gui in layer.guis do
-			table.insert(children, { child = gui, z = styled(gui, "ZIndex"), index = index })
-		end
-		table.sort(children, function(a, b)
-			if a.z ~= b.z then
-				return a.z < b.z
-			end
-			return a.index < b.index
-		end)
-		for _, entry in children do
-			walk(state, entry.child, nil, order)
-		end
-		if layer.global then
-			-- Global: every descendant sorts by ZIndex alone, ties keep tree order.
-			for index, node in order do
-				node.i = index
-			end
-			table.sort(order, function(a, b)
-				if a.z ~= b.z then
-					return a.z < b.z
-				end
-				return a.i < b.i
-			end)
-		end
-		for _, node in order do
-			node.z, node.i = nil, nil
-			table.insert(state.nodes, node)
-		end
-	end
-	table.clear(pixelCache)
-
-	local scale = arguments.scale or math.min(1, DEFAULT_MAX_SIDE / math.max(size.X, size.Y))
-	local note = if state.skipped > 0 then `, stopped after {MAX_NODES} elements` else ""
-	return {
-		content = {
-			{
-				type = "text",
-				text = `{state.count} element(s) under {root:GetFullName()}, {size.X}x{size.Y} at {string.format(
-					"%.2f",
-					scale
-				)}x{note}`,
-			},
-		},
-		postProcess = {
-			kind = "ui",
-			name = arguments.name,
-			width = size.X,
-			height = size.Y,
-			scale = scale,
-			nodes = state.nodes,
-		},
-	}
-end
-
-return Tool
-]]></string>
-        </Properties>
-      </Item>
-      <Item class="ModuleScript" referent="57">
+      <Item class="ModuleScript" referent="49">
         <Properties>
           <string name="Name">SearchScripts</string>
           <string name="Source"><![CDATA[--!strict
@@ -11793,7 +9552,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="58">
+      <Item class="ModuleScript" referent="50">
         <Properties>
           <string name="Name">TimelinePart</string>
           <string name="Source"><![CDATA[--!strict
@@ -11897,7 +9656,7 @@ return Tool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="59">
+      <Item class="ModuleScript" referent="51">
         <Properties>
           <string name="Name">TryScripts</string>
           <string name="Source"><![CDATA[--!strict
@@ -12003,169 +9762,6 @@ function Tool.Run(arguments: { scripts: { { script: string, source: string } }?,
 		table.insert(lines, "(a playtest was already running and was restarted)")
 	end
 	return text(table.concat(lines, "\n"))
-end
-
-return Tool
-]]></string>
-        </Properties>
-      </Item>
-      <Item class="ModuleScript" referent="60">
-        <Properties>
-          <string name="Name">UploadImage</string>
-          <string name="Source"><![CDATA[--!strict
-
--- Publishes a picture as a Roblox Image asset, so a script can use rbxassetid://id at runtime
--- instead of an EditableImage that only exists in this session. The upload itself happens on
--- the VMCP server over Open Cloud, because Studio's own CreateAssetAsync isn't enabled
--- everywhere yet; the plugin's job is to say what to upload and who should own it.
-
-local Path = require(script.Parent.Parent.Path)
-local Canvas = require(script.Parent.Parent.Lib.Canvas)
-
-type Result = {
-	content: { { type: "text", text: string } },
-	isError: boolean?,
-	postProcess: { [string]: any }?,
-}
-
-local Tool = {}
-
-Tool.Definition = {
-	name = "upload_image",
-	description = "Uploads an image as a Roblox Image asset and returns its rbxassetid, so the "
-		.. "picture can be used at runtime without EditableImage. Give it either `file`, the "
-		.. "name of a PNG vmcp.Render already wrote under ~/.vmcp/images, or `root`, a dotted "
-		.. "path to an ImageLabel/ImageButton showing an EditableImage (or the EditableImage "
-		.. "itself). `owner` is the Studio user by default; pass a group id to upload there. "
-		.. "First-time setup: pass `apiKey` once (an Open Cloud key with the assets read/write "
-		.. "scope for that user or group) and it's remembered in ~/.vmcp/roblox-api-key. "
-		.. "Moderation runs after upload, so the id is usable at once and the picture appears a "
-		.. "little later. Images must be 4096px on the long side (Roblox downsamples; small "
-		.. "uploads look blurry) unless allowSmall is set. Every id is remembered in "
-		.. "~/.vmcp/images/assets.json so screenshot_ui can draw the real picture.",
-	inputSchema = {
-		type = "object",
-		properties = {
-			file = {
-				type = "string",
-				description = "Name of a PNG under ~/.vmcp/images, without the extension -- what you gave vmcp.Render.",
-			},
-			root = {
-				type = "string",
-				description = "Dotted path to an ImageLabel, ImageButton or EditableImage in the place.",
-			},
-			name = {
-				type = "string",
-				description = "Asset display name. Defaults to the file or instance name.",
-			},
-			description = { type = "string", description = "Asset description." },
-			owner = {
-				type = "string",
-				description = '"user" (default: whoever is logged into Studio) or a group id like "12345678".',
-			},
-			apiKey = {
-				type = "string",
-				description = "Open Cloud API key to remember for every later upload. Only needed once.",
-			},
-			allowSmall = {
-				type = "boolean",
-				description = "Upload even when the long side is under 4096px. Assets are meant to be exported at 4K and downsampled by Roblox, so this is refused by default.",
-			},
-		},
-	},
-	tags = { title = "Upload Image", external = true },
-	timeoutMs = 90000,
-}
-
-local function studioUserId(): number?
-	local ok, id = pcall(function()
-		return game:GetService("StudioService"):GetUserId()
-	end)
-	return if ok then id else nil
-end
-
-local function fail(text: string): Result
-	return { content = { { type = "text", text = text } }, isError = true }
-end
-
-function Tool.Run(arguments: {
-	file: string?,
-	root: string?,
-	name: string?,
-	description: string?,
-	owner: string?,
-	apiKey: string?,
-	allowSmall: boolean?,
-}): Result
-	local directive: { [string]: any } = {
-		kind = "upload",
-		apiKey = arguments.apiKey,
-		description = arguments.description,
-		allowSmall = arguments.allowSmall == true,
-	}
-
-	local owner = arguments.owner
-	if owner == nil or owner == "" or owner == "user" then
-		local userId = studioUserId()
-		if not userId then
-			return fail("couldn't read the Studio user; pass owner as a group id instead")
-		end
-		directive.userId = userId
-	else
-		local groupId = tonumber(owner)
-		if not groupId then
-			return fail(`owner must be "user" or a group id, not "{owner}"`)
-		end
-		directive.groupId = groupId
-	end
-
-	if type(arguments.file) == "string" and arguments.file ~= "" then
-		directive.file = arguments.file
-		directive.name = arguments.name or arguments.file
-	elseif type(arguments.root) == "string" and arguments.root ~= "" then
-		local found, problem = Path.Resolve(arguments.root)
-		if not found then
-			return fail(problem :: string)
-		end
-		local image: EditableImage? = nil
-		if found:IsA("EditableImage") then
-			image = found
-		elseif found:IsA("ImageLabel") or found:IsA("ImageButton") then
-			local content = (found :: any):GetStyled("ImageContent") :: Content
-			local object = if content.SourceType == Enum.ContentSourceType.Object then content.Object else nil
-			if object and object:IsA("EditableImage") then
-				image = object
-			end
-		end
-		if not image then
-			return fail(`{found:GetFullName()} isn't an EditableImage or an image label showing one`)
-		end
-		local pixels = Canvas.Base64Pixels(image)
-		if not pixels then
-			return fail(
-				`{found:GetFullName()} is too big to send ({image.Size.X}x{image.Size.Y}); render it with vmcp.Render first and upload the file`
-			)
-		end
-		directive.width = image.Size.X
-		directive.height = image.Size.Y
-		directive.pixels = pixels
-		directive.name = arguments.name or found.Name
-	elseif arguments.apiKey then
-		-- Just storing the key is a fine call on its own.
-		directive.name = nil
-	else
-		return fail("give `file` (a PNG vmcp.Render wrote) or `root` (an image in the place)")
-	end
-
-	local what = if directive.file
-		then `~/.vmcp/images/{directive.file}.png`
-		elseif directive.pixels then arguments.root
-		else "nothing"
-	local who = if directive.groupId then `group {directive.groupId}` else `user {directive.userId}`
-	return {
-		content = { { type = "text", text = `uploading {what} as "{directive.name or "-"}" owned by {who}` } },
-		postProcess = directive,
-	}
 end
 
 return Tool
