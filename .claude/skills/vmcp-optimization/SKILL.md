@@ -280,7 +280,7 @@ What happens, in order: sections and auto-instrumentation are written into the s
 Studio; a playtest is started (or restarted); Studio's Source is put back the moment the test is
 up; the load runs in the live context with every call wrapped in `debug.profilebegin(label)` and
 `debug.setmemorycategory(label)`; LibMP snapshots the last `frameLimit` frames; the snapshot is
-read and written to `~/.vmcp/profiles/<name>-<label>.gprx`.
+read and written to `~/.vmcp-lite/profiles/<name>-<label>.gprx`.
 
 ### Building fake data
 
@@ -524,7 +524,7 @@ LibMP cheat sheet, the parts you'll use:
   don't hold them.
 - Automatic script scopes are `$Script`; only `debug.profilebegin` labels carry your names.
 
-Offline: the `.gprx` in `~/.vmcp/profiles/` opens in Lute (github.com/luau-lang/lute) with
+Offline: the `.gprx` in `~/.vmcp-lite/profiles/` opens in Lute (github.com/luau-lang/lute) with
 `require("./LibMP").Session.OpenFromFile(path)` and the same API. Use it when the capture is
 bigger than you want to hold in Studio, or to diff two captures side by side.
 

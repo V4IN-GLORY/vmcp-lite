@@ -16,7 +16,7 @@ local Tool = {}
 Tool.Definition = {
 	name = "optimization_ledger",
 	description = "Per-place record of the optimization pass, stored by the VMCP server under "
-		.. "~/.vmcp/optimization/<place>.json. read lists every script touched so far with its status "
+		.. "~/.vmcp-lite/optimization/<place>.json. read lists every script touched so far with its status "
 		.. "and numbers; write merges fields into one script's entry (status: profiled | proposed | "
 		.. "tried | applied | rejected | skipped, plus whatever else is worth keeping -- worst frame "
 		.. "before/after, the fix in one line, why it was rejected); clear removes an entry. Read it "

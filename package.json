@@ -6,7 +6,7 @@
     "vmcp": "server/dist/index.js"
   },
   "scripts": {
-    "prepare": "tsc -p server && rojo build plugin.project.json -o VMCP.rbxmx"
+    "prepare": "tsc -p server && rojo build plugin.project.json -o VMCP-Lite.rbxmx"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",

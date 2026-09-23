@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { log } from "./config.js";
 
-const ASSET = "VMCP.rbxmx";
+const ASSET = "VMCP-Lite.rbxmx";
 
 export interface PluginUpdate {
 	sha256: string;

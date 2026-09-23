@@ -15,7 +15,7 @@ local RunService = game:GetService("RunService")
 local Bridge = require(script.Bridge)
 local LogBuffer = require(script.Log.Buffer)
 
-local DEFAULT_PORT = "8791"
+local DEFAULT_PORT = "8792"
 
 -- Started before anything else can log: get_logs is only useful if it was already recording when
 -- the interesting error happened.
@@ -53,14 +53,14 @@ end
 
 local Panel = require(script.Panel)
 
-local toolbar = plugin:CreateToolbar("VMCP")
-local button = toolbar:CreateButton("Panel", "Open the VMCP bridge panel", "rbxassetid://5325741572")
+local toolbar = plugin:CreateToolbar("VMCP Lite")
+local button = toolbar:CreateButton("Panel", "Open the VMCP Lite bridge panel", "rbxassetid://5325741572")
 
 local widget = plugin:CreateDockWidgetPluginGuiAsync(
-	"MCP_Panel",
+	"VMCP_Lite_Panel",
 	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 400, 400, 200, 200)
 )
-widget.Title = "VMCP"
+widget.Title = "VMCP Lite"
 
 local port = plugin:GetSetting("port") or DEFAULT_PORT
 local token = plugin:GetSetting("token")
@@ -5876,7 +5876,7 @@ function Panel.Mount(parent: Instance): Frame
 
 	new("TextLabel", {
 		Name = "Wordmark",
-		Text = "VMCP",
+		Text = "VMCP Lite",
 		AnchorPoint = Vector2.new(0, 0.5),
 		Position = UDim2.new(0, 0, 0.5, 0),
 		AutomaticSize = Enum.AutomaticSize.XY,
@@ -5928,7 +5928,7 @@ function Panel.Mount(parent: Instance): Frame
 	Panel.PortInput = new("TextBox", {
 		Name = "PortInput",
 		Text = "",
-		PlaceholderText = "8791",
+		PlaceholderText = "8792",
 		Size = UDim2.new(0, 0, 1, 0),
 		TextXAlignment = Enum.TextXAlignment.Left,
 	}, portField)
@@ -8005,7 +8005,7 @@ local Tool = {}
 Tool.Definition = {
 	name = "optimization_ledger",
 	description = "Per-place record of the optimization pass, stored by the VMCP server under "
-		.. "~/.vmcp/optimization/<place>.json. read lists every script touched so far with its status "
+		.. "~/.vmcp-lite/optimization/<place>.json. read lists every script touched so far with its status "
 		.. "and numbers; write merges fields into one script's entry (status: profiled | proposed | "
 		.. "tried | applied | rejected | skipped, plus whatever else is worth keeping -- worst frame "
 		.. "before/after, the fix in one line, why it was rejected); clear removes an entry. Read it "
@@ -8536,7 +8536,7 @@ Tool.Definition = {
 			},
 			dump = {
 				type = "boolean",
-				description = "Write each capture to ~/.vmcp/profiles/<name>-<label>.gprx. Defaults to true.",
+				description = "Write each capture to ~/.vmcp-lite/profiles/<name>-<label>.gprx. Defaults to true.",
 			},
 			name = {
 				type = "string",

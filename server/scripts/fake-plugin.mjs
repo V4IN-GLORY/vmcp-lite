@@ -13,8 +13,8 @@ const placeId = process.argv[2] ?? "1234567890";
 const placeName = process.argv[3] ?? "VMCP Test Place";
 // One per Studio window. The same place open twice is two sessions.
 const sessionId = process.argv[4] ?? randomUUID();
-const port = process.env.VMCP_PORT ?? 8791;
-const token = readFileSync(join(process.env.VMCP_HOME ?? join(homedir(), ".vmcp"), "token"), "utf8").trim();
+const port = process.env.VMCP_PORT ?? 8792;
+const token = readFileSync(join(process.env.VMCP_HOME ?? join(homedir(), ".vmcp-lite"), "token"), "utf8").trim();
 
 const tools = [
 	{

@@ -1,11 +1,11 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const DEFAULT_PORT = 8791;
+export const DEFAULT_PORT = 8792;
 export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 export const DEFAULT_MAX_MESSAGE_MB = 8;
 
-const stateDir = process.env.VMCP_HOME ?? join(homedir(), ".vmcp");
+const stateDir = process.env.VMCP_HOME ?? join(homedir(), ".vmcp-lite");
 
 export const config = {
 	host: "127.0.0.1",

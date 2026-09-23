@@ -178,7 +178,7 @@ Tool.Definition = {
 			},
 			dump = {
 				type = "boolean",
-				description = "Write each capture to ~/.vmcp/profiles/<name>-<label>.gprx. Defaults to true.",
+				description = "Write each capture to ~/.vmcp-lite/profiles/<name>-<label>.gprx. Defaults to true.",
 			},
 			name = {
 				type = "string",

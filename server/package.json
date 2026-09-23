@@ -13,7 +13,7 @@
     "token": "node scripts/print-token.mjs",
     "probe": "node scripts/probe.mjs",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
-    "build:plugin": "rojo build ../plugin.project.json -o ../VMCP.rbxmx"
+    "build:plugin": "rojo build ../plugin.project.json -o ../VMCP-Lite.rbxmx"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",

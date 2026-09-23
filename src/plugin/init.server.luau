@@ -10,7 +10,7 @@ local RunService = game:GetService("RunService")
 local Bridge = require(script.Bridge)
 local LogBuffer = require(script.Log.Buffer)
 
-local DEFAULT_PORT = "8791"
+local DEFAULT_PORT = "8792"
 
 -- Started before anything else can log: get_logs is only useful if it was already recording when
 -- the interesting error happened.
@@ -48,14 +48,14 @@ end
 
 local Panel = require(script.Panel)
 
-local toolbar = plugin:CreateToolbar("VMCP")
-local button = toolbar:CreateButton("Panel", "Open the VMCP bridge panel", "rbxassetid://5325741572")
+local toolbar = plugin:CreateToolbar("VMCP Lite")
+local button = toolbar:CreateButton("Panel", "Open the VMCP Lite bridge panel", "rbxassetid://5325741572")
 
 local widget = plugin:CreateDockWidgetPluginGuiAsync(
-	"MCP_Panel",
+	"VMCP_Lite_Panel",
 	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 400, 400, 200, 200)
 )
-widget.Title = "VMCP"
+widget.Title = "VMCP Lite"
 
 local port = plugin:GetSetting("port") or DEFAULT_PORT
 local token = plugin:GetSetting("token")

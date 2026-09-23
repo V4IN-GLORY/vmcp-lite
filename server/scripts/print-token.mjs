@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const path = join(process.env.VMCP_HOME ?? join(homedir(), ".vmcp"), "token");
+const path = join(process.env.VMCP_HOME ?? join(homedir(), ".vmcp-lite"), "token");
 
 try {
 	console.log(readFileSync(path, "utf8").trim());

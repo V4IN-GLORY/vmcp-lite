@@ -254,7 +254,7 @@ function Panel.Mount(parent: Instance): Frame
 
 	new("TextLabel", {
 		Name = "Wordmark",
-		Text = "VMCP",
+		Text = "VMCP Lite",
 		AnchorPoint = Vector2.new(0, 0.5),
 		Position = UDim2.new(0, 0, 0.5, 0),
 		AutomaticSize = Enum.AutomaticSize.XY,
@@ -306,7 +306,7 @@ function Panel.Mount(parent: Instance): Frame
 	Panel.PortInput = new("TextBox", {
 		Name = "PortInput",
 		Text = "",
-		PlaceholderText = "8791",
+		PlaceholderText = "8792",
 		Size = UDim2.new(0, 0, 1, 0),
 		TextXAlignment = Enum.TextXAlignment.Left,
 	}, portField)

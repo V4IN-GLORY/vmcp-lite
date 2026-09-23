@@ -9,8 +9,8 @@ commit would have run on every machine using VMCP, with nobody looking. Now:
 
 ```
 git clone https://github.com/V4IN-GLORY/vmcp-lite
-cd vmcp-lite && npm install          # builds server/dist and VMCP.rbxmx
-claude mcp add vmcp -- node "<path to repo>/server/dist/index.js"
+cd vmcp-lite && npm install          # builds server/dist and VMCP-Lite.rbxmx
+claude mcp add vmcp-lite -- node "<path to repo>/server/dist/index.js"
 ```
 
 Then build the plugin into Studio's folder once (see the README) and restart Studio.
@@ -31,7 +31,7 @@ The state is `updates/state { server, plugin, running, head, git }` (pushed) and
   if upstream moved since, and otherwise does `git merge --ff-only <commit>` and `npm ci` (which
   rebuilds the server and the plugin). A checkout with local changes can't fast-forward; the
   error shows in the panel and nothing changes.
-- **plugin** — `{ sha256, destination, fresh, bytes }` when the `VMCP.rbxmx` bundled next to the
+- **plugin** — `{ sha256, destination, fresh, bytes }` when the `VMCP-Lite.rbxmx` bundled next to the
   server differs from the installed one. Clicking Update sends `plugin/update-apply { sha256 }`;
   the server re-reads the bundled file, refuses if the sha no longer matches, and otherwise
   writes it (temp file + rename). Studio hot-reloads a changed local plugin.

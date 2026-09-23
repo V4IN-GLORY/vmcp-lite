@@ -9,7 +9,7 @@ Everything the Studio plugin needs to do. You shouldn't have to open the TypeScr
                                   (node, on your PC)                   (your Luau)
 ```
 
-The server listens on `ws://127.0.0.1:8791`. Your plugin dials in — the server never
+The server listens on `ws://127.0.0.1:8792`. Your plugin dials in — the server never
 reaches out, so it doesn't care whether Studio is open.
 
 **Your plugin owns the tools.** You write them in Luau with their own names, descriptions
@@ -23,7 +23,7 @@ shaped: `{jsonrpc, id, method, params}` going out, `{jsonrpc, id, result}` or
 ## What the plugin has to do
 
 1. Get the token in (once, by hand — see below).
-2. Open a WebSocket to `ws://127.0.0.1:8791`.
+2. Open a WebSocket to `ws://127.0.0.1:8792`.
 3. Send `session/hello` with the token, protocol version, your place identity, and your tools.
 4. Wait for `tool/call` messages and reply to each with the matching `id`.
 5. Reconnect with backoff when the socket drops.
@@ -33,7 +33,7 @@ optional and can wait until the basics work.
 
 ## Getting the token in
 
-The server writes a random token to `%USERPROFILE%\.vmcp\token` and reuses it forever.
+The server writes a random token to `%USERPROFILE%\.vmcp-lite\token` and reuses it forever.
 Anything that connects with it can drive your place, so the socket won't talk without it.
 
 **A Studio plugin can't read files**, so the token has to get there by hand once:
@@ -62,7 +62,7 @@ loop — it won't start working.
 local HttpService = game:GetService("HttpService")
 
 local client = HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, {
-	Url = "ws://127.0.0.1:8791",
+	Url = "ws://127.0.0.1:8792",
 })
 ```
 
@@ -437,7 +437,7 @@ The reply is `{ "file": "<absolute path>", "previous": "<what the file held befo
 caller can put it back.
 
 `ledger/read` and `ledger/write` keep a per-place JSON record under
-`~/.vmcp/optimization/<placeId>.json` for the optimization pass — one object per script path.
+`~/.vmcp-lite/optimization/<placeId>.json` for the optimization pass — one object per script path.
 `ledger/write` takes `{ "key": "<script path>", "entry": { ... } }` and merges the fields in
 (stamping `updatedAt`); an absent `entry` deletes the key. Both reply with `{ placeId, entries }`.
 
@@ -446,7 +446,7 @@ caller can put it back.
 After it accepts an edit session's hello, and whenever the plugin sends `updates/check {}`, the
 server *reports* `updates/state { server, plugin, running, head, git }`: whether its git checkout
 is behind upstream (`server: { from, to, commits }`, applied by `server/update-apply { commit }`,
-which fast-forwards and rebuilds), whether the `VMCP.rbxmx` bundled next to it differs from the
+which fast-forwards and rebuilds), whether the `VMCP-Lite.rbxmx` bundled next to it differs from the
 installed one (`plugin`, below), and the commit it's running vs. the one on disk. The old shape
 of the plugin part, for reference:
 
@@ -470,8 +470,8 @@ nothing is pending, or the request didn't come from the edit session. See
 
 A tool result may carry a `postProcess` object alongside `content`. It's for work the plugin
 genuinely can't do, which means writing a file. Kinds: `scene` renders collected part geometry
-as a blockout picture under `~/.vmcp/images/<name>.png`, and `gprx` writes a base64 `data` field
-out as a MicroProfiler capture under `~/.vmcp/profiles/<name>.gprx`.
+as a blockout picture under `~/.vmcp-lite/images/<name>.png`, and `gprx` writes a base64 `data` field
+out as a MicroProfiler capture under `~/.vmcp-lite/profiles/<name>.gprx`.
 
 ```json
 {
@@ -595,7 +595,7 @@ Generate the `sessionId` per window and never persist it and this stays theoreti
 reachable when two windows genuinely share one.
 
 While you're disconnected your tools disappear from Claude's list. The server still caches
-your last registered list to `%USERPROFILE%\.vmcp\tools.json`, and setting
+your last registered list to `%USERPROFILE%\.vmcp-lite\tools.json`, and setting
 `VMCP_LIST_OFFLINE=1` makes it keep listing closed places — marked `[place not open in
 Studio]`, and calling one returns an error telling Claude to open it.
 

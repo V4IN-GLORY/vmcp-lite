@@ -83,7 +83,7 @@ if (argv.length === 0) {
 
 async function repl() {
 	console.log(`
-VMCP probe. The server is up on ${process.env.VMCP_PORT ?? 8791} — connect your plugin now.
+VMCP probe. The server is up on ${process.env.VMCP_PORT ?? 8792} — connect your plugin now.
 
   list                       what's registered
   call <tool> [json]         run one, e.g. call echo {"text":"hi"}

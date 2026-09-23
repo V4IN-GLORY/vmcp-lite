@@ -16,6 +16,12 @@ Skills under `.claude/skills/`: `vmcp-build`, `vmcp-debugging`, `vmcp-optimizati
 `vmcp-build` is a short core plus a `references/` library the model loads per phase, with
 `references/types/` for per-build-type tips you can add to by PR.
 
+Lite installs next to regular VMCP without touching it: its own plugin file
+(`Plugins/VMCP-Lite.rbxmx`), port `8792`, state folder `~/.vmcp-lite`, toolbar and MCP name
+(`vmcp-lite`). Its Update buttons only pull from this repo and only write `VMCP-Lite.rbxmx`.
+Coming from an older Lite that installed as `VMCP.rbxmx`: delete that file from the Plugins folder,
+copy `VMCP-Lite.rbxmx` in, and paste the new token from `npm --prefix server run token`.
+
 Two halves:
 
 - `server/` — the TypeScript MCP server. Talks MCP to Claude on one side, WebSocket to
@@ -37,18 +43,18 @@ npm run token          # prints the auth token to paste into the plugin
 Point Claude at it:
 
 ```bash
-claude mcp add vmcp -- node "<path to repo>/server/dist/index.js"
+claude mcp add vmcp-lite -- node "<path to repo>/server/dist/index.js"
 ```
 
-The server writes its token and cached tool lists to `%USERPROFILE%\.vmcp\`.
+The server writes its token and cached tool lists to `%USERPROFILE%\.vmcp-lite\`.
 
 | Env var | Default | What it does |
 |---|---|---|
-| `VMCP_PORT` | `8791` | Bridge port |
+| `VMCP_PORT` | `8792` | Bridge port |
 | `VMCP_TIMEOUT_MS` | `30000` | Default per-call timeout |
 | `VMCP_MAX_MESSAGE_MB` | `8` | Largest single WebSocket message |
 | `VMCP_LIST_OFFLINE` | off | Keep listing tools for places that aren't open |
-| `VMCP_HOME` | `~/.vmcp` | Where the token and tool cache live |
+| `VMCP_HOME` | `~/.vmcp-lite` | Where the token and tool cache live |
 
 ## When Claude lists the tools but can't reach your place
 
@@ -83,7 +89,7 @@ rojo build plugin.project.json -o "$LOCALAPPDATA/Roblox/Plugins/VMCP.rbxm"
 Restart Studio afterwards — it only picks up newly installed plugins on load.
 
 After that, nothing updates by itself. When the server's checkout is behind upstream, or the
-bundled `VMCP.rbxmx` differs from the installed one, the panel shows an **Update** button and
+bundled `VMCP-Lite.rbxmx` differs from the installed one, the panel shows an **Update** button and
 nothing is pulled or written until it's clicked. [`docs/plugin-updates.md`](docs/plugin-updates.md).
 
 Or work from the place instead: `rojo serve`, then right-click **ServerStorage → VMCP** and pick
@@ -122,9 +128,9 @@ can drive your plugin by hand:
 
 ```
 $ npm run probe
-[vmcp] bridge listening on ws://127.0.0.1:8791
+[vmcp] bridge listening on ws://127.0.0.1:8792
 
-VMCP probe. The server is up on 8791 — connect your plugin now.
+VMCP probe. The server is up on 8792 — connect your plugin now.
 
 vmcp> list
   echo  [readOnly]
